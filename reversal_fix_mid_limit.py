@@ -58,7 +58,7 @@ except ImportError:
 BET_PCT = 0.02                   # 2% of bankroll per trade
 MAX_LIVE_BET = 5.00              # Hard cap
 FAK_FLOOR = 0.05
-TP_PRICE = 0.30                  # Take profit target (lowered from $0.35)
+TP_PRICE = 0.35                  # Take profit target
 TIME_EXIT_SECS = 180             # Sell at current bid if TP not hit within 3 minutes
 
 # Signal thresholds
