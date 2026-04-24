@@ -51,9 +51,9 @@ except ImportError:
     pass
 
 # ── Config ─────────────────────────────────────────────
-STARTING_BANKROLL = 100.0
-BET_PCT = 0.10
-MAX_BET = 200.0
+STARTING_BANKROLL = 149.32
+BET_PCT = 0.34
+MAX_BET = 5000.0
 FAK_FLOOR = 0.05
 
 # Entry thresholds
@@ -65,7 +65,7 @@ ENTRY_SECONDS_BEFORE = 15   # Enter at T-15 seconds
 SL_PRICE = 0.49             # Only triggers if direction completely reverses
 # At T-15, a side at $0.97 dropping to $0.49 is extremely rare
 
-DRAWDOWN_PAUSE = 0.90
+# DRAWDOWN_PAUSE removed — compounding strategy handles losses via bet sizing
 
 USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 CLOB_HOST = "https://clob.polymarket.com"
@@ -322,10 +322,7 @@ class SnipeBot:
                 if wait > 0:
                     await asyncio.sleep(wait)
                 await asyncio.sleep(2)
-                log_msg(f"[LOOP] Window cycle start, bankroll=${self.bankroll:.2f} paused={self.paused}")
-
-                if self.paused:
-                    continue
+                log_msg(f"[LOOP] Window cycle start, bankroll=${self.bankroll:.2f}")
 
                 if self.bankroll < 3:
                     log_msg(f"[RISK] Bankroll ${self.bankroll:.2f} too low")
@@ -494,9 +491,7 @@ class SnipeBot:
         dd = (self.peak - self.bankroll) / self.peak * 100 if self.peak > 0 else 0
         if dd > self.max_dd:
             self.max_dd = dd
-        if dd >= DRAWDOWN_PAUSE * 100 and not self.paused:
-            self.paused = True
-            log_msg(f"[RISK] PAUSED — DD {dd:.0f}%")
+        # Drawdown pause removed — compounding handles risk via bet sizing
 
         total = self.wins + self.losses + self.flat
         wr = self.wins / total * 100 if total else 0
