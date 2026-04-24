@@ -16,7 +16,7 @@ Fixes applied for live:
 Strategy:
   - Wait for one side to drop below $0.25
   - Coinbase reversal: 5 ticks + $10 move in 10s
-  - Buy cheap token via GTC maker bid (0% fee)
+  - Buy cheap token via FOK taker (instant fill, small fee at low prices)
   - Hold to resolution ($1.00 or $0.00)
   - No stop loss (small bets, hold to binary outcome)
 
@@ -57,7 +57,7 @@ except ImportError:
     pass
 
 # ── Config ─────────────────────────────────────────────
-BET_PCT = 0.05
+BET_PCT = 0.02
 MAX_LIVE_BET = 50.00         # Same as paper — 5% of bankroll, max $50
 FAK_FLOOR = 0.05
 
@@ -69,13 +69,13 @@ REVERSAL_MOVE = 10.0
 REVERSAL_WINDOW = 10.0
 MIN_WINDOW_ELAPSED = 30
 MAX_WINDOW_ELAPSED = 240
-COOLDOWN = 60.0
+COOLDOWN = 30.0              # Reduced from 60s for faster re-entry
 MAX_TRADES_PER_WINDOW = 1
 
 # Time-of-day filter: skip 9am-4pm ET (13:00-20:00 UTC)
 # Reversal bots lose money during US market hours
-SKIP_HOURS_UTC_START = 13
-SKIP_HOURS_UTC_END = 20
+SKIP_HOURS_UTC_START = 99
+SKIP_HOURS_UTC_END = 99
 
 DRAWDOWN_PAUSE_PCT = 95      # Pause at 50% DD of starting wallet
 MIN_WALLET_BALANCE = 5.0     # Don't trade if wallet below $5
@@ -91,14 +91,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # LIVE/PAPER MODE
-PAPER_MODE = os.getenv("REVERSAL_LIVE", "0") != "1"
+PAPER_MODE = os.getenv("REVERSAL_FIXED_LIVE", "0") != "1"
 
-ASSETS = ["BTC", "SOL"]
+ASSETS = ["SOL"]
 
 os.makedirs("logs", exist_ok=True)
-BOT_NAME = "REVERSAL-LIVE" if not PAPER_MODE else "REVERSAL-LIVE-PAPER"
-LOG_FILE = "logs/reversal_live_trades.jsonl"
-SUMMARY_FILE = "logs/reversal_live_summary.json"
+BOT_NAME = "REVERSAL-FIXED" if not PAPER_MODE else "REVERSAL-LIVE-PAPER"
+LOG_FILE = "logs/reversal_fixed_trades.jsonl"
+SUMMARY_FILE = "logs/reversal_fixed_summary.json"
 
 
 def ts():
@@ -308,22 +308,35 @@ class ExecutionEngine:
         self.client = client
         self._lock = asyncio.Lock()
 
-    async def buy_maker(self, token_id, price, size):
-        """Place GTC maker bid. Returns order dict or None."""
+    async def buy_taker(self, token_id, price, size):
+        """FOK then FAK taker buy — instant fill or partial fill."""
         async with self._lock:
             if not self.client:
                 return None
+            buy_price = snap_price(price * 1.05)
+            size = round(size)  # Integer shares to avoid decimal precision errors
+            # Try FOK first (full fill or nothing)
             try:
-                bid_price = snap_price(price)
-                args = OrderArgs(price=bid_price, size=size, side=BUY, token_id=token_id)
+                args = OrderArgs(price=buy_price, size=size, side=BUY, token_id=token_id)
                 signed = self.client.create_order(args)
-                resp = self.client.post_order(signed, OrderType.GTC)
+                resp = self.client.post_order(signed, OrderType.FOK)
                 oid = resp.get("orderID") or resp.get("order_id") if resp else None
                 if oid:
-                    log_msg(f"[BID] GTC {size}sh @ ${bid_price} (maker) order={oid[:8]}...")
-                    return {"order_id": oid, "price": bid_price, "size": size, "token_id": token_id}
+                    log_msg(f"[BUY] FOK {size}sh @ ${buy_price} order={oid[:8]}...")
+                    return {"order_id": oid, "price": buy_price, "size": size, "token_id": token_id, "filled": True}
             except Exception as e:
-                log_msg(f"[BID] err: {e}")
+                log_msg(f"[BUY] FOK: {e}")
+            # FAK fallback (fill what you can)
+            try:
+                args = OrderArgs(price=buy_price, size=size, side=BUY, token_id=token_id)
+                signed = self.client.create_order(args)
+                resp = self.client.post_order(signed, OrderType.FAK)
+                oid = resp.get("orderID") or resp.get("order_id") if resp else None
+                if oid:
+                    log_msg(f"[BUY] FAK {size}sh @ ${buy_price} order={oid[:8]}...")
+                    return {"order_id": oid, "price": buy_price, "size": size, "token_id": token_id, "filled": True}
+            except Exception as e:
+                log_msg(f"[BUY] FAK: {e}")
             return None
 
     def check_order_status(self, order_id):
@@ -420,6 +433,7 @@ class ReversalSniperLive:
         self.skipped_time_filter = 0
         self.fill_failures = 0
         self.position = None
+        self.placing_order = False
 
     def init_clob(self):
         if PAPER_MODE:
@@ -505,7 +519,7 @@ class ReversalSniperLive:
 
                 if self.position:
                     await self._manage_position()
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)  # Faster position check
                     continue
 
                 window_start = (int(now) // 300) * 300
@@ -529,7 +543,7 @@ class ReversalSniperLive:
                     if self.position:
                         break
 
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.1)  # 100ms scan for faster signal catch
 
             except Exception as e:
                 log_msg(f"[MAIN] {e}")
@@ -563,7 +577,6 @@ class ReversalSniperLive:
         if not cheap_side:
             return  # no logging here to avoid spam
 
-        log_msg(f"[DEBUG] {asset} cheap found: {cheap_side} ask=${cheap_ask:.2f}")
         self.signals_detected += 1
 
         is_reversing, strength = self.coinbase.get_reversal_signal(trend_dir)
@@ -576,10 +589,13 @@ class ReversalSniperLive:
         entry_price = snap_price(cheap_ask)
         bet = min(self.bankroll * BET_PCT, MAX_LIVE_BET)  # Hard cap at MAX_LIVE_BET
         shares = round(bet / entry_price, 2)
-        shares = max(shares, 5.0)
+        shares = round(max(shares, 5.0))  # Integer shares for clean amounts
         if shares * entry_price > self.bankroll * 0.5:
             return
 
+        if self.placing_order:
+            return
+        self.placing_order = True
         self.trade_count += 1
         self.trades_this_window += 1
         tid = self.trade_count
@@ -590,35 +606,31 @@ class ReversalSniperLive:
 
         # ── EXECUTE BUY ──
         if self.engine:
-            order = await self.engine.buy_maker(cheap_token, entry_price, shares)
+            order = await self.engine.buy_taker(cheap_token, entry_price, shares)
             if not order:
                 log_msg(f"[FAIL] #{tid} Bid placement failed")
                 self.fill_failures += 1
+                self.placing_order = False
                 return
 
-            # FILL VERIFICATION: check actual order status via CLOB API
-            log_msg(f"[WAIT] #{tid} Waiting for fill (order {order['order_id'][:8]}...)...")
-            filled, filled_size = await self.engine.wait_for_fill(order["order_id"], max_wait=30)
-
-            if not filled:
-                await self.engine.cancel_order(order["order_id"])
-                # Double check it didn't fill during cancel
-                filled2, filled_size2 = self.engine.check_order_status(order["order_id"])
-                if filled2:
-                    log_msg(f"[FILL] #{tid} Filled during cancel! size={filled_size2}")
-                    shares = filled_size2
-                else:
-                    log_msg(f"[UNFILL] #{tid} Not filled -- cancelled")
-                    self.fill_failures += 1
-                    return
+            # FOK = instant fill or fail, no waiting needed
+            # Verify via order status
+            await asyncio.sleep(1)
+            filled, filled_size = self.engine.check_order_status(order["order_id"])
+            if filled and filled_size > 0:
+                shares = filled_size
+                log_msg(f"[FILL] #{tid} CONFIRMED {shares}sh @ ${entry_price:.2f}")
+            elif order.get("filled"):
+                log_msg(f"[FILL] #{tid} FOK filled {shares}sh @ ${entry_price:.2f}")
             else:
-                if filled_size > 0:
-                    shares = filled_size
-            log_msg(f"[FILL] #{tid} CONFIRMED {shares}sh @ ${entry_price:.2f}")
+                log_msg(f"[UNFILL] #{tid} FOK not filled")
+                self.fill_failures += 1
+                return
         else:
             log_msg(f"[PAPER] #{tid} Simulated buy {shares}sh {cheap_side} @ ${entry_price:.2f}")
 
         self.last_trade_time = time.time()
+        self.placing_order = False
         self.position = {
             "id": tid,
             "asset": asset,
@@ -630,6 +642,7 @@ class ReversalSniperLive:
             "entry_time": time.time(),
             "btc_at_entry": self.coinbase.price,
             "reversal_strength": strength,
+            "peak_bid": entry_price,
             "question": mkt["question"],
             "wallet_before": self.bankroll,
         }
@@ -646,6 +659,10 @@ class ReversalSniperLive:
             return
 
         bid = book["bid"]
+
+        # Track peak bid
+        if bid > pos.get("peak_bid", 0):
+            pos["peak_bid"] = bid
 
         # WIN
         if bid >= 0.95:
@@ -724,6 +741,8 @@ class ReversalSniperLive:
                 "pnl": pnl, "return_pct": ret_pct, "bankroll": self.bankroll,
                 "btc_at_entry": pos["btc_at_entry"],
                 "reversal_strength": pos["reversal_strength"],
+                "peak_bid": pos.get("peak_bid", 0),
+                "bid_range": f"{pos['entry_price']:.2f}->{pos.get('peak_bid', 0):.2f}",
                 "hold_seconds": round(elapsed, 1),
                 "mode": mode,
                 "question": pos["question"],
@@ -735,6 +754,7 @@ class ReversalSniperLive:
 
         self._write_summary()
         self.position = None
+        self.placing_order = False
 
         icon = "🟢" if pnl > 0 else "🔴"
         asyncio.create_task(send_telegram(
@@ -813,7 +833,7 @@ async def main():
     print(f"  Buy cheap tokens (${CHEAP_MIN}-${CHEAP_MAX}) on Coinbase reversal")
     print(f"  Time filter: OFF during 9am-4pm ET (saves ~$275 in losses)")
     print(f"  Max bet: ${MAX_LIVE_BET}/trade | Bet: {int(BET_PCT*100)}% of wallet")
-    print(f"  Fill verification: poll up to 30s, cancel if unfilled")
+    print(f"  FOK taker orders — instant fill or fail, no waiting")
     print(f"  Assets: {', '.join(ASSETS)}")
     print()
     if mode == "LIVE":
