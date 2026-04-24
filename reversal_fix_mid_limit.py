@@ -58,7 +58,8 @@ except ImportError:
 BET_PCT = 0.02                   # 2% of bankroll per trade
 MAX_LIVE_BET = 5.00              # Hard cap
 FAK_FLOOR = 0.05
-TP_PRICE = 0.35                  # Take profit target
+TP_PRICE = 0.30                  # Take profit target (lowered from $0.35)
+TIME_EXIT_SECS = 180             # Sell at current bid if TP not hit within 3 minutes
 
 # Signal thresholds
 CHEAP_MAX = 0.25
@@ -471,6 +472,21 @@ async def ws_monitor_position(bot, pos):
                     return {"exit": "LOSS", "peak": peak_bid, "exit_price": 0.00,
                             "bid_history": bid_history[-50:]}
 
+                # ── TIME EXIT: sell at current bid if TP not hit within 3 min ──
+                elapsed = now - pos["entry_time"]
+                if elapsed >= TIME_EXIT_SECS and bid < TP_PRICE and bid > 0.02:
+                    log_msg(f"[TIME-EXIT] #{pos['id']} {elapsed:.0f}s elapsed, bid=${bid:.2f} < TP ${TP_PRICE} — SELLING")
+                    if bot.engine and not PAPER_MODE:
+                        sold = await bot.engine.emergency_sell(
+                            token_id, round(pos["shares"]), f"TIME-{pos['id']}"
+                        )
+                        if sold:
+                            return {"exit": "TIME-EXIT", "peak": peak_bid, "exit_price": bid,
+                                    "bid_history": bid_history[-50:]}
+                    else:
+                        return {"exit": "TIME-EXIT", "peak": peak_bid, "exit_price": bid,
+                                "bid_history": bid_history[-50:]}
+
                 # ── TIMEOUT: window expired + 60s grace ──
                 window_end = (int(pos["entry_time"]) // 300 + 1) * 300
                 if now > window_end + 60:
@@ -539,6 +555,21 @@ async def http_monitor_position(bot, pos, peak_bid=None, bid_history=None):
         if bid <= 0.02:
             return {"exit": "LOSS", "peak": peak_bid, "exit_price": 0.00,
                     "bid_history": bid_history[-50:]}
+
+        # Time exit
+        elapsed = now - pos["entry_time"]
+        if elapsed >= TIME_EXIT_SECS and bid < TP_PRICE and bid > 0.02:
+            log_msg(f"[TIME-EXIT] #{pos['id']} {elapsed:.0f}s elapsed, bid=${bid:.2f} — SELLING (HTTP)")
+            if bot.engine and not PAPER_MODE:
+                sold = await bot.engine.emergency_sell(
+                    token_id, round(pos["shares"]), f"TIME-{pos['id']}"
+                )
+                if sold:
+                    return {"exit": "TIME-EXIT", "peak": peak_bid, "exit_price": bid,
+                            "bid_history": bid_history[-50:]}
+            else:
+                return {"exit": "TIME-EXIT", "peak": peak_bid, "exit_price": bid,
+                        "bid_history": bid_history[-50:]}
 
         # Timeout
         window_end = (int(pos["entry_time"]) // 300 + 1) * 300
@@ -803,6 +834,12 @@ class ReversalMidBot:
             else:
                 pnl = round(pos["shares"] * (1.00 - pos["entry_price"]), 4)
             self.wins += 1
+        elif exit_type == "TIME-EXIT":
+            pnl = round(pos["shares"] * (exit_price - pos["entry_price"]), 4)
+            if pnl > 0:
+                self.wins += 1
+            else:
+                self.losses += 1
         else:
             pnl = round(-pos["shares"] * pos["entry_price"], 4)
             self.losses += 1

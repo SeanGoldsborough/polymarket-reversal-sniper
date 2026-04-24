@@ -62,6 +62,7 @@ FAK_FLOOR = 0.05
 # Trailing stop config
 TRAIL_ACTIVATE = 0.10            # Activate trail after +$0.10 from entry
 TRAIL_AMOUNT = 0.08              # Sell when bid drops $0.08 from peak
+TIME_EXIT_SECS = 180             # Sell at current bid if trail not activated within 3 minutes
 
 # Signal thresholds
 CHEAP_MAX = 0.25
@@ -474,6 +475,21 @@ async def ws_monitor_position(bot, pos):
                     return {"exit": "LOSS", "peak": peak_bid, "exit_price": 0.00,
                             "trail_active": trail_active, "bid_history": bid_history[-50:]}
 
+                # ── TIME EXIT: sell at current bid if trail not activated within 3 min ──
+                elapsed = now - pos["entry_time"]
+                if elapsed >= TIME_EXIT_SECS and not trail_active and bid > 0.02:
+                    log_msg(f"[TIME-EXIT] #{pos['id']} {elapsed:.0f}s elapsed, trail not activated, bid=${bid:.2f} — SELLING")
+                    if bot.engine and not PAPER_MODE:
+                        sold = await bot.engine.emergency_sell(
+                            token_id, round(pos["shares"]), f"TIME-{pos['id']}"
+                        )
+                        if sold:
+                            return {"exit": "TIME-EXIT", "peak": peak_bid, "exit_price": bid,
+                                    "trail_active": False, "bid_history": bid_history[-50:]}
+                    else:
+                        return {"exit": "TIME-EXIT", "peak": peak_bid, "exit_price": bid,
+                                "trail_active": False, "bid_history": bid_history[-50:]}
+
                 # ── TIMEOUT ──
                 window_end = (int(pos["entry_time"]) // 300 + 1) * 300
                 if now > window_end + 60:
@@ -547,6 +563,21 @@ async def http_monitor_position(bot, pos, peak_bid=None, trail_active=False, bid
         if bid <= 0.02:
             return {"exit": "LOSS", "peak": peak_bid, "exit_price": 0.00,
                     "trail_active": trail_active, "bid_history": bid_history[-50:]}
+
+        # Time exit
+        elapsed = now - pos["entry_time"]
+        if elapsed >= TIME_EXIT_SECS and not trail_active and bid > 0.02:
+            log_msg(f"[TIME-EXIT] #{pos['id']} {elapsed:.0f}s elapsed, trail not activated — SELLING (HTTP)")
+            if bot.engine and not PAPER_MODE:
+                sold = await bot.engine.emergency_sell(
+                    token_id, round(pos["shares"]), f"TIME-{pos['id']}"
+                )
+                if sold:
+                    return {"exit": "TIME-EXIT", "peak": peak_bid, "exit_price": bid,
+                            "trail_active": False, "bid_history": bid_history[-50:]}
+            else:
+                return {"exit": "TIME-EXIT", "peak": peak_bid, "exit_price": bid,
+                        "trail_active": False, "bid_history": bid_history[-50:]}
 
         # Timeout
         window_end = (int(pos["entry_time"]) // 300 + 1) * 300
@@ -811,6 +842,12 @@ class ReversalTrailBot:
             else:
                 self.losses += 1
             self.trail_exits += 1
+        elif exit_type == "TIME-EXIT":
+            pnl = round(pos["shares"] * (exit_price - pos["entry_price"]), 4)
+            if pnl > 0:
+                self.wins += 1
+            else:
+                self.losses += 1
         elif exit_type in ("WIN", "WIN-LATE"):
             pnl = round(pos["shares"] * (1.00 - pos["entry_price"]), 4)
             self.wins += 1
