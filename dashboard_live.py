@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live trading dashboard - tracks from deposit date."""
+"""Live trading dashboard — tracks all active bots, wallet, and P&L."""
 import json
 import time
 import urllib.request
@@ -9,15 +9,22 @@ from datetime import datetime, timezone
 
 BOT_TOKEN = "8027434003:AAEZPOsAFCXBjdxAdY8gmWGo9-PQwEir-0E"
 CHAT_ID = "7142537098"
-INTERVAL = 300
-STARTING_WALLET = 101.21
-DEPOSIT_TIME = "2026-04-22T01:54:00"  # Only count trades after this
+INTERVAL = 300  # 5 minutes
 
-BOTS = [
-    ("REVERSAL-FIXED", "logs/reversal_fixed_trades.jsonl", None, "reversalFIXED"),
-    ("REVERSAL-MID", "logs/reversal_mid_trades.jsonl", None, "reversalMID"),
-    ("SNIPE-ALT-LIVE", "logs/snipe_alt_live_trades.jsonl", None, "snipeALTlive"),
+LIVE_STARTING_WALLET = 149.32  # Deposit for live trading
+
+# ── Bot definitions: (name, log_path, tmux_session, mode) ──
+LIVE_BOTS = [
+    ("SNIPE-ALT", "logs/snipe_alt_live_trades.jsonl", "snipeALTlive"),
 ]
+
+PAPER_BOTS = [
+    ("BTC-LADDER", "logs/btc_ladder_trades.jsonl", "btcLadder"),
+    ("SNIPE-ALL", "logs/snipe_paper_all_trades.jsonl", "snipePaperAll"),
+]
+
+PAPER_STARTING_BANKROLL = 100.0
+
 
 def send_telegram(msg):
     try:
@@ -26,6 +33,7 @@ def send_telegram(msg):
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
         print(f"Telegram error: {e}")
+
 
 def get_wallet():
     try:
@@ -46,6 +54,7 @@ def get_wallet():
     except:
         return None
 
+
 def is_session_running(name):
     try:
         result = os.popen(f"tmux has-session -t {name} 2>&1").read()
@@ -53,16 +62,69 @@ def is_session_running(name):
     except:
         return False
 
-def read_trades_since_deposit(path):
+
+def read_trades(path):
     trades = []
     try:
         with open(f"/home/ubuntu/polymarket-bot/{path}") as f:
             for line in f:
-                t = json.loads(line)
-                if t.get("time", "") >= DEPOSIT_TIME:
-                    trades.append(t)
-    except: pass
+                try:
+                    trades.append(json.loads(line))
+                except:
+                    pass
+    except:
+        pass
     return trades
+
+
+def read_summary(bot_name):
+    """Read summary JSON for paper bots to get current bankroll."""
+    summary_map = {
+        "BTC-LADDER": "logs/btc_ladder_summary.json",
+        "SNIPE-ALL": "logs/snipe_paper_all_summary.json",
+    }
+    path = summary_map.get(bot_name)
+    if not path:
+        return None
+    try:
+        with open(f"/home/ubuntu/polymarket-bot/{path}") as f:
+            return json.load(f)
+    except:
+        return None
+
+
+def format_bot_line(bot_name, trades, running):
+    n = len(trades)
+    w = sum(1 for t in trades if t.get("pnl", 0) > 0.01)
+    lo = sum(1 for t in trades if t.get("pnl", 0) < -0.01)
+    pnl = sum(t.get("pnl", 0) for t in trades)
+
+    if n == 0:
+        if running:
+            return f"\u23F3 <b>{bot_name}</b> | waiting", 0, 0, 0, 0
+        else:
+            return f"\u26D4 <b>{bot_name}</b> | stopped", 0, 0, 0, 0
+
+    wr = w / n * 100 if n else 0
+    last_t = trades[-1]
+    last_result = last_t.get("result", "?")
+    last_pnl = last_t.get("pnl", 0)
+    lsign = "+" if last_pnl >= 0 else "-"
+
+    if not running:
+        icon = "\u26D4"
+    elif w > lo:
+        icon = "\U0001F7E2"
+    elif lo > w:
+        icon = "\U0001F534"
+    else:
+        icon = "\u26AA"
+
+    line = f"{icon} <b>{bot_name}</b> | {n}t {wr:.0f}% ({w}W/{lo}L) ${pnl:+.2f}"
+    line += f"\n   Last: {last_result} {'+'if last_pnl>=0 else '-'}${abs(last_pnl):.2f}"
+
+    return line, n, w, lo, pnl
+
 
 def build_dashboard():
     now = datetime.now(timezone.utc)
@@ -74,75 +136,76 @@ def build_dashboard():
     et_str = f"{et_12}:{et_min} {am_pm} ET"
 
     wallet = get_wallet()
-    if wallet is None: wallet = 0
-    wallet_pnl = wallet - STARTING_WALLET
-    wsign = "+" if wallet_pnl >= 0 else "-"
+    if wallet is None:
+        wallet = 0
+    wallet_pnl = wallet - LIVE_STARTING_WALLET
 
     lines = []
-    lines.append("\U0001F1EE\U0001F1EA\U0001F4C8 <b>LIVE Trading Dashboard</b>")
+    lines.append("\U0001F1EE\U0001F1EA\U0001F4C8 <b>Trading Dashboard</b>")
     lines.append(f"{utc_str} / {et_str}")
-    lines.append(f"\U0001F4B0 Wallet: <b>${wallet:,.2f}</b> ({wsign}${abs(wallet_pnl):,.2f})")
-    lines.append(f"Started: ${STARTING_WALLET}")
     lines.append("")
 
-    total_trades = 0
-    total_wins = 0
-    total_losses = 0
+    # ── LIVE SECTION ──
+    lines.append("\U0001F4B0 <b>LIVE</b>")
+    lines.append(f"Wallet: <b>${wallet:,.2f}</b> ({'+'if wallet_pnl>=0 else ''}{wallet_pnl:,.2f})")
+    lines.append(f"Started: ${LIVE_STARTING_WALLET:,.2f}")
+    lines.append("")
 
-    for bot_name, log_path, vf, tmux_name in BOTS:
+    live_total_t = 0
+    live_total_w = 0
+    live_total_l = 0
+
+    for bot_name, log_path, tmux_name in LIVE_BOTS:
         running = is_session_running(tmux_name)
-        trades = read_trades_since_deposit(log_path)
-        wins = [t for t in trades if t.get("pnl", 0) > 0.01]
-        losses_list = [t for t in trades if t.get("pnl", 0) < -0.01]
-        n = len(trades)
-        w = len(wins)
-        lo = len(losses_list)
-        total_trades += n
-        total_wins += w
-        total_losses += lo
-
-        if n == 0:
-            if running:
-                lines.append(f"\u23F3 <b>{bot_name}</b> | waiting")
-            else:
-                lines.append(f"\u26D4 <b>{bot_name}</b> | stopped")
-        else:
-            wr = w / n * 100 if n else 0
-            last_t = trades[-1]
-            last_result = last_t.get("result", "?")
-            last_pnl = last_t.get("pnl", 0)
-            lsign = "+" if last_pnl >= 0 else "-"
-
-            if not running:
-                icon = "\u26D4"
-            elif w > lo:
-                icon = "\U0001F7E2"
-            elif lo > w:
-                icon = "\U0001F534"
-            else:
-                icon = "\u26AA"
-
-            lines.append(f"{icon} <b>{bot_name}</b> | {n}t {wr:.0f}% ({w}W/{lo}L)")
-            lines.append(f"   Last: {last_result} {lsign}${abs(last_pnl):.2f}")
+        trades = read_trades(log_path)
+        line, n, w, lo, pnl = format_bot_line(bot_name, trades, running)
+        lines.append(line)
+        live_total_t += n
+        live_total_w += w
+        live_total_l += lo
 
     lines.append("")
-    lines.append(f"\U0001F4CA {total_trades}t total ({total_wins}W/{total_losses}L)")
+
+    # ── PAPER SECTION ──
+    lines.append("\U0001F4DD <b>PAPER</b>")
+
+    for bot_name, log_path, tmux_name in PAPER_BOTS:
+        running = is_session_running(tmux_name)
+        trades = read_trades(log_path)
+
+        # Get paper bankroll from summary
+        summary = read_summary(bot_name)
+        paper_bank = summary.get("bankroll", PAPER_STARTING_BANKROLL) if summary else PAPER_STARTING_BANKROLL
+        paper_pnl = paper_bank - PAPER_STARTING_BANKROLL
+
+        line, n, w, lo, pnl = format_bot_line(bot_name, trades, running)
+        lines.append(line)
+        if n > 0 or running:
+            lines.append(f"   Bank: ${paper_bank:,.2f} ({'+'if paper_pnl>=0 else ''}{paper_pnl:,.2f}) | Start: ${PAPER_STARTING_BANKROLL:.2f}")
+
+    lines.append("")
+
+    # ── TOTALS ──
+    lines.append(f"\U0001F4CA Live: {live_total_t}t ({live_total_w}W/{live_total_l}L)")
 
     return lines
 
+
 def check_bot_health():
-    """Check if bots are still running. Alert if any died."""
     alerts = []
-    for bot_name, log_path, vf, tmux_name in BOTS:
+    for bot_name, log_path, tmux_name in LIVE_BOTS:
         if not is_session_running(tmux_name):
-            alerts.append(f"\u274C <b>{bot_name}</b> is DOWN!")
+            alerts.append(f"\u274C <b>{bot_name}</b> (LIVE) is DOWN!")
+    for bot_name, log_path, tmux_name in PAPER_BOTS:
+        if not is_session_running(tmux_name):
+            alerts.append(f"\u26A0 <b>{bot_name}</b> (PAPER) is DOWN")
     return alerts
 
+
 def main():
-    print("Live dashboard started.", flush=True)
-    last_health_check = 0
+    print("Dashboard started.", flush=True)
     alerted_down = set()
-    
+
     while True:
         try:
             lines = build_dashboard()
@@ -150,30 +213,29 @@ def main():
             send_telegram(msg)
             ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
             print(f"[{ts}] Sent", flush=True)
-            
-            # Health check every cycle — alert immediately if bot dies
+
+            # Health check
             alerts = check_bot_health()
             for alert in alerts:
                 bot_name = alert.split("<b>")[1].split("</b>")[0] if "<b>" in alert else ""
                 if bot_name not in alerted_down:
-                    send_telegram(f"\U0001F6A8 <b>SERVER ALERT</b>\n{alert}\nMay need Stop/Start from AWS console.")
+                    send_telegram(f"\U0001F6A8 <b>SERVER ALERT</b>\n{alert}")
                     alerted_down.add(bot_name)
                     print(f"[{ts}] ALERT: {bot_name} down!", flush=True)
-            
+
             # Clear alerts for bots that came back
             running_bots = set()
-            for _, _, _, tmux_name in BOTS:
+            for bot_name, _, tmux_name in LIVE_BOTS + PAPER_BOTS:
                 if is_session_running(tmux_name):
-                    for bot_name, _, _, tn in BOTS:
-                        if tn == tmux_name:
-                            running_bots.add(bot_name)
+                    running_bots.add(bot_name)
             alerted_down -= running_bots
-            
+
         except Exception as e:
             print(f"Error: {e}", flush=True)
             import traceback
             traceback.print_exc()
         time.sleep(INTERVAL)
+
 
 if __name__ == "__main__":
     main()

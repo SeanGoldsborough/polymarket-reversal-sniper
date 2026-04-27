@@ -70,6 +70,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 PAPER_MODE = os.getenv("BTC_LADDER_LIVE", "0") != "1"
 
+# Ensure we're in the right directory for log files
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 os.makedirs("logs", exist_ok=True)
 BOT_NAME = "BTC-LADDER" if not PAPER_MODE else "BTC-LADDER-PAPER"
 LOG_FILE = "logs/btc_ladder_trades.jsonl"
