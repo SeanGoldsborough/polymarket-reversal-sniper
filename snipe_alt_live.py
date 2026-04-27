@@ -264,24 +264,13 @@ class ExecutionEngine:
         self._lock = asyncio.Lock()
 
     async def buy_taker(self, token_id, price, size):
-        """FOK then FAK taker buy."""
+        """FAK first (partial fill), FOK fallback (full fill)."""
         async with self._lock:
             if not self.client:
                 return None
             buy_price = snap_price(price * 1.02)
             size = round(size)  # Integer shares
-            # Try FOK first
-            try:
-                args = OrderArgs(price=buy_price, size=size, side=BUY, token_id=token_id)
-                signed = self.client.create_order(args)
-                resp = self.client.post_order(signed, OrderType.FOK)
-                oid = resp.get("orderID") or resp.get("order_id") if resp else None
-                if oid:
-                    log_msg(f"[BUY] FOK {size}sh @ ${buy_price} order={oid[:8]}...")
-                    return {"order_id": oid, "price": buy_price, "size": size, "token_id": token_id}
-            except Exception as e:
-                log_msg(f"[BUY] FOK: {e}")
-            # FAK fallback
+            # FAK first — gets partial fills immediately
             try:
                 args = OrderArgs(price=buy_price, size=size, side=BUY, token_id=token_id)
                 signed = self.client.create_order(args)
@@ -292,6 +281,17 @@ class ExecutionEngine:
                     return {"order_id": oid, "price": buy_price, "size": size, "token_id": token_id}
             except Exception as e:
                 log_msg(f"[BUY] FAK: {e}")
+            # FOK fallback — try full fill
+            try:
+                args = OrderArgs(price=buy_price, size=size, side=BUY, token_id=token_id)
+                signed = self.client.create_order(args)
+                resp = self.client.post_order(signed, OrderType.FOK)
+                oid = resp.get("orderID") or resp.get("order_id") if resp else None
+                if oid:
+                    log_msg(f"[BUY] FOK {size}sh @ ${buy_price} order={oid[:8]}...")
+                    return {"order_id": oid, "price": buy_price, "size": size, "token_id": token_id}
+            except Exception as e:
+                log_msg(f"[BUY] FOK: {e}")
             return None
 
     def check_order_status(self, order_id):
