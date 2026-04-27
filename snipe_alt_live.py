@@ -78,7 +78,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 PAPER_MODE = os.getenv("SNIPE_ALT_LIVE", "0") != "1"
-ASSETS = ["ETH", "XRP", "DOGE"]
+ASSETS = ["ETH", "DOGE"]
 
 os.makedirs("logs", exist_ok=True)
 BOT_NAME = "SNIPE-ALT-LIVE" if not PAPER_MODE else "SNIPE-ALT-PAPER"
