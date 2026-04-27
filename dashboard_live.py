@@ -21,6 +21,7 @@ LIVE_BOTS = [
 PAPER_BOTS = [
     ("BTC-LADDER", "logs/btc_ladder_trades.jsonl", "btcLadder"),
     ("SNIPE-ALL", "logs/snipe_paper_all_trades.jsonl", "snipePaperAll"),
+    ("BTC-SNIPE-LADDER", "logs/btc_snipe_ladder_trades.jsonl", "btcSnipeLadder"),
 ]
 
 PAPER_STARTING_BANKROLL = 100.0
@@ -82,6 +83,7 @@ def read_summary(bot_name):
     summary_map = {
         "BTC-LADDER": "logs/btc_ladder_summary.json",
         "SNIPE-ALL": "logs/snipe_paper_all_summary.json",
+        "BTC-SNIPE-LADDER": "logs/btc_snipe_ladder_summary.json",
     }
     path = summary_map.get(bot_name)
     if not path:
