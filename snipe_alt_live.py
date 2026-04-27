@@ -63,7 +63,11 @@ ENTRY_SECONDS_BEFORE = 15   # Enter at T-15 seconds
 
 # Stop loss
 SL_PRICE = 0.49             # Only triggers if direction completely reverses
-# At T-15, a side at $0.97 dropping to $0.49 is extremely rare
+
+# Reactive hedge: if our side drops below this, buy the OTHER side
+HEDGE_TRIGGER = 0.90        # Our side drops below $0.90 → reversal detected
+HEDGE_PCT = 0.10            # Hedge with 10% of bankroll on the other side
+HEDGE_MAX_PRICE = 0.20      # Don't hedge if cheap side already above $0.20
 
 # DRAWDOWN_PAUSE removed — compounding strategy handles losses via bet sizing
 
@@ -421,14 +425,26 @@ class SnipeBot:
         else:
             log_msg(f"[PAPER] #{tid} Simulated buy {shares}sh @ ${entry_price:.2f}")
 
+        # Determine the OTHER side token for potential hedge
+        if target_side == "UP":
+            hedge_token = mkt["down"]
+            hedge_side = "DOWN"
+        else:
+            hedge_token = mkt["up"]
+            hedge_side = "UP"
+
         # Monitor for SL or resolution (only ~15 seconds left + 60s resolution wait)
         window_end = (int(time.time()) // 300 + 1) * 300
         monitor_end = window_end + 60
+        hedge_placed = False
+        hedge_shares = 0
+        hedge_cost = 0
+        hedge_entry = 0
 
         while time.time() < monitor_end:
             book = await get_book(target_token)
             if not book:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
                 continue
 
             bid = book["bid"]
@@ -436,8 +452,41 @@ class SnipeBot:
             # WIN: resolved to $1.00
             if bid >= 0.95:
                 pnl = round(shares * (1.00 - entry_price), 4)
-                self._record_trade(tid, asset, target_side, entry_price, 1.00, shares, pnl, "WIN", mkt["question"])
+                # If we hedged, the hedge loses
+                if hedge_placed:
+                    hedge_loss = round(-hedge_cost, 4)
+                    pnl += hedge_loss
+                    log_msg(f"[HEDGE] #{tid} WIN — hedge lost ${hedge_loss:.2f} (net P&L ${pnl:+.2f})")
+                self._record_trade(tid, asset, target_side, entry_price, 1.00, shares, pnl, "WIN", mkt["question"],
+                                   hedge_placed=hedge_placed, hedge_cost=hedge_cost, hedge_shares=hedge_shares, hedge_entry=hedge_entry)
                 return
+
+            # ── REACTIVE HEDGE: detect reversal, buy the other side ──
+            if bid <= HEDGE_TRIGGER and not hedge_placed and time.time() < window_end:
+                # Check cheap side price
+                hedge_book = await get_book(hedge_token)
+                if hedge_book and hedge_book["ask"] <= HEDGE_MAX_PRICE and hedge_book["ask"] > 0.01:
+                    hedge_bet = round(self.bankroll * HEDGE_PCT, 2)
+                    hedge_price = snap_price(min(hedge_book["ask"] + 0.01, 0.99))
+                    hedge_shares = round(max(hedge_bet / hedge_price, 5))
+                    hedge_entry = hedge_price
+                    hedge_cost = round(hedge_shares * hedge_price, 4)
+
+                    log_msg(f"[HEDGE] #{tid} REVERSAL DETECTED — {target_side} dropped to ${bid:.2f}")
+                    log_msg(f"[HEDGE] #{tid} Buying {hedge_shares}sh {hedge_side} @ ${hedge_price:.2f} (${hedge_cost:.2f})")
+
+                    if self.engine:
+                        hedge_order = await self.engine.buy_taker(hedge_token, hedge_price, hedge_shares)
+                        if hedge_order:
+                            hedge_placed = True
+                            hedge_shares = hedge_order.get("size", hedge_shares)
+                            log_msg(f"[HEDGE] #{tid} FILLED {hedge_shares}sh {hedge_side} @ ${hedge_price:.2f}")
+                        else:
+                            log_msg(f"[HEDGE] #{tid} Fill FAILED")
+                    else:
+                        # Paper mode
+                        hedge_placed = True
+                        log_msg(f"[HEDGE-PAPER] #{tid} Simulated {hedge_shares}sh {hedge_side} @ ${hedge_price:.2f}")
 
             # SL: direction completely reversed
             if bid <= SL_PRICE and time.time() < window_end:
@@ -446,7 +495,14 @@ class SnipeBot:
                 if self.engine:
                     await self.engine.emergency_sell(target_token, shares, "SL")
                 self.sl_hits += 1
-                self._record_trade(tid, asset, target_side, entry_price, bid, shares, pnl, "SL", mkt["question"])
+                # Hedge will resolve separately — if hedge is on the winning side, it profits
+                if hedge_placed:
+                    # Hedge side is winning since our side lost
+                    hedge_pnl = round(hedge_shares * (1.00 - hedge_entry), 4)
+                    pnl += hedge_pnl
+                    log_msg(f"[HEDGE] #{tid} SL — hedge wins +${hedge_pnl:.2f} (net P&L ${pnl:+.2f})")
+                self._record_trade(tid, asset, target_side, entry_price, bid, shares, pnl, "SL+HEDGE" if hedge_placed else "SL", mkt["question"],
+                                   hedge_placed=hedge_placed, hedge_cost=hedge_cost, hedge_shares=hedge_shares, hedge_entry=hedge_entry)
                 return
 
             # LOSS: resolved to $0
@@ -454,24 +510,36 @@ class SnipeBot:
                 pnl = round(-shares * entry_price, 4)
                 if self.engine:
                     await self.engine.emergency_sell(target_token, shares, "LOSS")
-                self._record_trade(tid, asset, target_side, entry_price, 0, shares, pnl, "LOSS", mkt["question"])
+                # Hedge wins!
+                if hedge_placed:
+                    hedge_pnl = round(hedge_shares * (1.00 - hedge_entry), 4)
+                    pnl += hedge_pnl
+                    log_msg(f"[HEDGE] #{tid} LOSS → hedge wins +${hedge_pnl:.2f} (net P&L ${pnl:+.2f})")
+                self._record_trade(tid, asset, target_side, entry_price, 0, shares, pnl, "LOSS+HEDGE" if hedge_placed else "LOSS", mkt["question"],
+                                   hedge_placed=hedge_placed, hedge_cost=hedge_cost, hedge_shares=hedge_shares, hedge_entry=hedge_entry)
                 return
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)  # Poll faster for hedge detection
 
         # Timeout — determine by final bid
         book = await get_book(target_token)
         final_bid = book["bid"] if book else 0
         if final_bid > 0.5:
             pnl = round(shares * (1.00 - entry_price), 4)
-            self._record_trade(tid, asset, target_side, entry_price, 1.00, shares, pnl, "WIN-LATE", mkt["question"])
+            if hedge_placed:
+                hedge_loss = round(-hedge_cost, 4)
+                pnl += hedge_loss
+            self._record_trade(tid, asset, target_side, entry_price, 1.00, shares, pnl, "WIN-LATE", mkt["question"],
+                               hedge_placed=hedge_placed, hedge_cost=hedge_cost, hedge_shares=hedge_shares, hedge_entry=hedge_entry)
         else:
             pnl = round(-shares * entry_price, 4)
             if self.engine:
                 await self.engine.emergency_sell(target_token, shares, "EXP")
-            self._record_trade(tid, asset, target_side, entry_price, 0, shares, pnl, "LOSS", mkt["question"])
+            self._record_trade(tid, asset, target_side, entry_price, 0, shares, pnl, "LOSS", mkt["question"],
+                               hedge_placed=hedge_placed, hedge_cost=hedge_cost, hedge_shares=hedge_shares, hedge_entry=hedge_entry)
 
-    def _record_trade(self, tid, asset, side, entry, exit_price, shares, pnl, result, question):
+    def _record_trade(self, tid, asset, side, entry, exit_price, shares, pnl, result, question,
+                       hedge_placed=False, hedge_cost=0, hedge_shares=0, hedge_entry=0):
         # Always use calculated P&L (wallet sync causes false readings with shared wallet)
         self.bankroll = round(self.bankroll + pnl, 4)
 
@@ -491,15 +559,18 @@ class SnipeBot:
         dd = (self.peak - self.bankroll) / self.peak * 100 if self.peak > 0 else 0
         if dd > self.max_dd:
             self.max_dd = dd
-        # Drawdown pause removed — compounding handles risk via bet sizing
 
         total = self.wins + self.losses + self.flat
         wr = self.wins / total * 100 if total else 0
         ret_pct = round(pnl / (shares * entry) * 100, 1) if entry > 0 else 0
 
+        hedge_str = ""
+        if hedge_placed:
+            hedge_str = f" | HEDGE: {hedge_shares}sh @ ${hedge_entry:.2f} (${hedge_cost:.2f})"
+
         log_msg(f"[{result}] #{tid} {asset} {side} @ ${entry:.2f}→${exit_price:.2f} | "
                 f"P&L ${pnl:+.2f} ({ret_pct:+.1f}%) | bank ${self.bankroll:.2f} | "
-                f"{self.wins}W/{self.losses}L ({wr:.0f}%)")
+                f"{self.wins}W/{self.losses}L ({wr:.0f}%){hedge_str}")
 
         try:
             self.log_file.write(json.dumps({
@@ -507,6 +578,8 @@ class SnipeBot:
                 "entry": entry, "exit": exit_price, "shares": shares,
                 "pnl": pnl, "return_pct": ret_pct, "result": result,
                 "bankroll": self.bankroll, "question": question,
+                "hedge_placed": hedge_placed, "hedge_cost": round(hedge_cost, 4),
+                "hedge_shares": hedge_shares, "hedge_entry": round(hedge_entry, 4),
                 "time": datetime.now(timezone.utc).isoformat(),
             }) + "\n")
             self.log_file.flush()
