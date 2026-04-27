@@ -65,7 +65,7 @@ ENTRY_SECONDS_BEFORE = 15   # Enter at T-15 seconds
 SL_PRICE = 0.49             # Only triggers if direction completely reverses
 
 # Reactive hedge: if BTC crosses back toward threshold, buy the OTHER side
-HEDGE_BTC_THRESHOLD = 15.0  # Hedge when BTC is within $15 of price to beat (was on our side by $100+ at entry)
+HEDGE_THRESHOLD_PCT = 0.00019  # Hedge when asset price is within ~0.019% of threshold
 HEDGE_PCT = 0.10            # Hedge with 10% of bankroll on the other side
 HEDGE_MAX_PRICE = 0.30      # Don't hedge if cheap side already above $0.30
 
@@ -541,11 +541,7 @@ class SnipeBot:
             price_to_beat = self.coinbase.get_window_open(asset)
 
             if not hedge_placed and time.time() < window_end and asset_price > 0 and price_to_beat > 0:
-                # Threshold is relative to asset price, not fixed dollar amount
-                # Use percentage: $15 on BTC ($77K) ≈ 0.02%, but for DOGE ($0.17) that would be $0.00003
-                # Instead use a percentage of the price to beat
-                threshold_pct = HEDGE_BTC_THRESHOLD / 77000.0  # normalize to ~0.02%
-                threshold_abs = price_to_beat * threshold_pct
+                threshold_abs = price_to_beat * HEDGE_THRESHOLD_PCT
 
                 should_hedge = False
                 if target_side == "UP" and price_to_beat > 0:
@@ -757,7 +753,7 @@ async def main():
     bot._write_summary()
 
     log_msg(f"[INIT] {'LIVE' if bot.engine else 'PAPER'} mode — Bank: ${bot.bankroll:.2f}")
-    log_msg(f"[INIT] Hedge: asset within ~{HEDGE_BTC_THRESHOLD/77000*100:.3f}% of threshold → buy other side ({int(HEDGE_PCT*100)}%)")
+    log_msg(f"[INIT] Hedge: asset within ~{HEDGE_THRESHOLD_PCT*100:.3f}% of threshold → buy other side ({int(HEDGE_PCT*100)}%)")
 
     # Wait for Coinbase to connect
     log_msg(f"[COINBASE] Connecting to {', '.join(ASSETS)}...")
@@ -775,7 +771,7 @@ async def main():
     asyncio.create_task(send_telegram(
         f"🎯 <b>{BOT_NAME}</b>\n"
         f"Last-15s snipe @ ${MIN_ENTRY}-${MAX_ENTRY}\n"
-        f"Hedge: BTC ±${HEDGE_BTC_THRESHOLD:.0f} → buy other side\n"
+        f"Hedge: ±{HEDGE_THRESHOLD_PCT*100:.3f}% of threshold → buy other side\n"
         f"SL ${SL_PRICE} | {', '.join(ASSETS)}\n"
         f"Bank: ${bot.bankroll:.2f}"))
 
