@@ -64,10 +64,10 @@ ENTRY_SECONDS_BEFORE = 15   # Enter at T-15 seconds
 # Stop loss
 SL_PRICE = 0.49             # Only triggers if direction completely reverses
 
-# Reactive hedge: if our side drops below this, buy the OTHER side
-HEDGE_TRIGGER = 0.90        # Our side drops below $0.90 → reversal detected
+# Reactive hedge: if BTC crosses back toward threshold, buy the OTHER side
+HEDGE_BTC_THRESHOLD = 15.0  # Hedge when BTC is within $15 of price to beat (was on our side by $100+ at entry)
 HEDGE_PCT = 0.10            # Hedge with 10% of bankroll on the other side
-HEDGE_MAX_PRICE = 0.20      # Don't hedge if cheap side already above $0.20
+HEDGE_MAX_PRICE = 0.30      # Don't hedge if cheap side already above $0.30
 
 # DRAWDOWN_PAUSE removed — compounding strategy handles losses via bet sizing
 
@@ -83,6 +83,57 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 PAPER_MODE = os.getenv("SNIPE_ALT_LIVE", "0") != "1"
 ASSETS = ["ETH", "DOGE"]
+
+# ── Coinbase Price Feed (for hedge trigger) ────────────
+class CoinbaseFeed:
+    def __init__(self):
+        self.price = 0.0
+        self.last_update = 0.0
+        self.connected = False
+        self.window_open_price = 0.0
+        self.current_window = 0
+
+    def _check_window(self):
+        window = int(time.time()) // 300
+        if window != self.current_window:
+            self.current_window = window
+            self.window_open_price = self.price
+
+    async def run(self):
+        while True:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(
+                        "wss://ws-feed.exchange.coinbase.com",
+                        timeout=aiohttp.ClientTimeout(total=30),
+                        heartbeat=15,
+                    ) as ws:
+                        sub = json.dumps({
+                            "type": "subscribe",
+                            "product_ids": ["BTC-USD"],
+                            "channels": ["ticker"]
+                        })
+                        await ws.send_str(sub)
+                        self.connected = True
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    data = json.loads(msg.data)
+                                    if data.get("type") == "ticker":
+                                        p = float(data.get("price", 0))
+                                        if p > 0:
+                                            self.price = p
+                                            self.last_update = time.time()
+                                            self._check_window()
+                                except Exception:
+                                    pass
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+            except Exception:
+                pass
+            self.connected = False
+            await asyncio.sleep(2)
+
 
 os.makedirs("logs", exist_ok=True)
 BOT_NAME = "SNIPE-ALT-LIVE" if not PAPER_MODE else "SNIPE-ALT-PAPER"
@@ -274,8 +325,9 @@ class ExecutionEngine:
 
 # ── Snipe Bot ──────────────────────────────────────────
 class SnipeBot:
-    def __init__(self):
+    def __init__(self, coinbase):
         self.mf = MarketFinder()
+        self.coinbase = coinbase
         self.client = None
         self.engine = None
         self.bankroll = STARTING_BANKROLL
@@ -461,32 +513,48 @@ class SnipeBot:
                                    hedge_placed=hedge_placed, hedge_cost=hedge_cost, hedge_shares=hedge_shares, hedge_entry=hedge_entry)
                 return
 
-            # ── REACTIVE HEDGE: detect reversal, buy the other side ──
-            if bid <= HEDGE_TRIGGER and not hedge_placed and time.time() < window_end:
-                # Check cheap side price
-                hedge_book = await get_book(hedge_token)
-                if hedge_book and hedge_book["ask"] <= HEDGE_MAX_PRICE and hedge_book["ask"] > 0.01:
-                    hedge_bet = round(self.bankroll * HEDGE_PCT, 2)
-                    hedge_price = snap_price(min(hedge_book["ask"] + 0.01, 0.99))
-                    hedge_shares = round(max(hedge_bet / hedge_price, 5))
-                    hedge_entry = hedge_price
-                    hedge_cost = round(hedge_shares * hedge_price, 4)
+            # ── REACTIVE HEDGE: if BTC crosses back toward threshold, buy OTHER side ──
+            if not hedge_placed and time.time() < window_end and self.coinbase.price > 0:
+                btc_now = self.coinbase.price
+                price_to_beat = self.coinbase.window_open_price
 
-                    log_msg(f"[HEDGE] #{tid} REVERSAL DETECTED — {target_side} dropped to ${bid:.2f}")
-                    log_msg(f"[HEDGE] #{tid} Buying {hedge_shares}sh {hedge_side} @ ${hedge_price:.2f} (${hedge_cost:.2f})")
+                # Check if BTC has moved back toward (or past) the threshold
+                # We bought UP → BTC was above threshold. Hedge if BTC drops near/below it.
+                # We bought DOWN → BTC was below threshold. Hedge if BTC rises near/above it.
+                should_hedge = False
+                if target_side == "UP" and price_to_beat > 0:
+                    # We need BTC > price_to_beat to win. Hedge if BTC within $15 of it.
+                    if btc_now <= price_to_beat + HEDGE_BTC_THRESHOLD:
+                        should_hedge = True
+                elif target_side == "DOWN" and price_to_beat > 0:
+                    # We need BTC < price_to_beat to win. Hedge if BTC within $15 of it.
+                    if btc_now >= price_to_beat - HEDGE_BTC_THRESHOLD:
+                        should_hedge = True
 
-                    if self.engine:
-                        hedge_order = await self.engine.buy_taker(hedge_token, hedge_price, hedge_shares)
-                        if hedge_order:
-                            hedge_placed = True
-                            hedge_shares = hedge_order.get("size", hedge_shares)
-                            log_msg(f"[HEDGE] #{tid} FILLED {hedge_shares}sh {hedge_side} @ ${hedge_price:.2f}")
+                if should_hedge:
+                    hedge_book = await get_book(hedge_token)
+                    if hedge_book and hedge_book["ask"] <= HEDGE_MAX_PRICE and hedge_book["ask"] > 0.01:
+                        hedge_bet = round(self.bankroll * HEDGE_PCT, 2)
+                        hedge_price = snap_price(min(hedge_book["ask"] + 0.01, 0.99))
+                        hedge_shares = round(max(hedge_bet / hedge_price, 5))
+                        hedge_entry = hedge_price
+                        hedge_cost = round(hedge_shares * hedge_price, 4)
+
+                        diff_from_beat = btc_now - price_to_beat
+                        log_msg(f"[HEDGE] #{tid} BTC ${btc_now:,.2f} near threshold ${price_to_beat:,.2f} (${diff_from_beat:+,.2f})")
+                        log_msg(f"[HEDGE] #{tid} Buying {hedge_shares}sh {hedge_side} @ ${hedge_price:.2f} (${hedge_cost:.2f})")
+
+                        if self.engine:
+                            hedge_order = await self.engine.buy_taker(hedge_token, hedge_price, hedge_shares)
+                            if hedge_order:
+                                hedge_placed = True
+                                hedge_shares = hedge_order.get("size", hedge_shares)
+                                log_msg(f"[HEDGE] #{tid} FILLED {hedge_shares}sh {hedge_side} @ ${hedge_price:.2f}")
+                            else:
+                                log_msg(f"[HEDGE] #{tid} Fill FAILED")
                         else:
-                            log_msg(f"[HEDGE] #{tid} Fill FAILED")
-                    else:
-                        # Paper mode
-                        hedge_placed = True
-                        log_msg(f"[HEDGE-PAPER] #{tid} Simulated {hedge_shares}sh {hedge_side} @ ${hedge_price:.2f}")
+                            hedge_placed = True
+                            log_msg(f"[HEDGE-PAPER] #{tid} Simulated {hedge_shares}sh {hedge_side} @ ${hedge_price:.2f}")
 
             # SL: direction completely reversed
             if bid <= SL_PRICE and time.time() < window_end:
@@ -657,15 +725,30 @@ async def main():
     print(f"  Assets: {', '.join(ASSETS)} | Bankroll: ${STARTING_BANKROLL} | Bet: {int(BET_PCT*100)}%")
     print()
 
-    bot = SnipeBot()
+    coinbase = CoinbaseFeed()
+    bot = SnipeBot(coinbase)
     bot.init_clob()
     bot._write_summary()
 
     log_msg(f"[INIT] {'LIVE' if bot.engine else 'PAPER'} mode — Bank: ${bot.bankroll:.2f}")
+    log_msg(f"[INIT] Hedge: BTC within ${HEDGE_BTC_THRESHOLD:.0f} of threshold → buy other side ({int(HEDGE_PCT*100)}%)")
+
+    # Wait for Coinbase to connect
+    log_msg("[COINBASE] Connecting...")
+    asyncio.create_task(coinbase.run())
+    for _ in range(30):
+        if coinbase.connected and coinbase.price > 0:
+            break
+        await asyncio.sleep(0.5)
+    if coinbase.connected:
+        log_msg(f"[COINBASE] Connected — BTC ${coinbase.price:,.2f}")
+    else:
+        log_msg("[COINBASE] Not connected — hedge will be disabled until connected")
 
     asyncio.create_task(send_telegram(
         f"🎯 <b>{BOT_NAME}</b>\n"
         f"Last-15s snipe @ ${MIN_ENTRY}-${MAX_ENTRY}\n"
+        f"Hedge: BTC ±${HEDGE_BTC_THRESHOLD:.0f} → buy other side\n"
         f"SL ${SL_PRICE} | {', '.join(ASSETS)}\n"
         f"Bank: ${bot.bankroll:.2f}"))
 
