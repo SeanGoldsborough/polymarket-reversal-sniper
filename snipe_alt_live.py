@@ -84,22 +84,44 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 PAPER_MODE = os.getenv("SNIPE_ALT_LIVE", "0") != "1"
 ASSETS = ["ETH", "DOGE"]
 
-# ── Coinbase Price Feed (for hedge trigger) ────────────
-class CoinbaseFeed:
-    def __init__(self):
-        self.price = 0.0
-        self.last_update = 0.0
-        self.connected = False
-        self.window_open_price = 0.0
+# ── Coinbase Price Feeds (for hedge trigger) ───────────
+# Maps asset name to Coinbase product ID
+COINBASE_PRODUCTS = {
+    "ETH": "ETH-USD",
+    "DOGE": "DOGE-USD",
+    "XRP": "XRP-USD",
+    "BTC": "BTC-USD",
+    "SOL": "SOL-USD",
+}
+
+class CoinbaseMultiFeed:
+    """Single WebSocket tracking multiple assets."""
+    def __init__(self, assets):
+        self.assets = assets
+        self.prices = {a: 0.0 for a in assets}
+        self.window_open_prices = {a: 0.0 for a in assets}
         self.current_window = 0
+        self.connected = False
+
+    def get_price(self, asset):
+        return self.prices.get(asset, 0.0)
+
+    def get_window_open(self, asset):
+        return self.window_open_prices.get(asset, 0.0)
 
     def _check_window(self):
         window = int(time.time()) // 300
         if window != self.current_window:
             self.current_window = window
-            self.window_open_price = self.price
+            for a in self.assets:
+                if self.prices[a] > 0:
+                    self.window_open_prices[a] = self.prices[a]
 
     async def run(self):
+        product_ids = [COINBASE_PRODUCTS[a] for a in self.assets if a in COINBASE_PRODUCTS]
+        # Reverse lookup: product_id → asset
+        prod_to_asset = {COINBASE_PRODUCTS[a]: a for a in self.assets if a in COINBASE_PRODUCTS}
+
         while True:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -110,7 +132,7 @@ class CoinbaseFeed:
                     ) as ws:
                         sub = json.dumps({
                             "type": "subscribe",
-                            "product_ids": ["BTC-USD"],
+                            "product_ids": product_ids,
                             "channels": ["ticker"]
                         })
                         await ws.send_str(sub)
@@ -120,10 +142,11 @@ class CoinbaseFeed:
                                 try:
                                     data = json.loads(msg.data)
                                     if data.get("type") == "ticker":
+                                        prod = data.get("product_id", "")
                                         p = float(data.get("price", 0))
-                                        if p > 0:
-                                            self.price = p
-                                            self.last_update = time.time()
+                                        asset = prod_to_asset.get(prod)
+                                        if asset and p > 0:
+                                            self.prices[asset] = p
                                             self._check_window()
                                 except Exception:
                                     pass
@@ -513,22 +536,25 @@ class SnipeBot:
                                    hedge_placed=hedge_placed, hedge_cost=hedge_cost, hedge_shares=hedge_shares, hedge_entry=hedge_entry)
                 return
 
-            # ── REACTIVE HEDGE: if BTC crosses back toward threshold, buy OTHER side ──
-            if not hedge_placed and time.time() < window_end and self.coinbase.price > 0:
-                btc_now = self.coinbase.price
-                price_to_beat = self.coinbase.window_open_price
+            # ── REACTIVE HEDGE: if asset price crosses back toward threshold, buy OTHER side ──
+            asset_price = self.coinbase.get_price(asset)
+            price_to_beat = self.coinbase.get_window_open(asset)
 
-                # Check if BTC has moved back toward (or past) the threshold
-                # We bought UP → BTC was above threshold. Hedge if BTC drops near/below it.
-                # We bought DOWN → BTC was below threshold. Hedge if BTC rises near/above it.
+            if not hedge_placed and time.time() < window_end and asset_price > 0 and price_to_beat > 0:
+                # Threshold is relative to asset price, not fixed dollar amount
+                # Use percentage: $15 on BTC ($77K) ≈ 0.02%, but for DOGE ($0.17) that would be $0.00003
+                # Instead use a percentage of the price to beat
+                threshold_pct = HEDGE_BTC_THRESHOLD / 77000.0  # normalize to ~0.02%
+                threshold_abs = price_to_beat * threshold_pct
+
                 should_hedge = False
                 if target_side == "UP" and price_to_beat > 0:
-                    # We need BTC > price_to_beat to win. Hedge if BTC within $15 of it.
-                    if btc_now <= price_to_beat + HEDGE_BTC_THRESHOLD:
+                    # We need asset > price_to_beat. Hedge if asset drops near/below it.
+                    if asset_price <= price_to_beat + threshold_abs:
                         should_hedge = True
                 elif target_side == "DOWN" and price_to_beat > 0:
-                    # We need BTC < price_to_beat to win. Hedge if BTC within $15 of it.
-                    if btc_now >= price_to_beat - HEDGE_BTC_THRESHOLD:
+                    # We need asset < price_to_beat. Hedge if asset rises near/above it.
+                    if asset_price >= price_to_beat - threshold_abs:
                         should_hedge = True
 
                 if should_hedge:
@@ -540,8 +566,8 @@ class SnipeBot:
                         hedge_entry = hedge_price
                         hedge_cost = round(hedge_shares * hedge_price, 4)
 
-                        diff_from_beat = btc_now - price_to_beat
-                        log_msg(f"[HEDGE] #{tid} BTC ${btc_now:,.2f} near threshold ${price_to_beat:,.2f} (${diff_from_beat:+,.2f})")
+                        diff_from_beat = asset_price - price_to_beat
+                        log_msg(f"[HEDGE] #{tid} {asset} ${asset_price:,.4f} near threshold ${price_to_beat:,.4f} (${diff_from_beat:+,.4f})")
                         log_msg(f"[HEDGE] #{tid} Buying {hedge_shares}sh {hedge_side} @ ${hedge_price:.2f} (${hedge_cost:.2f})")
 
                         if self.engine:
@@ -725,25 +751,26 @@ async def main():
     print(f"  Assets: {', '.join(ASSETS)} | Bankroll: ${STARTING_BANKROLL} | Bet: {int(BET_PCT*100)}%")
     print()
 
-    coinbase = CoinbaseFeed()
+    coinbase = CoinbaseMultiFeed(ASSETS)
     bot = SnipeBot(coinbase)
     bot.init_clob()
     bot._write_summary()
 
     log_msg(f"[INIT] {'LIVE' if bot.engine else 'PAPER'} mode — Bank: ${bot.bankroll:.2f}")
-    log_msg(f"[INIT] Hedge: BTC within ${HEDGE_BTC_THRESHOLD:.0f} of threshold → buy other side ({int(HEDGE_PCT*100)}%)")
+    log_msg(f"[INIT] Hedge: asset within ~{HEDGE_BTC_THRESHOLD/77000*100:.3f}% of threshold → buy other side ({int(HEDGE_PCT*100)}%)")
 
     # Wait for Coinbase to connect
-    log_msg("[COINBASE] Connecting...")
+    log_msg(f"[COINBASE] Connecting to {', '.join(ASSETS)}...")
     asyncio.create_task(coinbase.run())
     for _ in range(30):
-        if coinbase.connected and coinbase.price > 0:
+        if coinbase.connected and all(coinbase.get_price(a) > 0 for a in ASSETS):
             break
         await asyncio.sleep(0.5)
     if coinbase.connected:
-        log_msg(f"[COINBASE] Connected — BTC ${coinbase.price:,.2f}")
+        prices_str = " | ".join(f"{a} ${coinbase.get_price(a):,.4f}" for a in ASSETS)
+        log_msg(f"[COINBASE] Connected — {prices_str}")
     else:
-        log_msg("[COINBASE] Not connected — hedge will be disabled until connected")
+        log_msg("[COINBASE] Not fully connected — hedge will be disabled until connected")
 
     asyncio.create_task(send_telegram(
         f"🎯 <b>{BOT_NAME}</b>\n"
