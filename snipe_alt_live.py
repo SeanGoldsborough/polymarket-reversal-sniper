@@ -508,9 +508,9 @@ class SnipeBot:
             hedge_token = mkt["up"]
             hedge_side = "UP"
 
-        # Monitor for SL or resolution (only ~15 seconds left + 60s resolution wait)
+        # Monitor for SL or resolution (only ~15 seconds left + 90s resolution wait)
         window_end = (int(time.time()) // 300 + 1) * 300
-        monitor_end = window_end + 60
+        monitor_end = window_end + 90
         hedge_placed = False
         hedge_shares = 0
         hedge_cost = 0
@@ -611,21 +611,48 @@ class SnipeBot:
 
             await asyncio.sleep(0.5)  # Poll faster for hedge detection
 
-        # Timeout — determine by final bid
+        # Timeout — wait for definitive resolution (bid >= 0.95 or <= 0.05)
+        for _ in range(120):  # Up to 2 more minutes
+            book = await get_book(target_token)
+            if book:
+                if book["bid"] >= 0.95:
+                    pnl = round(shares * (1.00 - entry_price), 4)
+                    if hedge_placed:
+                        pnl += round(-hedge_cost, 4)
+                    self._record_trade(tid, asset, target_side, entry_price, 1.00, shares, pnl, "WIN-LATE", mkt["question"],
+                                       hedge_placed=hedge_placed, hedge_cost=hedge_cost, hedge_shares=hedge_shares, hedge_entry=hedge_entry)
+                    return
+                if book["bid"] <= 0.05:
+                    pnl = round(-shares * entry_price, 4)
+                    if hedge_placed:
+                        pnl += round(hedge_shares * (1.00 - hedge_entry), 4)
+                        log_msg(f"[HEDGE] #{tid} LOSS-LATE — hedge wins (net P&L ${pnl:+.2f})")
+                    self._record_trade(tid, asset, target_side, entry_price, 0, shares, pnl, "LOSS", mkt["question"],
+                                       hedge_placed=hedge_placed, hedge_cost=hedge_cost, hedge_shares=hedge_shares, hedge_entry=hedge_entry)
+                    return
+            await asyncio.sleep(1)
+
+        # Final fallback — read book one more time and decide
         book = await get_book(target_token)
         final_bid = book["bid"] if book else 0
-        if final_bid > 0.5:
+        log_msg(f"[TIMEOUT] #{tid} Final bid=${final_bid:.2f} after extended wait")
+        if final_bid >= 0.90:
             pnl = round(shares * (1.00 - entry_price), 4)
             if hedge_placed:
-                hedge_loss = round(-hedge_cost, 4)
-                pnl += hedge_loss
+                pnl += round(-hedge_cost, 4)
             self._record_trade(tid, asset, target_side, entry_price, 1.00, shares, pnl, "WIN-LATE", mkt["question"],
                                hedge_placed=hedge_placed, hedge_cost=hedge_cost, hedge_shares=hedge_shares, hedge_entry=hedge_entry)
-        else:
+        elif final_bid <= 0.10:
             pnl = round(-shares * entry_price, 4)
-            if self.engine:
-                await self.engine.emergency_sell(target_token, shares, "EXP")
+            if hedge_placed:
+                pnl += round(hedge_shares * (1.00 - hedge_entry), 4)
             self._record_trade(tid, asset, target_side, entry_price, 0, shares, pnl, "LOSS", mkt["question"],
+                               hedge_placed=hedge_placed, hedge_cost=hedge_cost, hedge_shares=hedge_shares, hedge_entry=hedge_entry)
+        else:
+            # Truly ambiguous — log as unknown, assume loss to be safe
+            log_msg(f"[WARN] #{tid} Ambiguous resolution bid=${final_bid:.2f} — recording as LOSS")
+            pnl = round(-shares * entry_price, 4)
+            self._record_trade(tid, asset, target_side, entry_price, final_bid, shares, pnl, "LOSS-AMBIGUOUS", mkt["question"],
                                hedge_placed=hedge_placed, hedge_cost=hedge_cost, hedge_shares=hedge_shares, hedge_entry=hedge_entry)
 
     def _record_trade(self, tid, asset, side, entry, exit_price, shares, pnl, result, question,
