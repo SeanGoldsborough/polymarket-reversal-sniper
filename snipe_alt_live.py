@@ -43,9 +43,9 @@ load_dotenv()
 
 CLOB_AVAILABLE = False
 try:
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, OrderType
-    from py_clob_client.order_builder.constants import BUY, SELL
+    from py_clob_client_v2.client import ClobClient
+    from py_clob_client_v2.clob_types import OrderArgs, OrderType
+    from py_clob_client_v2.order_builder.constants import BUY, SELL
     CLOB_AVAILABLE = True
 except ImportError:
     pass
@@ -197,7 +197,7 @@ async def send_telegram(msg):
 def get_clob_balance(client):
     """Read balance from CLOB API using correct signature_type."""
     try:
-        from py_clob_client.clob_types import BalanceAllowanceParams
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams
         params = BalanceAllowanceParams(asset_type="COLLATERAL", token_id="", signature_type=2)
         result = client.get_balance_allowance(params)
         balance = int(result.get("balance", "0")) / 1_000_000
@@ -378,7 +378,7 @@ class SnipeBot:
         try:
             self.client = ClobClient(CLOB_HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID,
                                      signature_type=SIGNATURE_TYPE, funder=FUNDER_ADDRESS)
-            self.client.set_api_creds(self.client.create_or_derive_api_creds())
+            self.client.set_api_creds(self.client.create_or_derive_api_key())
             self.engine = ExecutionEngine(self.client)
             log_msg("[CLOB] Auth OK — LIVE execution ready")
             # Sync bankroll from wallet

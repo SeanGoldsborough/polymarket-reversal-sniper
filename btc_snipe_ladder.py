@@ -39,9 +39,9 @@ load_dotenv()
 
 CLOB_AVAILABLE = False
 try:
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, OrderType
-    from py_clob_client.order_builder.constants import BUY
+    from py_clob_client_v2.client import ClobClient
+    from py_clob_client_v2.clob_types import OrderArgs, OrderType
+    from py_clob_client_v2.order_builder.constants import BUY
     CLOB_AVAILABLE = True
 except ImportError:
     pass
@@ -197,7 +197,7 @@ class BTCSnipeLadderBot:
         try:
             self.client = ClobClient(CLOB_HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID,
                                      signature_type=SIGNATURE_TYPE, funder=FUNDER_ADDRESS)
-            self.client.set_api_creds(self.client.create_or_derive_api_creds())
+            self.client.set_api_creds(self.client.create_or_derive_api_key())
             log_msg("[CLOB] Auth OK — LIVE execution ready")
         except Exception as e:
             log_msg(f"[CLOB] Auth fail: {e}")
