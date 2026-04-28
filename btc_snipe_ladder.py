@@ -41,7 +41,7 @@ CLOB_AVAILABLE = False
 try:
     from py_clob_client_v2.client import ClobClient
     from py_clob_client_v2.clob_types import OrderArgs, OrderType
-    from py_clob_client_v2.order_builder.constants import BUY
+    from py_clob_client_v2.order_builder.constants import BUY, SELL
     CLOB_AVAILABLE = True
 except ImportError:
     pass
@@ -54,6 +54,11 @@ ENTRY_SECONDS_BEFORE = 70       # Enter at T-70
 
 MIN_LEADING_BID = 0.70          # Only trade if leading side bid >= this
 MAX_LEADING_BID = 0.95          # Don't trade if leading side already too expensive
+
+# Reactive hedge
+HEDGE_THRESHOLD_PCT = 0.00019  # Hedge when BTC within ~0.019% of threshold
+HEDGE_BET = 5.00               # $5 hedge bet on the other side
+HEDGE_MAX_PRICE = 0.30         # Don't hedge if cheap side already above $0.30
 
 STARTING_BANKROLL = 100.0
 
@@ -68,6 +73,55 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 PAPER_MODE = os.getenv("BTC_SNIPE_LADDER_LIVE", "0") != "1"
+
+# ── Coinbase BTC Feed (for hedge trigger) ──────────────
+class CoinbaseFeed:
+    def __init__(self):
+        self.price = 0.0
+        self.connected = False
+        self.window_open_price = 0.0
+        self.current_window = 0
+
+    def _check_window(self):
+        window = int(time.time()) // 300
+        if window != self.current_window:
+            self.current_window = window
+            self.window_open_price = self.price
+
+    async def run(self):
+        while True:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(
+                        "wss://ws-feed.exchange.coinbase.com",
+                        timeout=aiohttp.ClientTimeout(total=30),
+                        heartbeat=15,
+                    ) as ws:
+                        sub = json.dumps({
+                            "type": "subscribe",
+                            "product_ids": ["BTC-USD"],
+                            "channels": ["ticker"]
+                        })
+                        await ws.send_str(sub)
+                        self.connected = True
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    data = json.loads(msg.data)
+                                    if data.get("type") == "ticker":
+                                        p = float(data.get("price", 0))
+                                        if p > 0:
+                                            self.price = p
+                                            self._check_window()
+                                except Exception:
+                                    pass
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+            except Exception:
+                pass
+            self.connected = False
+            await asyncio.sleep(2)
+
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 os.makedirs("logs", exist_ok=True)
@@ -170,6 +224,7 @@ class BTCSnipeLadderBot:
         self.log_file = open(LOG_FILE, "a")
         self.unfilled = 0
         self._pending_trade = None
+        self.coinbase = None  # Set in main()
 
     async def _read_wallet_balance(self):
         """Read pUSD balance from Polygon via aiohttp."""
@@ -329,9 +384,18 @@ class BTCSnipeLadderBot:
             log_msg(f"[FAIL] #{tid} No orders placed")
             return False
 
+        # Determine hedge token (the OTHER side)
+        if target_side == "UP":
+            hedge_token = mkt["down"]
+            hedge_side = "DOWN"
+        else:
+            hedge_token = mkt["up"]
+            hedge_side = "UP"
+
         # Store trade info for resolution tracking
         self._pending_trade = {
             "tid": tid, "target_side": target_side, "target_token": target_token,
+            "hedge_token": hedge_token, "hedge_side": hedge_side,
             "current_bid": current_bid, "orders_placed": orders_placed,
             "valid_prices": valid_prices, "question": mkt["question"],
         }
@@ -346,8 +410,14 @@ class BTCSnipeLadderBot:
         tid = trade["tid"]
         target_token = trade["target_token"]
         target_side = trade["target_side"]
+        hedge_token = trade["hedge_token"]
+        hedge_side = trade["hedge_side"]
         current_bid = trade["current_bid"]
         orders_placed = trade["orders_placed"]
+        hedge_placed = False
+        hedge_shares = 0
+        hedge_cost = 0
+        hedge_entry = 0
 
         # Check fills
         filled_shares = 0
@@ -394,22 +464,68 @@ class BTCSnipeLadderBot:
         avg_fill = filled_cost / filled_shares if filled_shares > 0 else 0
         log_msg(f"[FILLED] #{tid} {filled_shares:.0f}sh @ avg ${avg_fill:.3f} (${filled_cost:.2f})")
 
-        # Wait for definitive resolution
+        # Wait for definitive resolution + hedge monitoring
+        window_end = (int(time.time()) // 300 + 1) * 300
         for _ in range(90):
             book = await get_book(target_token)
             if book:
                 if book["bid"] >= 0.95:
                     pnl = round(filled_shares * (1.00 - avg_fill), 4)
+                    if hedge_placed:
+                        pnl += round(-hedge_cost, 4)
+                        log_msg(f"[HEDGE] #{tid} WIN — hedge lost ${hedge_cost:.2f} (net ${pnl:+.2f})")
                     self._record_trade(tid, target_side, avg_fill, 1.00, filled_shares, filled_cost,
                                        pnl, "WIN", trade["question"], current_bid, orders_placed)
                     self._pending_trade = None
                     return
                 if book["bid"] <= 0.05:
                     pnl = round(-filled_cost, 4)
+                    if hedge_placed:
+                        hedge_pnl = round(hedge_shares * (1.00 - hedge_entry), 4)
+                        pnl += hedge_pnl
+                        log_msg(f"[HEDGE] #{tid} LOSS — hedge wins +${hedge_pnl:.2f} (net ${pnl:+.2f})")
                     self._record_trade(tid, target_side, avg_fill, 0.00, filled_shares, filled_cost,
-                                       pnl, "LOSS", trade["question"], current_bid, orders_placed)
+                                       pnl, "LOSS+HEDGE" if hedge_placed else "LOSS", trade["question"], current_bid, orders_placed)
                     self._pending_trade = None
                     return
+
+            # ── REACTIVE HEDGE: check BTC price vs threshold ──
+            if not hedge_placed and self.coinbase and self.coinbase.price > 0 and time.time() < window_end:
+                btc_now = self.coinbase.price
+                price_to_beat = self.coinbase.window_open_price
+                if price_to_beat > 0:
+                    threshold_abs = price_to_beat * HEDGE_THRESHOLD_PCT
+                    should_hedge = False
+                    if target_side == "UP" and btc_now <= price_to_beat + threshold_abs:
+                        should_hedge = True
+                    elif target_side == "DOWN" and btc_now >= price_to_beat - threshold_abs:
+                        should_hedge = True
+
+                    if should_hedge:
+                        hedge_book = await get_book(hedge_token)
+                        if hedge_book and hedge_book["ask"] <= HEDGE_MAX_PRICE and hedge_book["ask"] > 0.01:
+                            hedge_price = snap_price(min(hedge_book["ask"] + 0.01, 0.99))
+                            hedge_shares = round(max(HEDGE_BET / hedge_price, 5))
+                            hedge_entry = hedge_price
+                            hedge_cost = round(hedge_shares * hedge_price, 4)
+                            diff = btc_now - price_to_beat
+                            log_msg(f"[HEDGE] #{tid} BTC ${btc_now:,.2f} near threshold ${price_to_beat:,.2f} (${diff:+,.2f})")
+                            log_msg(f"[HEDGE] #{tid} Buying {hedge_shares}sh {hedge_side} @ ${hedge_price:.2f} (${hedge_cost:.2f})")
+                            if self.client and not PAPER_MODE:
+                                try:
+                                    args = OrderArgs(price=hedge_price, size=hedge_shares, side=BUY, token_id=hedge_token)
+                                    signed = self.client.create_order(args)
+                                    resp = self.client.post_order(signed, OrderType.FOK)
+                                    oid = resp.get("orderID", "")
+                                    if oid:
+                                        hedge_placed = True
+                                        log_msg(f"[HEDGE] #{tid} FILLED")
+                                except Exception as e:
+                                    log_msg(f"[HEDGE] #{tid} FAILED: {str(e)[:60]}")
+                            else:
+                                hedge_placed = True
+                                log_msg(f"[HEDGE-PAPER] #{tid} Simulated")
+
             await asyncio.sleep(1)
 
         # Extended wait
@@ -418,14 +534,18 @@ class BTCSnipeLadderBot:
             if book:
                 if book["bid"] >= 0.95:
                     pnl = round(filled_shares * (1.00 - avg_fill), 4)
+                    if hedge_placed:
+                        pnl += round(-hedge_cost, 4)
                     self._record_trade(tid, target_side, avg_fill, 1.00, filled_shares, filled_cost,
                                        pnl, "WIN-LATE", trade["question"], current_bid, orders_placed)
                     self._pending_trade = None
                     return
                 if book["bid"] <= 0.05:
                     pnl = round(-filled_cost, 4)
+                    if hedge_placed:
+                        pnl += round(hedge_shares * (1.00 - hedge_entry), 4)
                     self._record_trade(tid, target_side, avg_fill, 0.00, filled_shares, filled_cost,
-                                       pnl, "LOSS", trade["question"], current_bid, orders_placed)
+                                       pnl, "LOSS+HEDGE" if hedge_placed else "LOSS", trade["question"], current_bid, orders_placed)
                     self._pending_trade = None
                     return
             await asyncio.sleep(1)
@@ -436,12 +556,16 @@ class BTCSnipeLadderBot:
         log_msg(f"[TIMEOUT] #{tid} Final bid=${final_bid:.2f} after extended wait")
         if final_bid >= 0.90:
             pnl = round(filled_shares * (1.00 - avg_fill), 4)
+            if hedge_placed:
+                pnl += round(-hedge_cost, 4)
             self._record_trade(tid, target_side, avg_fill, 1.00, filled_shares, filled_cost,
                                pnl, "WIN-LATE", trade["question"], current_bid, orders_placed)
         elif final_bid <= 0.10:
             pnl = round(-filled_cost, 4)
+            if hedge_placed:
+                pnl += round(hedge_shares * (1.00 - hedge_entry), 4)
             self._record_trade(tid, target_side, avg_fill, 0.00, filled_shares, filled_cost,
-                               pnl, "LOSS", trade["question"], current_bid, orders_placed)
+                               pnl, "LOSS+HEDGE" if hedge_placed else "LOSS", trade["question"], current_bid, orders_placed)
         else:
             log_msg(f"[WARN] #{tid} Ambiguous bid=${final_bid:.2f} — recording as LOSS")
             pnl = round(-filled_cost, 4)
@@ -557,7 +681,9 @@ async def main():
         print(f"  Paper mode — set BTC_SNIPE_LADDER_LIVE=1 to go live")
     print()
 
+    coinbase = CoinbaseFeed()
     bot = BTCSnipeLadderBot()
+    bot.coinbase = coinbase
     bot.init_clob()
 
     # Sync wallet balance in live mode
@@ -584,6 +710,18 @@ async def main():
     log_msg(f"[SYNC] Waiting {wait:.0f}s for window boundary...")
     await asyncio.sleep(wait)
     log_msg(f"[SYNC] Aligned.")
+
+    # Start Coinbase feed for hedge trigger
+    log_msg("[COINBASE] Connecting BTC-USD...")
+    asyncio.create_task(coinbase.run())
+    for _ in range(15):
+        if coinbase.connected and coinbase.price > 0:
+            break
+        await asyncio.sleep(0.5)
+    if coinbase.connected:
+        log_msg(f"[COINBASE] Connected — BTC ${coinbase.price:,.2f}")
+    else:
+        log_msg("[COINBASE] Not connected — hedge disabled until connected")
 
     await asyncio.gather(bot.run(), run_status(bot))
 
