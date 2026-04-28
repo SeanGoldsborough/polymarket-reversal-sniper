@@ -52,10 +52,11 @@ except ImportError:
     pass
 
 # ── Config ─────────────────────────────────────────────
-# Target buy prices for each side
-TARGET_PRICES = [0.40, 0.42, 0.44, 0.45]  # Bid at these prices
-BET_PER_PRICE = 5.00                       # $5 per price level per side
-MAX_COMBINED_COST = 0.92                   # Only buy if total cost < this (per share pair)
+# Target buy price — only buy when ask dips to this
+TARGET_PRICE = 0.47                        # Buy each side at $0.47
+MAX_OTHER_SIDE_ASK = 0.60                  # Only buy if other side's ask is also < this (market undecided)
+BET_PER_SIDE = 5.00                        # $5 per side
+MAX_COMBINED_COST = 0.96                   # Max combined cost per share pair ($0.48 + $0.48)
 
 SCAN_INTERVAL = 5                          # Check book every 5 seconds
 ENTRY_START = 30                           # Start scanning at T+30
@@ -260,58 +261,59 @@ class BTCBothSidesBot:
                 "down_ask": down_book["ask"],
             })
 
-            # Check if UP side has asks at our target prices
-            for target in TARGET_PRICES:
-                if up_total_shares > 0:
-                    break  # Already filled UP side at one price
+            up_ask = up_book["ask"]
+            down_ask = down_book["ask"]
 
-                # REALISTIC CHECK: is there actual ask liquidity at or below our target?
-                available_at_target = sum(size for price, size in up_book["asks"] if price <= target)
-                if available_at_target >= 5:  # At least 5 shares available
-                    shares = round(BET_PER_PRICE / target)
-                    if shares < 5:
-                        shares = 5
-                    actual_shares = min(shares, int(available_at_target))
-                    cost = actual_shares * target
-                    up_fills.append((target, actual_shares, time.time()))
-                    up_total_cost += cost
-                    up_total_shares += actual_shares
-                    log_msg(f"[FILL-UP] #{tid} {actual_shares}sh @ ${target:.2f} (${cost:.2f}) | "
-                            f"ask depth={available_at_target:.0f}sh at T+{elapsed:.0f}s")
+            # Only buy UP if:
+            # 1. UP ask <= target price
+            # 2. DOWN ask is also reasonable (market still undecided)
+            # 3. Haven't already filled UP
+            if up_total_shares == 0 and up_ask <= TARGET_PRICE and up_ask > 0.01:
+                if down_ask <= MAX_OTHER_SIDE_ASK:
+                    available = sum(size for price, size in up_book["asks"] if price <= TARGET_PRICE)
+                    if available >= 5:
+                        shares = round(BET_PER_SIDE / TARGET_PRICE)
+                        if shares < 5:
+                            shares = 5
+                        actual_shares = min(shares, int(available))
+                        cost = actual_shares * up_ask
+                        up_fills.append((up_ask, actual_shares, time.time()))
+                        up_total_cost += cost
+                        up_total_shares += actual_shares
+                        log_msg(f"[FILL-UP] #{tid} {actual_shares}sh @ ${up_ask:.2f} (${cost:.2f}) | "
+                                f"DOWN ask=${down_ask:.2f} (undecided) | T+{elapsed:.0f}s")
 
-            # Check DOWN side
-            for target in TARGET_PRICES:
-                if down_total_shares > 0:
-                    break
+            # Only buy DOWN if:
+            # 1. DOWN ask <= target price
+            # 2. UP ask is also reasonable (market still undecided)
+            # 3. Haven't already filled DOWN
+            if down_total_shares == 0 and down_ask <= TARGET_PRICE and down_ask > 0.01:
+                if up_ask <= MAX_OTHER_SIDE_ASK:
+                    available = sum(size for price, size in down_book["asks"] if price <= TARGET_PRICE)
+                    if available >= 5:
+                        shares = round(BET_PER_SIDE / TARGET_PRICE)
+                        if shares < 5:
+                            shares = 5
+                        actual_shares = min(shares, int(available))
+                        cost = actual_shares * down_ask
+                        down_fills.append((down_ask, actual_shares, time.time()))
+                        down_total_cost += cost
+                        down_total_shares += actual_shares
+                        log_msg(f"[FILL-DN] #{tid} {actual_shares}sh @ ${down_ask:.2f} (${cost:.2f}) | "
+                                f"UP ask=${up_ask:.2f} (undecided) | T+{elapsed:.0f}s")
 
-                available_at_target = sum(size for price, size in down_book["asks"] if price <= target)
-                if available_at_target >= 5:
-                    shares = round(BET_PER_PRICE / target)
-                    if shares < 5:
-                        shares = 5
-                    actual_shares = min(shares, int(available_at_target))
-                    cost = actual_shares * target
-                    down_fills.append((target, actual_shares, time.time()))
-                    down_total_cost += cost
-                    down_total_shares += actual_shares
-                    log_msg(f"[FILL-DN] #{tid} {actual_shares}sh @ ${target:.2f} (${cost:.2f}) | "
-                            f"ask depth={available_at_target:.0f}sh at T+{elapsed:.0f}s")
-
-            # If both filled, check combined cost
+            # If both filled, we're done — guaranteed profit
             if up_total_shares > 0 and down_total_shares > 0:
                 avg_up = up_total_cost / up_total_shares
                 avg_down = down_total_cost / down_total_shares
                 combined = avg_up + avg_down
-                if combined < MAX_COMBINED_COST:
-                    log_msg(f"[BOTH] #{tid} UP ${avg_up:.3f} + DOWN ${avg_down:.3f} = ${combined:.3f} < ${MAX_COMBINED_COST} ✓")
-                    break  # Stop scanning, we have both sides
-                else:
-                    log_msg(f"[WARN] #{tid} Combined ${combined:.3f} >= ${MAX_COMBINED_COST} — too expensive")
+                log_msg(f"[BOTH] #{tid} UP ${avg_up:.3f} + DOWN ${avg_down:.3f} = ${combined:.3f} | "
+                        f"Guaranteed profit: ${1.00 - combined:.3f}/pair")
+                break
 
             # Log status every 30 seconds
             if int(elapsed) % 30 == 0 and int(elapsed) > 0:
-                log_msg(f"[WATCH] #{tid} T+{elapsed:.0f}s | UP: bid=${up_book['bid']:.2f} ask=${up_book['ask']:.2f} | "
-                        f"DOWN: bid=${down_book['bid']:.2f} ask=${down_book['ask']:.2f} | "
+                log_msg(f"[WATCH] #{tid} T+{elapsed:.0f}s | UP ask=${up_ask:.2f} DN ask=${down_ask:.2f} | "
                         f"fills: UP={up_total_shares} DN={down_total_shares}")
 
             await asyncio.sleep(SCAN_INTERVAL)
@@ -469,7 +471,8 @@ class BTCBothSidesBot:
             "max_dd": round(self.max_dd, 1),
             "both_filled": self.both_filled,
             "one_filled": self.one_filled,
-            "target_prices": TARGET_PRICES,
+            "target_price": TARGET_PRICE,
+            "max_other_side_ask": MAX_OTHER_SIDE_ASK,
             "updated": datetime.now(timezone.utc).isoformat(),
         }
         atomic_write_json(SUMMARY_FILE, summary)
@@ -482,8 +485,8 @@ class BTCBothSidesBot:
 
         print(f"\n  [{ts()}] {'='*60}")
         print(f"  {BOT_NAME} | {elapsed:.0f}min | PAPER")
-        print(f"  Strategy: Buy BOTH sides below ${max(TARGET_PRICES)}")
-        print(f"  Targets: {', '.join(f'${p}' for p in TARGET_PRICES)}")
+        print(f"  Strategy: Buy BOTH sides at ${TARGET_PRICE} when market undecided")
+        print(f"  Target: ${TARGET_PRICE} per side | Only if other side ask < ${MAX_OTHER_SIDE_ASK}")
         print(f"  Bank: ${self.bankroll:.2f} (${pnl:+.2f}) | Peak: ${self.peak:.2f}")
         print(f"  Trades: {total} ({self.wins}W/{self.losses}L) WR: {wr:.0f}%")
         print(f"  Both-filled: {self.both_filled} | One-filled: {self.one_filled}")
@@ -500,9 +503,9 @@ async def main():
     print("=" * 65)
     print(f"  {BOT_NAME} — Buy Both Sides Below ${max(TARGET_PRICES)}")
     print("=" * 65)
-    print(f"  Monitor book, buy UP and DOWN when asks dip to targets")
-    print(f"  Targets: {', '.join(f'${p}' for p in TARGET_PRICES)}")
-    print(f"  ${BET_PER_PRICE}/level | Max combined: ${MAX_COMBINED_COST}")
+    print(f"  Monitor book, buy UP and DOWN when asks dip to ${TARGET_PRICE}")
+    print(f"  Only buy when OTHER side ask < ${MAX_OTHER_SIDE_ASK} (market undecided)")
+    print(f"  ${BET_PER_SIDE}/side | Max combined: ${MAX_COMBINED_COST}")
     print(f"  Scan: T+{ENTRY_START} to T-{ENTRY_END} | Every {SCAN_INTERVAL}s")
     print(f"  REALISTIC: only fills when real ask depth exists")
     print()
