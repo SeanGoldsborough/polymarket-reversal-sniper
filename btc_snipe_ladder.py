@@ -360,8 +360,8 @@ class BTCSnipeLadderBot:
 
         avg_fill = filled_cost / filled_shares if filled_shares > 0 else 0
 
-        # Check resolution
-        for _ in range(60):
+        # Check resolution — wait for definitive bid (>= 0.95 or <= 0.05)
+        for _ in range(90):
             book = await get_book(target_token)
             if book:
                 if book["bid"] >= 0.95:
@@ -376,17 +376,39 @@ class BTCSnipeLadderBot:
                     return
             await asyncio.sleep(1)
 
-        # Timeout
+        # Extended wait — keep checking for up to 2 more minutes
+        for _ in range(120):
+            book = await get_book(target_token)
+            if book:
+                if book["bid"] >= 0.95:
+                    pnl = round(filled_shares * (1.00 - avg_fill), 4)
+                    self._record_trade(tid, target_side, avg_fill, 1.00, filled_shares, filled_cost,
+                                       pnl, "WIN-LATE", mkt["question"], current_bid, orders_placed)
+                    return
+                if book["bid"] <= 0.05:
+                    pnl = round(-filled_cost, 4)
+                    self._record_trade(tid, target_side, avg_fill, 0.00, filled_shares, filled_cost,
+                                       pnl, "LOSS", mkt["question"], current_bid, orders_placed)
+                    return
+            await asyncio.sleep(1)
+
+        # Final fallback — use strict thresholds
         book = await get_book(target_token)
         final_bid = book["bid"] if book else 0
-        if final_bid > 0.5:
+        log_msg(f"[TIMEOUT] #{tid} Final bid=${final_bid:.2f} after extended wait")
+        if final_bid >= 0.90:
             pnl = round(filled_shares * (1.00 - avg_fill), 4)
             self._record_trade(tid, target_side, avg_fill, 1.00, filled_shares, filled_cost,
                                pnl, "WIN-LATE", mkt["question"], current_bid, orders_placed)
-        else:
+        elif final_bid <= 0.10:
             pnl = round(-filled_cost, 4)
             self._record_trade(tid, target_side, avg_fill, 0.00, filled_shares, filled_cost,
                                pnl, "LOSS", mkt["question"], current_bid, orders_placed)
+        else:
+            log_msg(f"[WARN] #{tid} Ambiguous resolution bid=${final_bid:.2f} — recording as LOSS")
+            pnl = round(-filled_cost, 4)
+            self._record_trade(tid, target_side, avg_fill, final_bid, filled_shares, filled_cost,
+                               pnl, "LOSS-AMBIGUOUS", mkt["question"], current_bid, orders_placed)
 
     def _record_trade(self, tid, side, avg_fill, exit_price, shares, cost, pnl, result, question, entry_bid, orders):
         self.bankroll = round(self.bankroll + pnl, 4)
