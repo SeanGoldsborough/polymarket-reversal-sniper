@@ -51,8 +51,8 @@ except ImportError:
     pass
 
 # ── Config ─────────────────────────────────────────────
-STARTING_BANKROLL = 149.32
-BET_PCT = 0.34
+STARTING_BANKROLL = 181.45
+BET_PCT = 0.08
 MAX_BET = 5000.0
 FAK_FLOOR = 0.05
 
@@ -82,7 +82,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 PAPER_MODE = os.getenv("SNIPE_ALT_LIVE", "0") != "1"
-ASSETS = ["ETH", "DOGE"]
+ASSETS = ["ETH", "DOGE", "SOL", "XRP"]
 
 # ── Coinbase Price Feeds (for hedge trigger) ───────────
 # Maps asset name to Coinbase product ID
