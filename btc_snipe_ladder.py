@@ -169,6 +169,24 @@ class BTCSnipeLadderBot:
         self.log_file = open(LOG_FILE, "a")
         self.unfilled = 0
 
+    async def _read_wallet_balance(self):
+        """Read pUSD balance from Polygon via aiohttp."""
+        wallet = PROXY_WALLET or FUNDER_ADDRESS
+        if not wallet:
+            return None
+        padded = wallet.lower().replace("0x", "").zfill(64)
+        payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                   "params": [{"to": USDC_CONTRACT, "data": f"0x70a08231{padded}"}, "latest"]}
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post("https://polygon-bor-rpc.publicnode.com", json=payload,
+                                  headers={"Content-Type": "application/json"},
+                                  timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    data = await r.json()
+                    return int(data.get("result", "0x0"), 16) / 1_000_000
+        except Exception:
+            return None
+
     def init_clob(self):
         if PAPER_MODE:
             log_msg("[CLOB] PAPER MODE — no real orders")
@@ -480,8 +498,16 @@ async def main():
 
     bot = BTCSnipeLadderBot()
     bot.init_clob()
-    bot._write_summary()
 
+    # Sync wallet balance in live mode
+    if not PAPER_MODE and bot.client:
+        bal = await bot._read_wallet_balance()
+        if bal and bal > 0:
+            bot.bankroll = bal
+            bot.peak = bal
+            log_msg(f"[WALLET] Balance: ${bal:.2f}")
+
+    bot._write_summary()
     log_msg(f"[INIT] {mode} mode — Bank: ${bot.bankroll:.2f}")
 
     asyncio.create_task(send_telegram(
