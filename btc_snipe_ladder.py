@@ -47,7 +47,8 @@ except ImportError:
     pass
 
 # ── Config ─────────────────────────────────────────────
-BET_PCT = 0.20                   # 20% of bankroll per signal
+BET_PCT = 0.00                   # Not used — fixed $1/order instead
+BET_PER_ORDER = 1.00             # $1 per ladder order, $6 total per trade
 LADDER_PRICES = [0.87, 0.88, 0.89, 0.90, 0.91, 0.92]
 ENTRY_SECONDS_BEFORE = 70       # Enter at T-70
 
@@ -276,7 +277,7 @@ class BTCSnipeLadderBot:
             log_msg(f"[SKIP] No valid ladder prices for bid ${current_bid:.2f}")
             return
 
-        total_bet = round(self.bankroll * BET_PCT, 2)
+        total_bet = round(BET_PER_ORDER * len(valid_prices), 2)
         per_order = round(total_bet / len(valid_prices), 2)
 
         self.trade_count += 1

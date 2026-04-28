@@ -51,7 +51,7 @@ except ImportError:
     pass
 
 # ── Config ─────────────────────────────────────────────
-STARTING_BANKROLL = 181.45
+STARTING_BANKROLL = 150.02
 BET_PCT = 0.08
 MAX_BET = 5000.0
 FAK_FLOOR = 0.05

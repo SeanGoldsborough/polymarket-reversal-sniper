@@ -11,7 +11,7 @@ BOT_TOKEN = "8027434003:AAEZPOsAFCXBjdxAdY8gmWGo9-PQwEir-0E"
 CHAT_ID = "7142537098"
 INTERVAL = 300  # 5 minutes
 
-LIVE_STARTING_WALLET = 181.45  # Current wallet at start of this config
+LIVE_STARTING_WALLET = 150.02  # Reset after bug fix — fresh start
 
 # ── Bot definitions: (name, log_path, tmux_session, mode) ──
 LIVE_BOTS = [
