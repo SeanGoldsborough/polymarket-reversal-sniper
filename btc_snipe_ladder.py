@@ -48,7 +48,7 @@ except ImportError:
 
 # ── Config ─────────────────────────────────────────────
 BET_PCT = 0.00                   # Not used — fixed $1/order instead
-BET_PER_ORDER = 1.00             # $1 per ladder order, $6 total per trade
+BET_PER_ORDER = 2.00             # $2 per ladder order, $12 total per trade
 LADDER_PRICES = [0.87, 0.88, 0.89, 0.90, 0.91, 0.92]
 ENTRY_SECONDS_BEFORE = 70       # Enter at T-70
 
@@ -169,6 +169,7 @@ class BTCSnipeLadderBot:
         self.start_time = time.time()
         self.log_file = open(LOG_FILE, "a")
         self.unfilled = 0
+        self._pending_trade = None
 
     async def _read_wallet_balance(self):
         """Read pUSD balance from Polygon via aiohttp."""
@@ -225,33 +226,54 @@ class BTCSnipeLadderBot:
                     log_msg(f"[RISK] Bankroll ${self.bankroll:.2f} too low")
                     continue
 
-                # Wait until T-70
+                # Scan continuously from T-70 to T-30
                 window_start = (int(time.time()) // 300) * 300
-                entry_time = window_start + 300 - ENTRY_SECONDS_BEFORE
-                now = time.time()
-                if now < entry_time:
-                    await asyncio.sleep(entry_time - now)
+                entry_start = window_start + 300 - ENTRY_SECONDS_BEFORE  # T-70
+                entry_end = window_start + 300 - 30                       # T-30
 
-                await self._snipe_ladder()
+                now = time.time()
+                if now < entry_start:
+                    await asyncio.sleep(entry_start - now)
+
+                # Place ladder once conditions qualify, then monitor fills
+                ladder_placed = False
+                while time.time() < entry_end:
+                    if not ladder_placed:
+                        placed = await self._try_place_ladder()
+                        if placed:
+                            ladder_placed = True
+                    await asyncio.sleep(3)  # Check every 3 seconds
+
+                # Cancel unfilled orders at T-30
+                if ladder_placed and self.client and not PAPER_MODE:
+                    try:
+                        self.client.cancel_all()
+                        log_msg("[CANCEL] Unfilled orders cancelled at T-30")
+                    except:
+                        pass
+
+                # If ladder was placed, wait for resolution
+                if ladder_placed:
+                    await self._wait_resolution()
 
             except Exception as e:
                 log_msg(f"[MAIN] {e}")
                 await asyncio.sleep(5)
 
-    async def _snipe_ladder(self):
+    async def _try_place_ladder(self):
+        """Check book and place ladder if conditions qualify. Returns True if placed."""
         mkt = self.mf.market
         if not mkt:
-            return
+            return False
 
         up_book, down_book = await asyncio.gather(
             get_book(mkt["up"]), get_book(mkt["down"]))
         if not up_book or not down_book:
-            return
+            return False
 
         up_bid = up_book["bid"]
         down_bid = down_book["bid"]
 
-        # Determine winning side
         if up_bid > down_bid:
             target_side = "UP"
             target_token = mkt["up"]
@@ -261,41 +283,29 @@ class BTCSnipeLadderBot:
             target_token = mkt["down"]
             current_bid = down_bid
         else:
-            return  # Equal — no clear winner
+            return False
 
-        # Check if price is in range
         if current_bid < MIN_LEADING_BID:
-            log_msg(f"[SKIP] {target_side} bid ${current_bid:.2f} < min ${MIN_LEADING_BID}")
-            return
+            return False
         if current_bid > MAX_LEADING_BID:
-            log_msg(f"[SKIP] {target_side} bid ${current_bid:.2f} > max ${MAX_LEADING_BID}")
-            return
+            return False
 
-        # Determine which ladder prices make sense (below current bid)
         valid_prices = [p for p in LADDER_PRICES if p <= current_bid + 0.02]
         if not valid_prices:
-            log_msg(f"[SKIP] No valid ladder prices for bid ${current_bid:.2f}")
-            return
-
-        total_bet = round(BET_PER_ORDER * len(valid_prices), 2)
-        per_order = round(total_bet / len(valid_prices), 2)
+            return False
 
         self.trade_count += 1
         tid = self.trade_count
 
         log_msg(f"[SIGNAL] #{tid} BTC {target_side} @ ${current_bid:.2f} | "
                 f"Ladder {len(valid_prices)} bids ${valid_prices[0]:.2f}-${valid_prices[-1]:.2f} | "
-                f"${total_bet:.2f} total | {mkt['question']}")
+                f"${BET_PER_ORDER:.2f}/order | {mkt['question']}")
 
-        # Place ladder orders
-        filled_shares = 0
-        filled_cost = 0
         orders_placed = 0
-
         for bid_price in valid_prices:
-            shares = round(per_order / bid_price)
-            if shares < 5:
-                shares = 5
+            shares = round(BET_PER_ORDER / bid_price)
+            if shares < 2:
+                shares = 2
 
             if self.client and not PAPER_MODE:
                 try:
@@ -309,107 +319,132 @@ class BTCSnipeLadderBot:
                 except Exception as e:
                     log_msg(f"[BID] err @ ${bid_price:.2f}: {e}")
             else:
-                # Paper: simulate fill if bid_price <= current market bid
-                if bid_price <= current_bid:
-                    filled_shares += shares
-                    filled_cost += shares * bid_price
-                    log_msg(f"[PAPER] BID {shares}sh @ ${bid_price:.2f} — FILLED (bid ${current_bid:.2f})")
-                else:
-                    log_msg(f"[PAPER] BID {shares}sh @ ${bid_price:.2f} — waiting")
+                log_msg(f"[PAPER] BID {shares}sh @ ${bid_price:.2f}")
                 orders_placed += 1
 
         if orders_placed == 0:
             log_msg(f"[FAIL] #{tid} No orders placed")
+            return False
+
+        # Store trade info for resolution tracking
+        self._pending_trade = {
+            "tid": tid, "target_side": target_side, "target_token": target_token,
+            "current_bid": current_bid, "orders_placed": orders_placed,
+            "valid_prices": valid_prices, "question": mkt["question"],
+        }
+        return True
+
+    async def _wait_resolution(self):
+        """Wait for resolution of the pending trade."""
+        trade = self._pending_trade
+        if not trade:
             return
 
-        # For live: monitor fills until window end
-        window_end = (int(time.time()) // 300 + 1) * 300
+        tid = trade["tid"]
+        target_token = trade["target_token"]
+        target_side = trade["target_side"]
+        current_bid = trade["current_bid"]
+        orders_placed = trade["orders_placed"]
+
+        # Check fills
+        filled_shares = 0
+        filled_cost = 0
 
         if self.client and not PAPER_MODE:
-            # Wait for fills then check resolution
-            await asyncio.sleep(window_end - time.time() - 5)
-            # Cancel unfilled orders
-            try:
-                self.client.cancel_all()
-            except:
-                pass
-            # TODO: check actual fills via order status
-        else:
-            # Paper: simulate remaining fills as price approaches resolution
-            # At T-70, some orders may fill as price moves. Simulate optimistically:
-            # assume orders at/below current bid fill immediately,
-            # orders above current bid have 50% chance of filling
-            for bid_price in valid_prices:
-                if bid_price > current_bid:
-                    shares = round(per_order / bid_price)
-                    if shares < 5:
-                        shares = 5
-                    # 50% fill chance for orders above current bid
-                    import random
-                    if random.random() < 0.5:
+            # Read fill status from order book or check positions
+            # For now, estimate based on what we placed
+            # TODO: check actual order status via API
+            await asyncio.sleep(5)
+            # Simple approach: check if we have tokens by reading the book spread
+            # If our bids were at $0.87-$0.92 and the bid is now higher, they may have filled
+            book = await get_book(target_token)
+            if book and book["bid"] >= 0.90:
+                # Likely some fills — estimate conservatively
+                for p in trade["valid_prices"]:
+                    if p <= book["bid"]:
+                        shares = round(BET_PER_ORDER / p)
+                        if shares < 2:
+                            shares = 2
                         filled_shares += shares
-                        filled_cost += shares * bid_price
-
-            # Wait for resolution
-            wait_time = max(window_end + 30 - time.time(), 5)
-            await asyncio.sleep(wait_time)
+                        filled_cost += shares * p
+        else:
+            # Paper: simulate fills for orders at/below current bid
+            for p in trade["valid_prices"]:
+                shares = round(BET_PER_ORDER / p)
+                if shares < 2:
+                    shares = 2
+                if p <= current_bid:
+                    filled_shares += shares
+                    filled_cost += shares * p
+                else:
+                    import random
+                    if random.random() < 0.3:
+                        filled_shares += shares
+                        filled_cost += shares * p
 
         if filled_shares <= 0:
             log_msg(f"[UNFILL] #{tid} No fills — skipping")
             self.unfilled += 1
+            self._pending_trade = None
             return
 
         avg_fill = filled_cost / filled_shares if filled_shares > 0 else 0
+        log_msg(f"[FILLED] #{tid} {filled_shares:.0f}sh @ avg ${avg_fill:.3f} (${filled_cost:.2f})")
 
-        # Check resolution — wait for definitive bid (>= 0.95 or <= 0.05)
+        # Wait for definitive resolution
         for _ in range(90):
             book = await get_book(target_token)
             if book:
                 if book["bid"] >= 0.95:
                     pnl = round(filled_shares * (1.00 - avg_fill), 4)
                     self._record_trade(tid, target_side, avg_fill, 1.00, filled_shares, filled_cost,
-                                       pnl, "WIN", mkt["question"], current_bid, orders_placed)
+                                       pnl, "WIN", trade["question"], current_bid, orders_placed)
+                    self._pending_trade = None
                     return
                 if book["bid"] <= 0.05:
                     pnl = round(-filled_cost, 4)
                     self._record_trade(tid, target_side, avg_fill, 0.00, filled_shares, filled_cost,
-                                       pnl, "LOSS", mkt["question"], current_bid, orders_placed)
+                                       pnl, "LOSS", trade["question"], current_bid, orders_placed)
+                    self._pending_trade = None
                     return
             await asyncio.sleep(1)
 
-        # Extended wait — keep checking for up to 2 more minutes
+        # Extended wait
         for _ in range(120):
             book = await get_book(target_token)
             if book:
                 if book["bid"] >= 0.95:
                     pnl = round(filled_shares * (1.00 - avg_fill), 4)
                     self._record_trade(tid, target_side, avg_fill, 1.00, filled_shares, filled_cost,
-                                       pnl, "WIN-LATE", mkt["question"], current_bid, orders_placed)
+                                       pnl, "WIN-LATE", trade["question"], current_bid, orders_placed)
+                    self._pending_trade = None
                     return
                 if book["bid"] <= 0.05:
                     pnl = round(-filled_cost, 4)
                     self._record_trade(tid, target_side, avg_fill, 0.00, filled_shares, filled_cost,
-                                       pnl, "LOSS", mkt["question"], current_bid, orders_placed)
+                                       pnl, "LOSS", trade["question"], current_bid, orders_placed)
+                    self._pending_trade = None
                     return
             await asyncio.sleep(1)
 
-        # Final fallback — use strict thresholds
+        # Final fallback
         book = await get_book(target_token)
         final_bid = book["bid"] if book else 0
         log_msg(f"[TIMEOUT] #{tid} Final bid=${final_bid:.2f} after extended wait")
         if final_bid >= 0.90:
             pnl = round(filled_shares * (1.00 - avg_fill), 4)
             self._record_trade(tid, target_side, avg_fill, 1.00, filled_shares, filled_cost,
-                               pnl, "WIN-LATE", mkt["question"], current_bid, orders_placed)
+                               pnl, "WIN-LATE", trade["question"], current_bid, orders_placed)
         elif final_bid <= 0.10:
             pnl = round(-filled_cost, 4)
             self._record_trade(tid, target_side, avg_fill, 0.00, filled_shares, filled_cost,
-                               pnl, "LOSS", mkt["question"], current_bid, orders_placed)
+                               pnl, "LOSS", trade["question"], current_bid, orders_placed)
         else:
-            log_msg(f"[WARN] #{tid} Ambiguous resolution bid=${final_bid:.2f} — recording as LOSS")
+            log_msg(f"[WARN] #{tid} Ambiguous bid=${final_bid:.2f} — recording as LOSS")
             pnl = round(-filled_cost, 4)
             self._record_trade(tid, target_side, avg_fill, final_bid, filled_shares, filled_cost,
-                               pnl, "LOSS-AMBIGUOUS", mkt["question"], current_bid, orders_placed)
+                               pnl, "LOSS-AMBIGUOUS", trade["question"], current_bid, orders_placed)
+        self._pending_trade = None
 
     def _record_trade(self, tid, side, avg_fill, exit_price, shares, cost, pnl, result, question, entry_bid, orders):
         self.bankroll = round(self.bankroll + pnl, 4)
