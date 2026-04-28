@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
-BTC-BOTH-SIDES — Buy Both Sides Below $0.50 on BTC 5-Min Up/Down
-===================================================================
+BTC-BOTH-SIDES — Buy Both Sides at $0.47 on BTC 5-Min Up/Down
+================================================================
 Strategy:
-  - Monitor BTC Up/Down order book throughout the window
-  - Place GTC maker bids on BOTH sides at target prices ($0.40-$0.45)
-  - If both sides fill, guaranteed profit: $1.00 - total_cost
-  - If only one side fills, hold to resolution (risky but often wins)
-  - Cancel unfilled orders at T-30
+  - At window open, place GTC maker bids at $0.47 on BOTH Up and Down
+  - Monitor via WebSocket for fills
+  - If one fills, check if market has decided:
+    - Other side ask < $0.60 → keep both bids (still undecided)
+    - Other side ask > $0.60 → cancel unfilled bid (market decided)
+  - If both fill: guaranteed profit ($1.00 - $0.94 = $0.06/pair)
+  - If one fills: hold to resolution
+  - Cancel all unfilled at T-30
 
-Realistic paper simulation:
-  - Reads REAL order book every 5 seconds
-  - Only counts fills when ask depth exists at our bid price
-  - Tracks exact fill prices and times
-  - No simulated random fills
-
-Entry: T+30 to T-30 (continuous monitoring)
-Execution: GTC maker limit orders (0% fee)
+Entry: Window open (T+10)
+Execution: GTC maker limit bids at $0.47 (0% fee)
+Monitor: Polymarket WebSocket for real-time book updates
 """
 
 import asyncio
@@ -32,6 +30,13 @@ except ImportError:
     import subprocess
     subprocess.check_call([sys.executable, "-m", "pip", "install", "aiohttp", "-q"])
     import aiohttp
+
+try:
+    import websockets
+except ImportError:
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "websockets", "-q"])
+    import websockets
 
 try:
     from dotenv import load_dotenv
@@ -52,15 +57,11 @@ except ImportError:
     pass
 
 # ── Config ─────────────────────────────────────────────
-# Target buy price — only buy when ask dips to this
-TARGET_PRICE = 0.47                        # Buy each side at $0.47
-MAX_OTHER_SIDE_ASK = 0.60                  # Only buy if other side's ask is also < this (market undecided)
+BID_PRICE = 0.47                           # Maker bid price for both sides
 BET_PER_SIDE = 5.00                        # $5 per side
-MAX_COMBINED_COST = 0.96                   # Max combined cost per share pair ($0.48 + $0.48)
-
-SCAN_INTERVAL = 5                          # Check book every 5 seconds
-ENTRY_START = 30                           # Start scanning at T+30
-ENTRY_END = 30                             # Stop scanning at T-30
+CANCEL_THRESHOLD = 0.60                    # Cancel unfilled if other side ask > this
+ENTRY_DELAY = 10                           # Place bids T+10 seconds into window
+CANCEL_BEFORE_END = 30                     # Cancel unfilled at T-30
 
 USDC_CONTRACT = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 CLOB_HOST = "https://clob.polymarket.com"
@@ -72,7 +73,8 @@ PROXY_WALLET = os.getenv("POLYMARKET_PROXY_WALLET", FUNDER_ADDRESS)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-PAPER_MODE = True  # Always paper for now
+PAPER_MODE = True
+POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 os.makedirs("logs", exist_ok=True)
@@ -141,23 +143,19 @@ class MarketFinder:
             log_msg(f"[MKT] BTC: {e}")
 
 
-async def get_full_book(token_id):
-    """Get full order book with all price levels."""
+async def get_book(token_id):
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(f"https://clob.polymarket.com/book?token_id={token_id}",
                              timeout=aiohttp.ClientTimeout(total=5)) as r:
                 if r.status == 200:
                     data = await r.json()
-                    bids = [(float(b["price"]), float(b["size"])) for b in data.get("bids", [])]
-                    asks = [(float(a["price"]), float(a["size"])) for a in data.get("asks", [])]
-                    best_bid = max((p for p, s in bids), default=0)
-                    best_ask = min((p for p, s in asks), default=0)
-                    return {
-                        "bid": best_bid, "ask": best_ask,
-                        "bids": sorted(bids, reverse=True),
-                        "asks": sorted(asks),
-                    }
+                    bids = data.get("bids", [])
+                    asks = data.get("asks", [])
+                    bb = max((float(b["price"]) for b in bids), default=0)
+                    ba = min((float(a["price"]) for a in asks), default=0)
+                    ask_depth_at_target = sum(float(a["size"]) for a in asks if float(a["price"]) <= BID_PRICE)
+                    return {"bid": bb, "ask": ba, "depth_at_target": ask_depth_at_target}
     except Exception:
         pass
     return None
@@ -166,41 +164,57 @@ async def get_full_book(token_id):
 class BTCBothSidesBot:
     def __init__(self):
         self.mf = MarketFinder()
+        self.client = None
         self.bankroll = 100.0
         self.starting_bankroll = 100.0
         self.peak = 100.0
         self.max_dd = 0
         self.wins = 0
         self.losses = 0
-        self.both_filled = 0  # Trades where both sides filled
-        self.one_filled = 0   # Trades where only one side filled
+        self.both_filled = 0
+        self.one_filled = 0
+        self.no_fills = 0
         self.trade_count = 0
         self.start_time = time.time()
         self.log_file = open(LOG_FILE, "a")
 
+    def init_clob(self):
+        if PAPER_MODE:
+            log_msg("[CLOB] PAPER MODE")
+            return
+        if not CLOB_AVAILABLE or not PRIVATE_KEY:
+            log_msg("[CLOB] No client — paper mode")
+            return
+        try:
+            self.client = ClobClient(CLOB_HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID,
+                                     signature_type=SIGNATURE_TYPE, funder=FUNDER_ADDRESS)
+            self.client.set_api_creds(self.client.create_or_derive_api_key())
+            log_msg("[CLOB] Auth OK")
+        except Exception as e:
+            log_msg(f"[CLOB] Auth fail: {e}")
+
     async def run(self):
         while True:
             try:
-                # Wait for next window
                 now = time.time()
                 nxt = (int(now) // 300 + 1) * 300
                 wait = nxt - now
                 if wait > 0:
                     await asyncio.sleep(wait)
-                await asyncio.sleep(2)
+                await asyncio.sleep(ENTRY_DELAY)
 
                 await self.mf.refresh()
                 if not self.mf.market:
                     log_msg("[LOOP] No market found")
                     continue
 
-                log_msg(f"[LOOP] Window start | Bank: ${self.bankroll:.2f} | {self.mf.market['question'][:40]}")
+                log_msg(f"[LOOP] Window start | Bank: ${self.bankroll:.2f}")
 
                 if self.bankroll < 5:
-                    log_msg(f"[RISK] Bankroll ${self.bankroll:.2f} too low")
+                    log_msg(f"[RISK] Bankroll too low")
                     continue
 
-                await self._scan_and_trade()
+                await self._trade_window()
 
             except Exception as e:
                 log_msg(f"[MAIN] {e}")
@@ -208,198 +222,260 @@ class BTCBothSidesBot:
                 traceback.print_exc()
                 await asyncio.sleep(5)
 
-    async def _scan_and_trade(self):
+    async def _trade_window(self):
         mkt = self.mf.market
         if not mkt:
             return
 
-        window_start = (int(time.time()) // 300) * 300
-        scan_start = window_start + ENTRY_START
-        scan_end = window_start + 300 - ENTRY_END
-        window_end = window_start + 300
-
-        # Wait until T+30
-        now = time.time()
-        if now < scan_start:
-            await asyncio.sleep(scan_start - now)
-
         self.trade_count += 1
         tid = self.trade_count
+        window_start = (int(time.time()) // 300) * 300
+        window_end = window_start + 300
+        cancel_time = window_end - CANCEL_BEFORE_END
 
-        # Track fills for each side
-        up_fills = []   # List of (price, shares, timestamp)
-        down_fills = []
-        up_total_cost = 0
-        down_total_cost = 0
-        up_total_shares = 0
-        down_total_shares = 0
+        up_token = mkt["up"]
+        down_token = mkt["down"]
+        shares_per_side = round(BET_PER_SIDE / BID_PRICE)
+        if shares_per_side < 5:
+            shares_per_side = 5
 
-        # Book snapshots for analysis
+        # ── PLACE BIDS ON BOTH SIDES ──
+        log_msg(f"[PLACE] #{tid} Bidding ${BID_PRICE} on BOTH sides | {shares_per_side}sh each | {mkt['question'][:40]}")
+
+        up_order_id = None
+        down_order_id = None
+
+        if self.client and not PAPER_MODE:
+            # Place real GTC orders
+            try:
+                args = OrderArgs(price=BID_PRICE, size=shares_per_side, side=BUY, token_id=up_token)
+                signed = self.client.create_order(args)
+                resp = self.client.post_order(signed, OrderType.GTC)
+                up_order_id = resp.get("orderID", "")
+                log_msg(f"[BID-UP] GTC {shares_per_side}sh @ ${BID_PRICE} order={up_order_id[:10]}...")
+            except Exception as e:
+                log_msg(f"[BID-UP] FAILED: {str(e)[:60]}")
+
+            try:
+                args = OrderArgs(price=BID_PRICE, size=shares_per_side, side=BUY, token_id=down_token)
+                signed = self.client.create_order(args)
+                resp = self.client.post_order(signed, OrderType.GTC)
+                down_order_id = resp.get("orderID", "")
+                log_msg(f"[BID-DN] GTC {shares_per_side}sh @ ${BID_PRICE} order={down_order_id[:10]}...")
+            except Exception as e:
+                log_msg(f"[BID-DN] FAILED: {str(e)[:60]}")
+        else:
+            log_msg(f"[PAPER] BID-UP {shares_per_side}sh @ ${BID_PRICE}")
+            log_msg(f"[PAPER] BID-DN {shares_per_side}sh @ ${BID_PRICE}")
+
+        # ── MONITOR VIA WEBSOCKET ──
+        up_filled = False
+        down_filled = False
+        up_fill_price = 0
+        down_fill_price = 0
+        up_cancelled = False
+        down_cancelled = False
         book_history = []
 
-        log_msg(f"[SCAN] #{tid} Monitoring both sides from T+{ENTRY_START} to T-{ENTRY_END}")
+        try:
+            async with websockets.connect(POLY_WS_URL, ping_interval=20, ping_timeout=10,
+                                           close_timeout=5) as ws:
+                sub_msg = json.dumps({
+                    "assets_ids": [up_token, down_token],
+                    "type": "market"
+                })
+                await ws.send(sub_msg)
+                log_msg(f"[WS] #{tid} Subscribed to both sides")
 
-        # Scan the book continuously
-        while time.time() < scan_end:
-            up_book = await get_full_book(mkt["up"])
-            down_book = await get_full_book(mkt["down"])
+                # Track best asks from WS updates
+                up_ask = 0
+                down_ask = 0
 
-            if not up_book or not down_book:
-                await asyncio.sleep(SCAN_INTERVAL)
-                continue
+                async for raw in ws:
+                    now = time.time()
 
-            now = time.time()
-            elapsed = now - window_start
-            remaining = window_end - now
+                    # Check if we should cancel and exit
+                    if now >= cancel_time:
+                        break
 
-            # Record book snapshot
-            book_history.append({
-                "t": round(elapsed, 1),
-                "up_bid": up_book["bid"],
-                "up_ask": up_book["ask"],
-                "down_bid": down_book["bid"],
-                "down_ask": down_book["ask"],
-            })
+                    try:
+                        msg = json.loads(raw)
+                    except:
+                        continue
 
-            up_ask = up_book["ask"]
-            down_ask = down_book["ask"]
+                    # Parse book update
+                    asset_id = msg.get("asset_id", "")
+                    asks = None
+                    if isinstance(msg.get("asks"), list):
+                        asks = msg["asks"]
+                    elif "book" in msg.get("event_type", ""):
+                        asks = msg.get("asks", [])
+                    elif "market" in msg.get("event_type", ""):
+                        asks = msg.get("asks", [])
 
-            # Only buy UP if:
-            # 1. UP ask <= target price
-            # 2. DOWN ask is also reasonable (market still undecided)
-            # 3. Haven't already filled UP
-            if up_total_shares == 0 and up_ask <= TARGET_PRICE and up_ask > 0.01:
-                if down_ask <= MAX_OTHER_SIDE_ASK:
-                    available = sum(size for price, size in up_book["asks"] if price <= TARGET_PRICE)
-                    if available >= 5:
-                        shares = round(BET_PER_SIDE / TARGET_PRICE)
-                        if shares < 5:
-                            shares = 5
-                        actual_shares = min(shares, int(available))
-                        cost = actual_shares * up_ask
-                        up_fills.append((up_ask, actual_shares, time.time()))
-                        up_total_cost += cost
-                        up_total_shares += actual_shares
-                        log_msg(f"[FILL-UP] #{tid} {actual_shares}sh @ ${up_ask:.2f} (${cost:.2f}) | "
-                                f"DOWN ask=${down_ask:.2f} (undecided) | T+{elapsed:.0f}s")
+                    if asks:
+                        best_ask = min((float(a.get("price", a.get("p", 99))) for a in asks), default=99)
+                        if asset_id == up_token:
+                            up_ask = best_ask
+                        elif asset_id == down_token:
+                            down_ask = best_ask
 
-            # Only buy DOWN if:
-            # 1. DOWN ask <= target price
-            # 2. UP ask is also reasonable (market still undecided)
-            # 3. Haven't already filled DOWN
-            if down_total_shares == 0 and down_ask <= TARGET_PRICE and down_ask > 0.01:
-                if up_ask <= MAX_OTHER_SIDE_ASK:
-                    available = sum(size for price, size in down_book["asks"] if price <= TARGET_PRICE)
-                    if available >= 5:
-                        shares = round(BET_PER_SIDE / TARGET_PRICE)
-                        if shares < 5:
-                            shares = 5
-                        actual_shares = min(shares, int(available))
-                        cost = actual_shares * down_ask
-                        down_fills.append((down_ask, actual_shares, time.time()))
-                        down_total_cost += cost
-                        down_total_shares += actual_shares
-                        log_msg(f"[FILL-DN] #{tid} {actual_shares}sh @ ${down_ask:.2f} (${cost:.2f}) | "
-                                f"UP ask=${up_ask:.2f} (undecided) | T+{elapsed:.0f}s")
+                    # Also check bids for fill detection
+                    bids = None
+                    if isinstance(msg.get("bids"), list):
+                        bids = msg["bids"]
+                    elif "book" in msg.get("event_type", ""):
+                        bids = msg.get("bids", [])
+                    elif "market" in msg.get("event_type", ""):
+                        bids = msg.get("bids", [])
 
-            # If both filled, we're done — guaranteed profit
-            if up_total_shares > 0 and down_total_shares > 0:
-                avg_up = up_total_cost / up_total_shares
-                avg_down = down_total_cost / down_total_shares
-                combined = avg_up + avg_down
-                log_msg(f"[BOTH] #{tid} UP ${avg_up:.3f} + DOWN ${avg_down:.3f} = ${combined:.3f} | "
-                        f"Guaranteed profit: ${1.00 - combined:.3f}/pair")
-                break
+                    # Paper fill detection: if ask drops to or below our bid, we filled
+                    if not up_filled and up_ask > 0 and up_ask <= BID_PRICE:
+                        up_filled = True
+                        up_fill_price = up_ask
+                        elapsed = now - window_start
+                        log_msg(f"[FILL-UP] #{tid} {shares_per_side}sh @ ${up_fill_price:.2f} | "
+                                f"DOWN ask=${down_ask:.2f} | T+{elapsed:.0f}s")
 
-            # Log status every 30 seconds
-            if int(elapsed) % 30 == 0 and int(elapsed) > 0:
-                log_msg(f"[WATCH] #{tid} T+{elapsed:.0f}s | UP ask=${up_ask:.2f} DN ask=${down_ask:.2f} | "
-                        f"fills: UP={up_total_shares} DN={down_total_shares}")
+                    if not down_filled and down_ask > 0 and down_ask <= BID_PRICE:
+                        down_filled = True
+                        down_fill_price = down_ask
+                        elapsed = now - window_start
+                        log_msg(f"[FILL-DN] #{tid} {shares_per_side}sh @ ${down_fill_price:.2f} | "
+                                f"UP ask=${up_ask:.2f} | T+{elapsed:.0f}s")
 
-            await asyncio.sleep(SCAN_INTERVAL)
+                    # ── GUARD: if one filled and market decided, cancel the other ──
+                    if up_filled and not down_filled and not down_cancelled:
+                        if down_ask > 0 and down_ask > CANCEL_THRESHOLD:
+                            # Market decided UP wins — cancel DOWN bid
+                            log_msg(f"[CANCEL-DN] #{tid} DOWN ask ${down_ask:.2f} > ${CANCEL_THRESHOLD} — market decided UP")
+                            if self.client and not PAPER_MODE and down_order_id:
+                                try:
+                                    self.client.cancel(down_order_id)
+                                except:
+                                    pass
+                            down_cancelled = True
 
-        # ── RESOLUTION ──
-        total_cost = up_total_cost + down_total_cost
-        total_shares_up = up_total_shares
-        total_shares_down = down_total_shares
+                    if down_filled and not up_filled and not up_cancelled:
+                        if up_ask > 0 and up_ask > CANCEL_THRESHOLD:
+                            log_msg(f"[CANCEL-UP] #{tid} UP ask ${up_ask:.2f} > ${CANCEL_THRESHOLD} — market decided DOWN")
+                            if self.client and not PAPER_MODE and up_order_id:
+                                try:
+                                    self.client.cancel(up_order_id)
+                                except:
+                                    pass
+                            up_cancelled = True
 
-        if total_shares_up == 0 and total_shares_down == 0:
-            log_msg(f"[SKIP] #{tid} No fills — neither side reached target prices")
-            # Log book history for analysis
-            if book_history:
-                min_up_ask = min(s["up_ask"] for s in book_history if s["up_ask"] > 0)
-                min_down_ask = min(s["down_ask"] for s in book_history if s["down_ask"] > 0)
-                log_msg(f"[DATA] #{tid} Lowest asks seen: UP ${min_up_ask:.2f} DOWN ${min_down_ask:.2f}")
+                    # If both filled, we're done monitoring
+                    if up_filled and down_filled:
+                        log_msg(f"[BOTH] #{tid} Both sides filled! UP ${up_fill_price:.2f} + DOWN ${down_fill_price:.2f} = "
+                                f"${up_fill_price + down_fill_price:.2f} | Profit: ${1.00 - up_fill_price - down_fill_price:.2f}/pair")
+                        break
+
+                    # Record snapshot every 10 seconds
+                    elapsed = now - window_start
+                    if int(elapsed) % 10 == 0 and up_ask > 0 and down_ask > 0:
+                        book_history.append({"t": round(elapsed), "up_ask": up_ask, "down_ask": down_ask})
+
+        except Exception as e:
+            log_msg(f"[WS] #{tid} Error: {e} — falling back to HTTP")
+
+        # ── CANCEL UNFILLED AT T-30 ──
+        if not up_filled and not up_cancelled:
+            if self.client and not PAPER_MODE and up_order_id:
+                try:
+                    self.client.cancel(up_order_id)
+                except:
+                    pass
+            log_msg(f"[CANCEL-UP] #{tid} Unfilled — cancelled at T-30")
+
+        if not down_filled and not down_cancelled:
+            if self.client and not PAPER_MODE and down_order_id:
+                try:
+                    self.client.cancel(down_order_id)
+                except:
+                    pass
+            log_msg(f"[CANCEL-DN] #{tid} Unfilled — cancelled at T-30")
+
+        # ── DETERMINE RESULT ──
+        both_sides = up_filled and down_filled
+        any_fill = up_filled or down_filled
+
+        if not any_fill:
+            self.no_fills += 1
+            min_up = min((s["up_ask"] for s in book_history), default=0)
+            min_down = min((s["down_ask"] for s in book_history), default=0)
+            log_msg(f"[SKIP] #{tid} No fills | Lowest asks: UP ${min_up:.2f} DOWN ${min_down:.2f}")
             return
 
-        both_sides = total_shares_up > 0 and total_shares_down > 0
+        up_cost = shares_per_side * up_fill_price if up_filled else 0
+        down_cost = shares_per_side * down_fill_price if down_filled else 0
+        total_cost = up_cost + down_cost
 
         if both_sides:
             self.both_filled += 1
-            log_msg(f"[BOTH-FILLED] #{tid} UP: {total_shares_up}sh (${up_total_cost:.2f}) + "
-                    f"DOWN: {total_shares_down}sh (${down_total_cost:.2f}) = ${total_cost:.2f}")
         else:
             self.one_filled += 1
-            side = "UP" if total_shares_up > 0 else "DOWN"
-            log_msg(f"[ONE-FILLED] #{tid} Only {side} filled — holding to resolution")
 
-        # Wait for resolution
+        # ── WAIT FOR RESOLUTION ──
         for _ in range(90):
-            up_book = await get_full_book(mkt["up"])
-            down_book = await get_full_book(mkt["down"])
-            if up_book and down_book:
+            up_book = await get_book(up_token)
+            if up_book:
                 if up_book["bid"] >= 0.95:
-                    # UP won
-                    up_pnl = total_shares_up * (1.00) - up_total_cost if total_shares_up > 0 else 0
-                    down_pnl = -down_total_cost  # DOWN resolves to $0
+                    winner = "UP"
+                    up_pnl = (shares_per_side * 1.00 - up_cost) if up_filled else 0
+                    down_pnl = -down_cost if down_filled else 0
                     pnl = round(up_pnl + down_pnl, 4)
-                    result = "WIN-BOTH" if both_sides else ("WIN" if total_shares_up > 0 else "LOSS")
-                    self._record_trade(tid, pnl, result, total_cost, up_total_cost, down_total_cost,
-                                       total_shares_up, total_shares_down, "UP", mkt["question"],
-                                       both_sides, book_history)
+                    result = "WIN-BOTH" if both_sides else ("WIN" if up_filled else "LOSS")
+                    self._record_trade(tid, pnl, result, total_cost, up_cost, down_cost,
+                                       shares_per_side if up_filled else 0,
+                                       shares_per_side if down_filled else 0,
+                                       winner, mkt["question"], both_sides, book_history)
                     return
-                if down_book["bid"] >= 0.95:
-                    # DOWN won
-                    down_pnl = total_shares_down * (1.00) - down_total_cost if total_shares_down > 0 else 0
-                    up_pnl = -up_total_cost  # UP resolves to $0
+                if up_book["bid"] <= 0.05:
+                    winner = "DOWN"
+                    down_pnl = (shares_per_side * 1.00 - down_cost) if down_filled else 0
+                    up_pnl = -up_cost if up_filled else 0
                     pnl = round(up_pnl + down_pnl, 4)
-                    result = "WIN-BOTH" if both_sides else ("WIN" if total_shares_down > 0 else "LOSS")
-                    self._record_trade(tid, pnl, result, total_cost, up_total_cost, down_total_cost,
-                                       total_shares_up, total_shares_down, "DOWN", mkt["question"],
-                                       both_sides, book_history)
+                    result = "WIN-BOTH" if both_sides else ("WIN" if down_filled else "LOSS")
+                    self._record_trade(tid, pnl, result, total_cost, up_cost, down_cost,
+                                       shares_per_side if up_filled else 0,
+                                       shares_per_side if down_filled else 0,
+                                       winner, mkt["question"], both_sides, book_history)
                     return
             await asyncio.sleep(1)
 
         # Extended wait
         for _ in range(120):
-            up_book = await get_full_book(mkt["up"])
+            up_book = await get_book(up_token)
             if up_book:
                 if up_book["bid"] >= 0.95:
-                    up_pnl = total_shares_up * 1.00 - up_total_cost if total_shares_up > 0 else 0
-                    down_pnl = -down_total_cost
+                    up_pnl = (shares_per_side * 1.00 - up_cost) if up_filled else 0
+                    down_pnl = -down_cost if down_filled else 0
                     pnl = round(up_pnl + down_pnl, 4)
-                    result = "WIN-BOTH" if both_sides else ("WIN" if total_shares_up > 0 else "LOSS")
-                    self._record_trade(tid, pnl, result, total_cost, up_total_cost, down_total_cost,
-                                       total_shares_up, total_shares_down, "UP-LATE", mkt["question"],
-                                       both_sides, book_history)
+                    self._record_trade(tid, pnl, "WIN-BOTH" if both_sides else "WIN-LATE", total_cost,
+                                       up_cost, down_cost, shares_per_side if up_filled else 0,
+                                       shares_per_side if down_filled else 0,
+                                       "UP", mkt["question"], both_sides, book_history)
                     return
                 if up_book["bid"] <= 0.05:
-                    down_pnl = total_shares_down * 1.00 - down_total_cost if total_shares_down > 0 else 0
-                    up_pnl = -up_total_cost
+                    down_pnl = (shares_per_side * 1.00 - down_cost) if down_filled else 0
+                    up_pnl = -up_cost if up_filled else 0
                     pnl = round(up_pnl + down_pnl, 4)
-                    result = "WIN-BOTH" if both_sides else ("WIN" if total_shares_down > 0 else "LOSS")
-                    self._record_trade(tid, pnl, result, total_cost, up_total_cost, down_total_cost,
-                                       total_shares_up, total_shares_down, "DOWN-LATE", mkt["question"],
-                                       both_sides, book_history)
+                    self._record_trade(tid, pnl, "WIN-BOTH" if both_sides else "WIN-LATE", total_cost,
+                                       up_cost, down_cost, shares_per_side if up_filled else 0,
+                                       shares_per_side if down_filled else 0,
+                                       "DOWN", mkt["question"], both_sides, book_history)
                     return
             await asyncio.sleep(1)
 
-        # Timeout fallback
+        # Timeout
         log_msg(f"[TIMEOUT] #{tid} Ambiguous — recording as LOSS")
         pnl = round(-total_cost, 4)
-        self._record_trade(tid, pnl, "LOSS-TIMEOUT", total_cost, up_total_cost, down_total_cost,
-                           total_shares_up, total_shares_down, "?", mkt["question"],
-                           both_sides, book_history)
+        self._record_trade(tid, pnl, "LOSS-TIMEOUT", total_cost, up_cost, down_cost,
+                           shares_per_side if up_filled else 0,
+                           shares_per_side if down_filled else 0,
+                           "?", mkt["question"], both_sides, book_history)
 
     def _record_trade(self, tid, pnl, result, total_cost, up_cost, down_cost,
                        up_shares, down_shares, winner, question, both_sides, book_history):
@@ -419,11 +495,10 @@ class BTCBothSidesBot:
         wr = self.wins / total * 100 if total else 0
         ret_pct = round(pnl / total_cost * 100, 1) if total_cost > 0 else 0
 
-        # Min asks seen during the window
         min_up = min((s["up_ask"] for s in book_history if s["up_ask"] > 0), default=0)
         min_down = min((s["down_ask"] for s in book_history if s["down_ask"] > 0), default=0)
 
-        log_msg(f"[{result}] #{tid} | P&L ${pnl:+.2f} ({ret_pct:+.1f}%) | "
+        log_msg(f"[{result}] #{tid} P&L ${pnl:+.2f} ({ret_pct:+.1f}%) | "
                 f"UP: {up_shares}sh ${up_cost:.2f} | DOWN: {down_shares}sh ${down_cost:.2f} | "
                 f"winner={winner} | both={both_sides} | bank ${self.bankroll:.2f} | "
                 f"{self.wins}W/{self.losses}L ({wr:.0f}%)")
@@ -448,7 +523,7 @@ class BTCBothSidesBot:
         self._write_summary()
 
         icon = "🟢" if pnl > 0 else "🔴"
-        both_tag = " ✅BOTH" if both_sides else " ⚠️ONE"
+        both_tag = " ✅BOTH" if both_sides else " ⚠️ONE" if (up_shares > 0 or down_shares > 0) else ""
         asyncio.create_task(send_telegram(
             f"{icon}{both_tag} <b>{BOT_NAME} #{tid}</b>\n"
             f"{result} | P&L ${pnl:+.2f} ({ret_pct:+.0f}%)\n"
@@ -471,8 +546,9 @@ class BTCBothSidesBot:
             "max_dd": round(self.max_dd, 1),
             "both_filled": self.both_filled,
             "one_filled": self.one_filled,
-            "target_price": TARGET_PRICE,
-            "max_other_side_ask": MAX_OTHER_SIDE_ASK,
+            "no_fills": self.no_fills,
+            "bid_price": BID_PRICE,
+            "cancel_threshold": CANCEL_THRESHOLD,
             "updated": datetime.now(timezone.utc).isoformat(),
         }
         atomic_write_json(SUMMARY_FILE, summary)
@@ -485,11 +561,11 @@ class BTCBothSidesBot:
 
         print(f"\n  [{ts()}] {'='*60}")
         print(f"  {BOT_NAME} | {elapsed:.0f}min | PAPER")
-        print(f"  Strategy: Buy BOTH sides at ${TARGET_PRICE} when market undecided")
-        print(f"  Target: ${TARGET_PRICE} per side | Only if other side ask < ${MAX_OTHER_SIDE_ASK}")
+        print(f"  Strategy: GTC ${BID_PRICE} on BOTH sides + WS monitor")
+        print(f"  Cancel unfilled when other side ask > ${CANCEL_THRESHOLD}")
         print(f"  Bank: ${self.bankroll:.2f} (${pnl:+.2f}) | Peak: ${self.peak:.2f}")
         print(f"  Trades: {total} ({self.wins}W/{self.losses}L) WR: {wr:.0f}%")
-        print(f"  Both-filled: {self.both_filled} | One-filled: {self.one_filled}")
+        print(f"  Both: {self.both_filled} | One: {self.one_filled} | No fill: {self.no_fills}")
         print()
 
 
@@ -501,25 +577,24 @@ async def run_status(bot):
 
 async def main():
     print("=" * 65)
-    print(f"  {BOT_NAME} — Buy Both Sides Below ${max(TARGET_PRICES)}")
+    print(f"  {BOT_NAME} — GTC ${BID_PRICE} Both Sides + WS Monitor")
     print("=" * 65)
-    print(f"  Monitor book, buy UP and DOWN when asks dip to ${TARGET_PRICE}")
-    print(f"  Only buy when OTHER side ask < ${MAX_OTHER_SIDE_ASK} (market undecided)")
-    print(f"  ${BET_PER_SIDE}/side | Max combined: ${MAX_COMBINED_COST}")
-    print(f"  Scan: T+{ENTRY_START} to T-{ENTRY_END} | Every {SCAN_INTERVAL}s")
-    print(f"  REALISTIC: only fills when real ask depth exists")
-    print()
-    print(f"  Paper mode — collecting data")
+    print(f"  Place GTC bids at ${BID_PRICE} on BOTH Up and Down at window open")
+    print(f"  Monitor via WebSocket for fills")
+    print(f"  Cancel unfilled when other side ask > ${CANCEL_THRESHOLD}")
+    print(f"  ${BET_PER_SIDE}/side | Cancel at T-{CANCEL_BEFORE_END}")
+    print(f"  Paper mode")
     print()
 
     bot = BTCBothSidesBot()
+    bot.init_clob()
     bot._write_summary()
     log_msg(f"[INIT] PAPER — Bank: ${bot.bankroll:.2f}")
 
     asyncio.create_task(send_telegram(
         f"🎯 <b>{BOT_NAME}</b> [PAPER]\n"
-        f"Buy both sides below ${max(TARGET_PRICES)}\n"
-        f"Targets: {', '.join(f'${p}' for p in TARGET_PRICES)}\n"
+        f"GTC ${BID_PRICE} both sides + WS monitor\n"
+        f"Cancel when other ask > ${CANCEL_THRESHOLD}\n"
         f"Bank: ${bot.bankroll:.2f}"))
 
     now = time.time()
