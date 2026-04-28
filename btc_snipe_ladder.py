@@ -48,7 +48,7 @@ except ImportError:
 
 # ── Config ─────────────────────────────────────────────
 BET_PCT = 0.00                   # Not used — fixed $1/order instead
-BET_PER_ORDER = 2.00             # $2 per ladder order, $12 total per trade
+BET_PER_ORDER = 5.00             # $5 per ladder order, $30 total per trade (min 5 shares)
 LADDER_PRICES = [0.87, 0.88, 0.89, 0.90, 0.91, 0.92]
 ENTRY_SECONDS_BEFORE = 70       # Enter at T-70
 
@@ -286,12 +286,15 @@ class BTCSnipeLadderBot:
             return False
 
         if current_bid < MIN_LEADING_BID:
+            log_msg(f"[SCAN] {target_side} bid ${current_bid:.2f} < min ${MIN_LEADING_BID}")
             return False
         if current_bid > MAX_LEADING_BID:
+            log_msg(f"[SCAN] {target_side} bid ${current_bid:.2f} > max ${MAX_LEADING_BID}")
             return False
 
         valid_prices = [p for p in LADDER_PRICES if p <= current_bid + 0.02]
         if not valid_prices:
+            log_msg(f"[SCAN] {target_side} bid ${current_bid:.2f} — no valid ladder prices")
             return False
 
         self.trade_count += 1
