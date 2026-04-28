@@ -51,7 +51,7 @@ CLOB_AVAILABLE = False
 try:
     from py_clob_client_v2.client import ClobClient
     from py_clob_client_v2.clob_types import OrderArgs, OrderType
-    from py_clob_client_v2.order_builder.constants import BUY
+    from py_clob_client_v2.order_builder.constants import BUY, SELL
     CLOB_AVAILABLE = True
 except ImportError:
     pass
@@ -62,6 +62,7 @@ BET_PER_SIDE = 5.00                        # $5 per side
 CANCEL_THRESHOLD = 0.60                    # Cancel unfilled if other side ask > this
 ENTRY_DELAY = 10                           # Place bids T+10 seconds into window
 CANCEL_BEFORE_END = 30                     # Cancel unfilled at T-30
+ONE_FILL_SL_PCT = 0.15                     # Sell if one-fill drops 15% from entry
 
 USDC_CONTRACT = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 CLOB_HOST = "https://clob.polymarket.com"
@@ -395,6 +396,19 @@ class BTCBothSidesBot:
         else:
             self.one_filled += 1
 
+        # For one-fill: determine which token to monitor for SL
+        sl_price = round(BID_PRICE * (1 - ONE_FILL_SL_PCT), 2)  # $0.47 * 0.85 = ~$0.40
+        one_fill_token = None
+        one_fill_side = None
+        if not both_sides:
+            if up_filled:
+                one_fill_token = up_token
+                one_fill_side = "UP"
+            else:
+                one_fill_token = down_token
+                one_fill_side = "DOWN"
+            log_msg(f"[SL-WATCH] #{tid} One fill ({one_fill_side}) — SL at ${sl_price:.2f} (-{ONE_FILL_SL_PCT*100:.0f}%)")
+
         # ── WAIT FOR RESOLUTION ──
         for _ in range(90):
             up_book = await get_book(up_token)
@@ -421,7 +435,33 @@ class BTCBothSidesBot:
                                        shares_per_side if down_filled else 0,
                                        winner, mkt["question"], both_sides, book_history)
                     return
-            await asyncio.sleep(1)
+
+            # ── ONE-FILL STOP LOSS: sell if bid drops 15% from entry ──
+            if one_fill_token and not both_sides:
+                sl_book = await get_book(one_fill_token)
+                if sl_book and sl_book["bid"] <= sl_price and sl_book["bid"] > 0.01:
+                    sell_price = sl_book["bid"]
+                    sl_shares = shares_per_side
+                    log_msg(f"[SL-HIT] #{tid} {one_fill_side} bid ${sell_price:.2f} <= SL ${sl_price:.2f} — SELLING")
+
+                    if self.client and not PAPER_MODE:
+                        try:
+                            args = OrderArgs(price=0.01, size=sl_shares, side=SELL, token_id=one_fill_token)
+                            signed = self.client.create_order(args)
+                            resp = self.client.post_order(signed, OrderType.FAK)
+                            log_msg(f"[SL-SOLD] #{tid} FAK sell {sl_shares}sh")
+                        except Exception as e:
+                            log_msg(f"[SL-SELL] #{tid} Failed: {str(e)[:60]}")
+
+                    revenue = sl_shares * sell_price
+                    pnl = round(revenue - total_cost, 4)
+                    self._record_trade(tid, pnl, "SL", total_cost, up_cost, down_cost,
+                                       shares_per_side if up_filled else 0,
+                                       shares_per_side if down_filled else 0,
+                                       "SL-" + one_fill_side, mkt["question"], both_sides, book_history)
+                    return
+
+            await asyncio.sleep(0.5)
 
         # Extended wait
         for _ in range(120):
