@@ -344,29 +344,7 @@ class BTCBothSidesBot:
                         log_msg(f"[FILL-DN] #{tid} {shares_per_side}sh @ ${down_fill_price:.2f} | "
                                 f"UP ask=${up_ask:.2f} | T+{elapsed:.0f}s")
 
-                    # ── GUARD: if one filled and market decided, cancel the other ──
-                    if up_filled and not down_filled and not down_cancelled:
-                        if down_ask > 0 and down_ask > CANCEL_THRESHOLD:
-                            # Market decided UP wins — cancel DOWN bid
-                            log_msg(f"[CANCEL-DN] #{tid} DOWN ask ${down_ask:.2f} > ${CANCEL_THRESHOLD} — market decided UP")
-                            if self.client and not PAPER_MODE and down_order_id:
-                                try:
-                                    self.client.cancel(down_order_id)
-                                except:
-                                    pass
-                            down_cancelled = True
-
-                    if down_filled and not up_filled and not up_cancelled:
-                        if up_ask > 0 and up_ask > CANCEL_THRESHOLD:
-                            log_msg(f"[CANCEL-UP] #{tid} UP ask ${up_ask:.2f} > ${CANCEL_THRESHOLD} — market decided DOWN")
-                            if self.client and not PAPER_MODE and up_order_id:
-                                try:
-                                    self.client.cancel(up_order_id)
-                                except:
-                                    pass
-                            up_cancelled = True
-
-                    # If both filled, we're done monitoring
+                    # If both filled, we're done — guaranteed profit
                     if up_filled and down_filled:
                         log_msg(f"[BOTH] #{tid} Both sides filled! UP ${up_fill_price:.2f} + DOWN ${down_fill_price:.2f} = "
                                 f"${up_fill_price + down_fill_price:.2f} | Profit: ${1.00 - up_fill_price - down_fill_price:.2f}/pair")
