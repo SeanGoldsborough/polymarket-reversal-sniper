@@ -56,7 +56,7 @@ MAX_LEADING_BID = 0.95          # Don't trade if leading side already too expens
 
 STARTING_BANKROLL = 100.0
 
-USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+USDC_CONTRACT = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 CLOB_HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
 PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")

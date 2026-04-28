@@ -71,7 +71,7 @@ HEDGE_MAX_PRICE = 0.30      # Don't hedge if cheap side already above $0.30
 
 # DRAWDOWN_PAUSE removed — compounding strategy handles losses via bet sizing
 
-USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+USDC_CONTRACT = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 CLOB_HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
 PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")

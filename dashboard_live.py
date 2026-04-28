@@ -173,17 +173,34 @@ def build_dashboard():
 
     for bot_name, log_path, tmux_name in PAPER_BOTS:
         running = is_session_running(tmux_name)
-        trades = read_trades(log_path)
-
-        # Get paper bankroll from summary
         summary = read_summary(bot_name)
-        paper_bank = summary.get("bankroll", PAPER_STARTING_BANKROLL) if summary else PAPER_STARTING_BANKROLL
-        paper_pnl = paper_bank - PAPER_STARTING_BANKROLL
 
-        line, n, w, lo, pnl = format_bot_line(bot_name, trades, running)
-        lines.append(line)
-        if n > 0 or running:
-            lines.append(f"   Bank: ${paper_bank:,.2f} ({'+'if paper_pnl>=0 else ''}{paper_pnl:,.2f}) | Start: ${PAPER_STARTING_BANKROLL:.2f}")
+        if summary and summary.get("trades", 0) > 0:
+            n = summary.get("trades", 0)
+            w = summary.get("wins", 0)
+            lo = summary.get("losses", 0)
+            pnl = summary.get("pnl_total", 0)
+            paper_bank = summary.get("bankroll", PAPER_STARTING_BANKROLL)
+            paper_start = summary.get("starting_bankroll", PAPER_STARTING_BANKROLL)
+            paper_pnl = paper_bank - paper_start
+            wr = w / n * 100 if n else 0
+
+            if not running:
+                icon = "\u26D4"
+            elif w > lo:
+                icon = "\U0001F7E2"
+            elif lo > w:
+                icon = "\U0001F534"
+            else:
+                icon = "\u26AA"
+
+            lines.append(f"{icon} <b>{bot_name}</b> | {n}t {wr:.0f}% ({w}W/{lo}L) ${pnl:+.2f}")
+            lines.append(f"   Bank: ${paper_bank:,.2f} ({'+'if paper_pnl>=0 else ''}{paper_pnl:,.2f}) | Start: ${paper_start:.2f}")
+        else:
+            if running:
+                lines.append(f"\u23F3 <b>{bot_name}</b> | waiting")
+            else:
+                lines.append(f"\u26D4 <b>{bot_name}</b> | stopped")
 
     lines.append("")
 
