@@ -55,6 +55,13 @@ ENTRY_SECONDS_BEFORE = 70       # Enter at T-70
 MIN_LEADING_BID = 0.70          # Only trade if leading side bid >= this
 MAX_LEADING_BID = 0.95          # Don't trade if leading side already too expensive
 
+# Time filter: only trade 2pm-10:59pm ET
+def is_trading_hours():
+    from datetime import datetime, timezone
+    h = datetime.now(timezone.utc).hour
+    et_hour = (h - 4) % 24
+    return 14 <= et_hour <= 22
+
 # Reactive hedge
 HEDGE_THRESHOLD_PCT = 0.00019  # Hedge when BTC within ~0.019% of threshold
 HEDGE_BET = 5.00               # $5 hedge bet on the other side
@@ -276,6 +283,9 @@ class BTCSnipeLadderBot:
                     continue
 
                 log_msg(f"[LOOP] Window start | Bank: ${self.bankroll:.2f}")
+
+                if not is_trading_hours():
+                    continue
 
                 if self.bankroll < 3:
                     log_msg(f"[RISK] Bankroll ${self.bankroll:.2f} too low")

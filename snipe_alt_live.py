@@ -61,6 +61,15 @@ MIN_ENTRY = 0.97            # Only buy if price >= this
 MAX_ENTRY = 0.99            # Don't buy above this (too expensive, no edge)
 ENTRY_SECONDS_BEFORE = 15   # Enter at T-15 seconds
 
+# Time filter: only trade 12am-8am ET and 7pm-12am ET (skip 8am-7pm ET)
+# ET = UTC - 4. 8am ET = 12 UTC, 7pm ET = 23 UTC
+def is_trading_hours():
+    from datetime import datetime, timezone
+    h = datetime.now(timezone.utc).hour
+    et_hour = (h - 4) % 24
+    # Trade: 0-7 ET (12am-8am) and 19-23 ET (7pm-12am)
+    return et_hour < 8 or et_hour >= 19
+
 # Stop loss
 SL_PRICE = 0.49             # Only triggers if direction completely reverses
 
@@ -402,6 +411,9 @@ class SnipeBot:
                     await asyncio.sleep(wait)
                 await asyncio.sleep(2)
                 log_msg(f"[LOOP] Window cycle start, bankroll=${self.bankroll:.2f}")
+
+                if not is_trading_hours():
+                    continue
 
                 if self.bankroll < 3:
                     log_msg(f"[RISK] Bankroll ${self.bankroll:.2f} too low")
