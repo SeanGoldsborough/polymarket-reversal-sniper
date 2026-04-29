@@ -264,6 +264,7 @@ class BTCBothSidesBot:
         down_shares = shares_per_side
         up_sl_hit = False
         down_sl_hit = False
+        both_logged = False
         up_sl_price = 0
         down_sl_price = 0
         last_log_time = 0
@@ -327,11 +328,11 @@ class BTCBothSidesBot:
                         log_msg(f"[FILL-DN] #{tid} {down_shares}sh @ ${down_fill_price:.2f} | "
                                 f"UP ask=${up_ask:.2f} | T+{elapsed:.0f}s")
 
-                    if up_filled and down_filled:
+                    if up_filled and down_filled and not both_logged:
+                        both_logged = True
                         combined = up_fill_price + down_fill_price
                         log_msg(f"[BOTH] #{tid} Both filled! UP ${up_fill_price:.2f} + DOWN ${down_fill_price:.2f} = "
-                                f"${combined:.2f} | SL ${SL_PRICE} on both sides")
-                        # Don't break — keep monitoring for SL on loser
+                                f"${combined:.2f} | SL ${SL_PRICE} on both sides — monitoring for SL")
 
                     # SL check on BOTH filled sides (or one-fill)
                     for item in items:
