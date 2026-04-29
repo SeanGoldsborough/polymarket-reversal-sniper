@@ -383,20 +383,48 @@ class BTCBothSidesBot:
                             except (ValueError, KeyError):
                                 pass
 
-                    # Fill detection: buy when ask is in range $0.45-$0.55
                     elapsed = now - target_window_start
 
-                    if not up_filled and BID_LOW <= up_ask <= BID_HIGH:
-                        up_filled = True
-                        up_fill_price = up_ask
-                        up_shares = shares_per_side  # Same as GTC order size
-                        log_msg(f"[FILL-UP] #{tid} {up_shares}sh @ ${up_fill_price:.2f} | "
-                                f"DOWN ask=${down_ask:.2f} | T+{elapsed:.0f}s")
+                    # Fill detection: live = check order API, paper = check ask price
+                    if not up_filled:
+                        if self.client and not PAPER_MODE and up_order_id:
+                            try:
+                                order = self.client.get_order(up_order_id)
+                                if order:
+                                    matched = float(order.get("size_matched", 0))
+                                    if matched > 0:
+                                        up_filled = True
+                                        up_fill_price = float(order.get("price", up_ask))
+                                        up_shares = int(matched)
+                                        log_msg(f"[FILL-UP] #{tid} {up_shares}sh @ ${up_fill_price:.2f} (verified) | "
+                                                f"DOWN ask=${down_ask:.2f} | T+{elapsed:.0f}s")
+                            except:
+                                pass
+                        elif BID_LOW <= up_ask <= BID_HIGH:
+                            up_filled = True
+                            up_fill_price = up_ask
+                            up_shares = shares_per_side
+                            log_msg(f"[FILL-UP] #{tid} {up_shares}sh @ ${up_fill_price:.2f} | "
+                                    f"DOWN ask=${down_ask:.2f} | T+{elapsed:.0f}s")
 
-                    if not down_filled and BID_LOW <= down_ask <= BID_HIGH:
-                        down_filled = True
-                        down_fill_price = down_ask
-                        down_shares = shares_per_side  # Same as GTC order size
+                    if not down_filled:
+                        if self.client and not PAPER_MODE and down_order_id:
+                            try:
+                                order = self.client.get_order(down_order_id)
+                                if order:
+                                    matched = float(order.get("size_matched", 0))
+                                    if matched > 0:
+                                        down_filled = True
+                                        down_fill_price = float(order.get("price", down_ask))
+                                        down_shares = int(matched)
+                                        log_msg(f"[FILL-DN] #{tid} {down_shares}sh @ ${down_fill_price:.2f} (verified) | "
+                                                f"UP ask=${up_ask:.2f} | T+{elapsed:.0f}s")
+                            except:
+                                pass
+                        elif BID_LOW <= down_ask <= BID_HIGH:
+                            down_filled = True
+                            down_fill_price = down_ask
+                            down_shares = shares_per_side
                         log_msg(f"[FILL-DN] #{tid} {down_shares}sh @ ${down_fill_price:.2f} | "
                                 f"UP ask=${up_ask:.2f} | T+{elapsed:.0f}s")
 
