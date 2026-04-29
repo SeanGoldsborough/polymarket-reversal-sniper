@@ -242,13 +242,13 @@ class BTCBothSidesBot:
     async def run(self):
         while True:
             try:
-                # At start of current window, get NEXT window's market and place orders
+                # Wait for next window boundary
                 now = time.time()
                 nxt = (int(now) // 300 + 1) * 300
                 wait = nxt - now
                 if wait > 0:
                     await asyncio.sleep(wait)
-                await asyncio.sleep(5)  # Brief delay for market to be available
+                await asyncio.sleep(5)
 
                 log_msg(f"[LOOP] Window start | Bank: ${self.bankroll:.2f}")
 
@@ -259,13 +259,16 @@ class BTCBothSidesBot:
                 # Get the NEXT window's market (prices near $0.50)
                 await self.mf.refresh_next()
                 if not self.mf.market:
-                    # Fallback to current window
                     await self.mf.refresh()
                 if not self.mf.market:
                     log_msg("[LOOP] No market found")
                     continue
 
-                await self._trade_window()
+                # Capture market data before it gets overwritten next loop
+                market_snapshot = dict(self.mf.market)
+
+                # Fire and forget — run trade in background so we don't block next window
+                asyncio.create_task(self._trade_window_safe(market_snapshot))
 
             except Exception as e:
                 log_msg(f"[MAIN] {e}")
@@ -273,8 +276,18 @@ class BTCBothSidesBot:
                 traceback.print_exc()
                 await asyncio.sleep(5)
 
-    async def _trade_window(self):
-        mkt = self.mf.market
+    async def _trade_window_safe(self, market_snapshot):
+        """Wrapper to catch errors without crashing the main loop."""
+        try:
+            await self._trade_window(market_snapshot)
+        except Exception as e:
+            log_msg(f"[TRADE-ERR] {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def _trade_window(self, mkt=None):
+        if mkt is None:
+            mkt = self.mf.market
         if not mkt:
             return
 
