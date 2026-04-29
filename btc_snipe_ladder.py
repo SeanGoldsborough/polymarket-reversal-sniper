@@ -360,6 +360,7 @@ class BTCSnipeLadderBot:
                 f"${BET_PER_ORDER:.2f}/order | {mkt['question']}")
 
         orders_placed = 0
+        order_ids = []
         for bid_price in valid_prices:
             shares = round(BET_PER_ORDER / bid_price)
             if shares < 2:
@@ -374,6 +375,7 @@ class BTCSnipeLadderBot:
                     if oid:
                         log_msg(f"[BID] GTC {shares}sh @ ${bid_price:.2f} order={oid[:8]}...")
                         orders_placed += 1
+                        order_ids.append(oid)
                 except Exception as e:
                     log_msg(f"[BID] err @ ${bid_price:.2f}: {e}")
             else:
@@ -397,6 +399,7 @@ class BTCSnipeLadderBot:
             "tid": tid, "target_side": target_side, "target_token": target_token,
             "hedge_token": hedge_token, "hedge_side": hedge_side,
             "current_bid": current_bid, "orders_placed": orders_placed,
+            "order_ids": order_ids,
             "valid_prices": valid_prices, "question": mkt["question"],
         }
         return True
@@ -424,22 +427,21 @@ class BTCSnipeLadderBot:
         filled_cost = 0
 
         if self.client and not PAPER_MODE:
-            # Read fill status from order book or check positions
-            # For now, estimate based on what we placed
-            # TODO: check actual order status via API
+            # Check actual fill status via CLOB order API
             await asyncio.sleep(5)
-            # Simple approach: check if we have tokens by reading the book spread
-            # If our bids were at $0.87-$0.92 and the bid is now higher, they may have filled
-            book = await get_book(target_token)
-            if book and book["bid"] >= 0.90:
-                # Likely some fills — estimate conservatively
-                for p in trade["valid_prices"]:
-                    if p <= book["bid"]:
-                        shares = round(BET_PER_ORDER / p)
-                        if shares < 2:
-                            shares = 2
-                        filled_shares += shares
-                        filled_cost += shares * p
+            for oid in trade.get("order_ids", []):
+                try:
+                    order = self.client.get_order(oid)
+                    if order:
+                        matched = float(order.get("size_matched", 0))
+                        price = float(order.get("price", 0))
+                        if matched > 0 and price > 0:
+                            filled_shares += matched
+                            filled_cost += matched * price
+                except Exception:
+                    pass
+            if filled_shares > 0:
+                log_msg(f"[FILL-VERIFY] #{tid} Verified {filled_shares:.0f}sh @ avg ${filled_cost/filled_shares:.3f} via order API")
         else:
             # Paper: simulate fills for orders at/below current bid
             for p in trade["valid_prices"]:
@@ -463,6 +465,18 @@ class BTCSnipeLadderBot:
 
         avg_fill = filled_cost / filled_shares if filled_shares > 0 else 0
         log_msg(f"[FILLED] #{tid} {filled_shares:.0f}sh @ avg ${avg_fill:.3f} (${filled_cost:.2f})")
+
+        # Record balance before resolution
+        pre_balance = None
+        if self.client and not PAPER_MODE:
+            try:
+                from py_clob_client_v2.clob_types import BalanceAllowanceParams
+                params = BalanceAllowanceParams(asset_type="COLLATERAL", token_id="", signature_type=2)
+                result = self.client.get_balance_allowance(params)
+                pre_balance = int(result.get("balance", "0")) / 1_000_000
+                log_msg(f"[BAL] #{tid} Pre-resolution balance: ${pre_balance:.2f}")
+            except:
+                pass
 
         # Wait for definitive resolution + hedge monitoring
         window_end = (int(time.time()) // 300 + 1) * 300
@@ -550,10 +564,38 @@ class BTCSnipeLadderBot:
                     return
             await asyncio.sleep(1)
 
-        # Final fallback
+        # Final fallback — check balance change to determine win/loss
+        post_balance = None
+        if self.client and not PAPER_MODE and pre_balance is not None:
+            try:
+                params = BalanceAllowanceParams(asset_type="COLLATERAL", token_id="", signature_type=2)
+                result = self.client.get_balance_allowance(params)
+                post_balance = int(result.get("balance", "0")) / 1_000_000
+                balance_change = post_balance - pre_balance
+                log_msg(f"[BAL] #{tid} Post-resolution: ${post_balance:.2f} (change: ${balance_change:+.2f})")
+
+                if balance_change > 0:
+                    # Balance increased — we won (tokens redeemed to pUSD)
+                    pnl = round(balance_change - filled_cost, 4) if filled_cost > 0 else round(balance_change, 4)
+                    log_msg(f"[BAL-WIN] #{tid} Balance up ${balance_change:.2f} → WIN")
+                    self._record_trade(tid, target_side, avg_fill, 1.00, filled_shares, filled_cost,
+                                       pnl, "WIN-BAL", trade["question"], current_bid, orders_placed)
+                    self._pending_trade = None
+                    return
+                elif balance_change < -1:
+                    # Balance decreased more than expected — we lost
+                    pnl = round(-filled_cost, 4)
+                    log_msg(f"[BAL-LOSS] #{tid} Balance down ${balance_change:.2f} → LOSS")
+                    self._record_trade(tid, target_side, avg_fill, 0.00, filled_shares, filled_cost,
+                                       pnl, "LOSS-BAL", trade["question"], current_bid, orders_placed)
+                    self._pending_trade = None
+                    return
+            except:
+                pass
+
         book = await get_book(target_token)
         final_bid = book["bid"] if book else 0
-        log_msg(f"[TIMEOUT] #{tid} Final bid=${final_bid:.2f} after extended wait")
+        log_msg(f"[TIMEOUT] #{tid} Final bid=${final_bid:.2f} — defaulting to LOSS")
         if final_bid >= 0.90:
             pnl = round(filled_shares * (1.00 - avg_fill), 4)
             if hedge_placed:
