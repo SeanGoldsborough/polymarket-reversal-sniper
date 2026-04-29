@@ -156,7 +156,7 @@ async def get_book(token_id):
                     asks = data.get("asks", [])
                     bb = max((float(b["price"]) for b in bids), default=0)
                     ba = min((float(a["price"]) for a in asks), default=0)
-                    ask_depth_at_target = sum(float(a["size"]) for a in asks if float(a["price"]) <= BID_PRICE)
+                    ask_depth_at_target = sum(float(a["size"]) for a in asks if float(a["price"]) <= BID_HIGH)
                     return {"bid": bb, "ask": ba, "depth_at_target": ask_depth_at_target}
     except Exception:
         pass
@@ -562,8 +562,8 @@ class BTCBothSidesBot:
             "both_filled": self.both_filled,
             "one_filled": self.one_filled,
             "no_fills": self.no_fills,
-            "bid_price": BID_PRICE,
-            "cancel_threshold": CANCEL_THRESHOLD,
+            "bid_price": BID_HIGH,
+            "cancel_threshold": BID_HIGH,
             "updated": datetime.now(timezone.utc).isoformat(),
         }
         atomic_write_json(SUMMARY_FILE, summary)
@@ -576,8 +576,8 @@ class BTCBothSidesBot:
 
         print(f"\n  [{ts()}] {'='*60}")
         print(f"  {BOT_NAME} | {elapsed:.0f}min | PAPER")
-        print(f"  Strategy: GTC ${BID_PRICE} on BOTH sides + WS monitor")
-        print(f"  Cancel unfilled when other side ask > ${CANCEL_THRESHOLD}")
+        print(f"  Strategy: GTC ${BID_HIGH} on BOTH sides + WS monitor")
+        print(f"  Cancel unfilled when other side ask > ${BID_HIGH}")
         print(f"  Bank: ${self.bankroll:.2f} (${pnl:+.2f}) | Peak: ${self.peak:.2f}")
         print(f"  Trades: {total} ({self.wins}W/{self.losses}L) WR: {wr:.0f}%")
         print(f"  Both: {self.both_filled} | One: {self.one_filled} | No fill: {self.no_fills}")
@@ -592,11 +592,11 @@ async def run_status(bot):
 
 async def main():
     print("=" * 65)
-    print(f"  {BOT_NAME} — GTC ${BID_PRICE} Both Sides + WS Monitor")
+    print(f"  {BOT_NAME} — GTC ${BID_HIGH} Both Sides + WS Monitor")
     print("=" * 65)
-    print(f"  Place GTC bids at ${BID_PRICE} on BOTH Up and Down at window open")
+    print(f"  Place GTC bids at ${BID_HIGH} on BOTH Up and Down at window open")
     print(f"  Monitor via WebSocket for fills")
-    print(f"  Cancel unfilled when other side ask > ${CANCEL_THRESHOLD}")
+    print(f"  Cancel unfilled when other side ask > ${BID_HIGH}")
     print(f"  ${BET_PER_SIDE}/side | Cancel at T-{CANCEL_BEFORE_END}")
     print(f"  Paper mode")
     print()
@@ -608,8 +608,8 @@ async def main():
 
     asyncio.create_task(send_telegram(
         f"🎯 <b>{BOT_NAME}</b> [PAPER]\n"
-        f"GTC ${BID_PRICE} both sides + WS monitor\n"
-        f"Cancel when other ask > ${CANCEL_THRESHOLD}\n"
+        f"GTC ${BID_HIGH} both sides + WS monitor\n"
+        f"Cancel when other ask > ${BID_HIGH}\n"
         f"Bank: ${bot.bankroll:.2f}"))
 
     now = time.time()
