@@ -330,39 +330,29 @@ class BTCBothSidesBot:
                     if up_filled and down_filled:
                         combined = up_fill_price + down_fill_price
                         log_msg(f"[BOTH] #{tid} Both filled! UP ${up_fill_price:.2f} + DOWN ${down_fill_price:.2f} = "
-                                f"${combined:.2f} | Profit: ${1.00 - combined:.2f}/pair")
-                        break
+                                f"${combined:.2f} | SL ${SL_PRICE} on both sides")
+                        # Don't break — keep monitoring for SL on loser
 
-                    # SL check: if a filled side's bid drops to $0.20
-                    if up_filled and not down_filled:
-                        # Check UP bid from book updates
-                        for item in items:
-                            aid = item.get("asset_id", "")
-                            bids_data = item.get("bids", [])
-                            if aid == up_token and bids_data:
-                                try:
-                                    up_bid = max(float(b["price"]) for b in bids_data if isinstance(b, dict) and "price" in b)
-                                    if up_bid <= SL_PRICE and up_bid > 0.01:
-                                        log_msg(f"[SL-UP] #{tid} UP bid ${up_bid:.2f} <= SL ${SL_PRICE} — selling")
-                                        # Mark as SL exit
-                                        up_sl_hit = True
-                                        up_sl_price = up_bid
-                                except (ValueError, KeyError):
-                                    pass
+                    # SL check on BOTH filled sides (or one-fill)
+                    for item in items:
+                        aid = item.get("asset_id", "")
+                        bids_data = item.get("bids", [])
+                        if not bids_data:
+                            continue
+                        try:
+                            best_bid = max(float(b["price"]) for b in bids_data if isinstance(b, dict) and "price" in b)
+                        except (ValueError, KeyError):
+                            continue
 
-                    if down_filled and not up_filled:
-                        for item in items:
-                            aid = item.get("asset_id", "")
-                            bids_data = item.get("bids", [])
-                            if aid == down_token and bids_data:
-                                try:
-                                    down_bid = max(float(b["price"]) for b in bids_data if isinstance(b, dict) and "price" in b)
-                                    if down_bid <= SL_PRICE and down_bid > 0.01:
-                                        log_msg(f"[SL-DN] #{tid} DOWN bid ${down_bid:.2f} <= SL ${SL_PRICE} — selling")
-                                        down_sl_hit = True
-                                        down_sl_price = down_bid
-                                except (ValueError, KeyError):
-                                    pass
+                        if aid == up_token and up_filled and not up_sl_hit and best_bid <= SL_PRICE and best_bid > 0.01:
+                            up_sl_hit = True
+                            up_sl_price = best_bid
+                            log_msg(f"[SL-UP] #{tid} UP bid ${best_bid:.2f} <= SL ${SL_PRICE} — selling")
+
+                        if aid == down_token and down_filled and not down_sl_hit and best_bid <= SL_PRICE and best_bid > 0.01:
+                            down_sl_hit = True
+                            down_sl_price = best_bid
+                            log_msg(f"[SL-DN] #{tid} DOWN bid ${best_bid:.2f} <= SL ${SL_PRICE} — selling")
 
                     # Record snapshot every 10s
                     if int(elapsed) % 10 == 0 and up_ask > 0 and down_ask > 0:
@@ -383,25 +373,6 @@ class BTCBothSidesBot:
                 up_ask = up_book["ask"]
             if down_book:
                 down_ask = down_book["ask"]
-
-        # ── HANDLE SL EXITS ──
-        if up_sl_hit and up_filled and not down_filled:
-            revenue = up_shares * up_sl_price
-            cost = up_shares * up_fill_price
-            pnl = round(revenue - cost, 4)
-            log_msg(f"[SL-EXIT] #{tid} Sold UP {up_shares}sh @ ${up_sl_price:.2f} | P&L ${pnl:+.2f}")
-            self._record_trade(tid, pnl, "SL", cost, cost, 0,
-                               up_shares, 0, "SL-UP", mkt["question"], False, book_history)
-            return
-
-        if down_sl_hit and down_filled and not up_filled:
-            revenue = down_shares * down_sl_price
-            cost = down_shares * down_fill_price
-            pnl = round(revenue - cost, 4)
-            log_msg(f"[SL-EXIT] #{tid} Sold DOWN {down_shares}sh @ ${down_sl_price:.2f} | P&L ${pnl:+.2f}")
-            self._record_trade(tid, pnl, "SL", cost, 0, cost,
-                               0, down_shares, "SL-DN", mkt["question"], False, book_history)
-            return
 
         # ── CANCEL UNFILLED AT T-30 ──
         if not up_filled:
@@ -429,27 +400,41 @@ class BTCBothSidesBot:
         else:
             self.one_filled += 1
 
-        one_fill_token = None
-        one_fill_side = None
-        if not both_sides:
-            if up_filled:
-                one_fill_token = up_token
-                one_fill_side = "UP"
-            else:
-                one_fill_token = down_token
-                one_fill_side = "DOWN"
-            log_msg(f"[WATCH-RES] #{tid} One fill ({one_fill_side}) — holding to resolution")
+        if not both_sides and up_filled:
+            log_msg(f"[WATCH-RES] #{tid} One fill (UP) — holding to resolution, SL ${SL_PRICE}")
+        elif not both_sides and down_filled:
+            log_msg(f"[WATCH-RES] #{tid} One fill (DOWN) — holding to resolution, SL ${SL_PRICE}")
+        elif both_sides:
+            log_msg(f"[WATCH-RES] #{tid} Both filled — holding to resolution, SL ${SL_PRICE} on both")
 
         # ── WAIT FOR RESOLUTION ──
         for _ in range(90):
             up_book = await get_book(up_token)
             if up_book:
+                # Check SL on filled sides (HTTP fallback for WS SL)
+                if up_filled and not up_sl_hit and up_book["bid"] <= SL_PRICE and up_book["bid"] > 0.01:
+                    up_sl_hit = True
+                    up_sl_price = up_book["bid"]
+                    log_msg(f"[SL-UP] #{tid} UP bid ${up_sl_price:.2f} <= SL ${SL_PRICE}")
+
+                down_book_check = await get_book(down_token)
+                if down_book_check and down_filled and not down_sl_hit and down_book_check["bid"] <= SL_PRICE and down_book_check["bid"] > 0.01:
+                    down_sl_hit = True
+                    down_sl_price = down_book_check["bid"]
+                    log_msg(f"[SL-DN] #{tid} DOWN bid ${down_sl_price:.2f} <= SL ${SL_PRICE}")
+
                 if up_book["bid"] >= 0.95:
                     winner = "UP"
                     up_pnl = (up_shares * 1.00 - up_cost) if up_filled else 0
-                    down_pnl = -down_cost if down_filled else 0
+                    # DOWN: SL recovery or full loss
+                    if down_sl_hit and down_filled:
+                        down_pnl = down_shares * down_sl_price - down_cost
+                    elif down_filled:
+                        down_pnl = -down_cost
+                    else:
+                        down_pnl = 0
                     pnl = round(up_pnl + down_pnl, 4)
-                    result = "WIN-BOTH" if both_sides else ("WIN" if up_filled else "LOSS")
+                    result = "WIN-BOTH+SL" if both_sides and down_sl_hit else ("WIN-BOTH" if both_sides else ("WIN" if up_filled else "LOSS"))
                     self._record_trade(tid, pnl, result, total_cost, up_cost, down_cost,
                                        up_shares if up_filled else 0,
                                        down_shares if down_filled else 0,
@@ -458,9 +443,15 @@ class BTCBothSidesBot:
                 if up_book["bid"] <= 0.05:
                     winner = "DOWN"
                     down_pnl = (down_shares * 1.00 - down_cost) if down_filled else 0
-                    up_pnl = -up_cost if up_filled else 0
+                    # UP: SL recovery or full loss
+                    if up_sl_hit and up_filled:
+                        up_pnl = up_shares * up_sl_price - up_cost
+                    elif up_filled:
+                        up_pnl = -up_cost
+                    else:
+                        up_pnl = 0
                     pnl = round(up_pnl + down_pnl, 4)
-                    result = "WIN-BOTH" if both_sides else ("WIN" if down_filled else "LOSS")
+                    result = "WIN-BOTH+SL" if both_sides and up_sl_hit else ("WIN-BOTH" if both_sides else ("WIN" if down_filled else "LOSS"))
                     self._record_trade(tid, pnl, result, total_cost, up_cost, down_cost,
                                        up_shares if up_filled else 0,
                                        down_shares if down_filled else 0,
