@@ -705,6 +705,15 @@ class SnipeBot:
 
         self._write_summary()
 
+        # Sync on-chain balance after trade resolution to prevent "Confirm pending deposit" popup
+        if self.engine and self.client:
+            try:
+                from py_clob_client_v2.clob_types import BalanceAllowanceParams
+                params = BalanceAllowanceParams(asset_type="COLLATERAL", token_id="", signature_type=2)
+                self.client.update_balance_allowance(params)
+            except Exception:
+                pass
+
         icon = "🟢" if pnl > 0 else "🔴"
         asyncio.create_task(send_telegram(
             f"{icon} <b>{BOT_NAME} #{tid}</b>\n"
