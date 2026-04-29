@@ -524,13 +524,35 @@ class BTCBothSidesBot:
                 if up_filled and not up_sl_hit and up_book["bid"] <= SL_PRICE and up_book["bid"] > 0.01:
                     up_sl_hit = True
                     up_sl_price = up_book["bid"]
-                    log_msg(f"[SL-UP] #{tid} UP bid ${up_sl_price:.2f} <= SL ${SL_PRICE}")
+                    log_msg(f"[SL-UP] #{tid} UP bid ${up_sl_price:.2f} <= SL ${SL_PRICE} — selling")
+                    if self.client and not PAPER_MODE:
+                        for attempt in range(3):
+                            try:
+                                sell_price = snap_price(max(up_sl_price - 0.02, 0.01))
+                                args = OrderArgs(price=sell_price, size=up_shares, side=SELL, token_id=up_token)
+                                signed = self.client.create_order(args)
+                                self.client.post_order(signed, OrderType.FAK)
+                                log_msg(f"[SL-SOLD-UP] #{tid} FAK sell {up_shares}sh @ ${sell_price}")
+                                break
+                            except Exception as e:
+                                log_msg(f"[SL-SELL-UP] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
 
                 down_book_check = await get_book(down_token)
                 if down_book_check and down_filled and not down_sl_hit and down_book_check["bid"] <= SL_PRICE and down_book_check["bid"] > 0.01:
                     down_sl_hit = True
                     down_sl_price = down_book_check["bid"]
-                    log_msg(f"[SL-DN] #{tid} DOWN bid ${down_sl_price:.2f} <= SL ${SL_PRICE}")
+                    log_msg(f"[SL-DN] #{tid} DOWN bid ${down_sl_price:.2f} <= SL ${SL_PRICE} — selling")
+                    if self.client and not PAPER_MODE:
+                        for attempt in range(3):
+                            try:
+                                sell_price = snap_price(max(down_sl_price - 0.02, 0.01))
+                                args = OrderArgs(price=sell_price, size=down_shares, side=SELL, token_id=down_token)
+                                signed = self.client.create_order(args)
+                                self.client.post_order(signed, OrderType.FAK)
+                                log_msg(f"[SL-SOLD-DN] #{tid} FAK sell {down_shares}sh @ ${sell_price}")
+                                break
+                            except Exception as e:
+                                log_msg(f"[SL-SELL-DN] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
 
                 if up_book["bid"] >= 0.95:
                     winner = "UP"
