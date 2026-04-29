@@ -269,7 +269,7 @@ class BTCBothSidesBot:
             log_msg(f"[PAPER] BID-UP {shares_per_side}sh @ ${BID_PRICE}")
             log_msg(f"[PAPER] BID-DN {shares_per_side}sh @ ${BID_PRICE}")
 
-        # ── MONITOR VIA HTTP POLLING (every 2 seconds) ──
+        # ── MONITOR VIA WEBSOCKET ──
         up_filled = False
         down_filled = False
         up_fill_price = 0
@@ -278,50 +278,87 @@ class BTCBothSidesBot:
         down_cancelled = False
         book_history = []
 
-        log_msg(f"[MONITOR] #{tid} Polling books every 2s until T-{CANCEL_BEFORE_END}")
+        up_ask = 0
+        down_ask = 0
+        last_log_time = 0
 
-        while time.time() < cancel_time:
-            try:
-                up_book = await get_book(up_token)
-                down_book = await get_book(down_token)
+        try:
+            async with websockets.connect(POLY_WS_URL, ping_interval=20, ping_timeout=10,
+                                           close_timeout=5) as ws:
+                sub_msg = json.dumps({"assets_ids": [up_token, down_token], "type": "market"})
+                await ws.send(sub_msg)
+                log_msg(f"[WS] #{tid} Connected — monitoring both sides")
 
-                up_ask = up_book["ask"] if up_book else 0
-                down_ask = down_book["ask"] if down_book else 0
-                now = time.time()
-                elapsed = now - window_start
+                async for raw in ws:
+                    now = time.time()
+                    if now >= cancel_time:
+                        break
 
-                # Paper fill detection: if ask drops to or below our bid, we filled
-                if not up_filled and up_ask > 0 and up_ask <= BID_PRICE:
-                    up_filled = True
-                    up_fill_price = up_ask
-                    log_msg(f"[FILL-UP] #{tid} {shares_per_side}sh @ ${up_fill_price:.2f} | "
-                            f"DOWN ask=${down_ask:.2f} | T+{elapsed:.0f}s")
+                    try:
+                        msg = json.loads(raw)
+                    except:
+                        continue
 
-                if not down_filled and down_ask > 0 and down_ask <= BID_PRICE:
-                    down_filled = True
-                    down_fill_price = down_ask
-                    log_msg(f"[FILL-DN] #{tid} {shares_per_side}sh @ ${down_fill_price:.2f} | "
-                            f"UP ask=${up_ask:.2f} | T+{elapsed:.0f}s")
+                    # Parse message — can be a list (initial snapshot) or dict (update)
+                    items = []
+                    if isinstance(msg, list):
+                        items = [m for m in msg if isinstance(m, dict)]
+                    elif isinstance(msg, dict) and ("asks" in msg or "bids" in msg):
+                        items = [msg]
 
-                # If both filled, we're done — guaranteed profit
-                if up_filled and down_filled:
-                    log_msg(f"[BOTH] #{tid} Both sides filled! UP ${up_fill_price:.2f} + DOWN ${down_fill_price:.2f} = "
-                            f"${up_fill_price + down_fill_price:.2f} | Profit: ${1.00 - up_fill_price - down_fill_price:.2f}/pair")
-                    break
+                    for item in items:
+                        aid = item.get("asset_id", "")
+                        asks = item.get("asks", [])
 
-                # Record snapshot every 10 seconds
-                if int(elapsed) % 10 == 0 and up_ask > 0 and down_ask > 0:
-                    book_history.append({"t": round(elapsed), "up_ask": up_ask, "down_ask": down_ask})
+                        if asks and isinstance(asks, list):
+                            try:
+                                best = min(float(a["price"]) for a in asks if isinstance(a, dict) and "price" in a)
+                                if aid == up_token:
+                                    up_ask = best
+                                elif aid == down_token:
+                                    down_ask = best
+                            except (ValueError, KeyError):
+                                pass
 
-                # Log status every 30 seconds
-                if int(elapsed) % 30 == 0 and elapsed > 0 and up_ask > 0:
-                    log_msg(f"[WATCH] #{tid} T+{elapsed:.0f}s | UP ask=${up_ask:.2f} DN ask=${down_ask:.2f} | "
-                            f"fills: UP={'Y' if up_filled else 'N'} DN={'Y' if down_filled else 'N'}")
+                    # Paper fill detection
+                    elapsed = now - window_start
 
-            except Exception as e:
-                log_msg(f"[POLL] #{tid} Error: {e}")
+                    if not up_filled and up_ask > 0 and up_ask <= BID_PRICE:
+                        up_filled = True
+                        up_fill_price = up_ask
+                        log_msg(f"[FILL-UP] #{tid} {shares_per_side}sh @ ${up_fill_price:.2f} | "
+                                f"DOWN ask=${down_ask:.2f} | T+{elapsed:.0f}s")
 
-            await asyncio.sleep(2)
+                    if not down_filled and down_ask > 0 and down_ask <= BID_PRICE:
+                        down_filled = True
+                        down_fill_price = down_ask
+                        log_msg(f"[FILL-DN] #{tid} {shares_per_side}sh @ ${down_fill_price:.2f} | "
+                                f"UP ask=${up_ask:.2f} | T+{elapsed:.0f}s")
+
+                    if up_filled and down_filled:
+                        log_msg(f"[BOTH] #{tid} Both filled! UP ${up_fill_price:.2f} + DOWN ${down_fill_price:.2f} = "
+                                f"${up_fill_price + down_fill_price:.2f} | Profit: ${1.00 - up_fill_price - down_fill_price:.2f}/pair")
+                        break
+
+                    # Record snapshot every 10s
+                    if int(elapsed) % 10 == 0 and up_ask > 0 and down_ask > 0:
+                        book_history.append({"t": round(elapsed), "up_ask": up_ask, "down_ask": down_ask})
+
+                    # Log every 30s
+                    if now - last_log_time >= 30 and elapsed > 5:
+                        last_log_time = now
+                        log_msg(f"[WATCH] #{tid} T+{elapsed:.0f}s | UP ask=${up_ask:.2f} DN ask=${down_ask:.2f} | "
+                                f"fills: UP={'Y' if up_filled else 'N'} DN={'Y' if down_filled else 'N'}")
+
+        except Exception as e:
+            log_msg(f"[WS] #{tid} Error: {e}")
+            # Fallback: one HTTP check
+            up_book = await get_book(up_token)
+            down_book = await get_book(down_token)
+            if up_book:
+                up_ask = up_book["ask"]
+            if down_book:
+                down_ask = down_book["ask"]
 
         # ── CANCEL UNFILLED AT T-30 ──
         if not up_filled and not up_cancelled:
