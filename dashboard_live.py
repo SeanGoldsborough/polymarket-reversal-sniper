@@ -22,6 +22,7 @@ LIVE_BOTS = [
 PAPER_BOTS = [
     ("BTC-LADDER", "logs/btc_ladder_trades.jsonl", "btcLadder"),
     ("SNIPE-ALL", "logs/snipe_paper_all_trades.jsonl", "snipePaperAll"),
+    ("BTC-BOTH-SIDES", "logs/btc_both_sides_trades.jsonl", "btcBothSides"),
 ]
 
 PAPER_STARTING_BANKROLL = 100.0
@@ -37,21 +38,40 @@ def send_telegram(msg):
 
 
 def get_wallet():
+    """Get CLOB balance (total tradeable)."""
     try:
         import sys
         sys.path.insert(0, "/home/ubuntu/polymarket-bot")
         from dotenv import load_dotenv
         load_dotenv("/home/ubuntu/polymarket-bot/.env")
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import BalanceAllowanceParams
+        from py_clob_client_v2.client import ClobClient
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams
         client = ClobClient("https://clob.polymarket.com",
             key=os.getenv("POLYMARKET_PRIVATE_KEY"), chain_id=137,
             signature_type=int(os.getenv("SIGNATURE_TYPE", "2")),
             funder=os.getenv("POLYMARKET_FUNDER_ADDRESS"))
-        client.set_api_creds(client.create_or_derive_api_creds())
+        client.set_api_creds(client.create_or_derive_api_key())
         params = BalanceAllowanceParams(asset_type="COLLATERAL", token_id="", signature_type=2)
         result = client.get_balance_allowance(params)
         return int(result.get("balance", "0")) / 1_000_000
+    except:
+        return None
+
+
+def get_onchain_balance():
+    """Get on-chain pUSD balance (available to trade without activation)."""
+    try:
+        import urllib.request as req2
+        proxy = os.getenv("POLYMARKET_PROXY_WALLET", os.getenv("POLYMARKET_FUNDER_ADDRESS", "0x7Fb17449872d8E330D523062879134d3B071D7F1"))
+        pusd = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+        padded = proxy.lower().replace("0x", "").zfill(64)
+        payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                   "params": [{"to": pusd, "data": f"0x70a08231{padded}"}, "latest"]})
+        r = req2.Request("https://polygon-bor-rpc.publicnode.com",
+            data=payload.encode(), headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+        resp = req2.urlopen(r, timeout=10)
+        data = json.loads(resp.read())
+        return int(data.get("result", "0x0"), 16) / 1_000_000
     except:
         return None
 
@@ -83,6 +103,7 @@ def read_summary(bot_name):
     summary_map = {
         "BTC-LADDER": "logs/btc_ladder_summary.json",
         "SNIPE-ALL": "logs/snipe_paper_all_summary.json",
+        "BTC-BOTH-SIDES": "logs/btc_both_sides_summary.json",
     }
     path = summary_map.get(bot_name)
     if not path:
@@ -141,10 +162,23 @@ def build_dashboard():
         wallet = 0
     wallet_pnl = wallet - LIVE_STARTING_WALLET
 
+    # Check for funds needing activation
+    onchain = get_onchain_balance()
+    needs_activation = False
+    activation_amount = 0
+    if onchain is not None and wallet > 0 and onchain < wallet - 2:
+        needs_activation = True
+        activation_amount = wallet - onchain
+
     lines = []
     lines.append("\U0001F1EE\U0001F1EA\U0001F4C8 <b>Trading Dashboard</b>")
     lines.append(f"{utc_str} / {et_str}")
     lines.append("")
+
+    # ── ACTIVATION ALERT ──
+    if needs_activation:
+        lines.append(f"\u26A0\uFE0F <b>ACTIVATE FUNDS</b>: ${activation_amount:,.2f} needs activation on Polymarket UI")
+        lines.append("")
 
     # ── LIVE SECTION ──
     lines.append("\U0001F4B0 <b>LIVE</b>")
