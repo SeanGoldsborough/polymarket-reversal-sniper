@@ -62,7 +62,7 @@ BET_PER_SIDE = 5.00                        # $5 per side
 CANCEL_THRESHOLD = 0.60                    # Cancel unfilled if other side ask > this
 ENTRY_DELAY = 10                           # Place bids T+10 seconds into window
 CANCEL_BEFORE_END = 30                     # Cancel unfilled at T-30
-ONE_FILL_SL_PCT = 0.15                     # Sell if one-fill drops 15% from entry
+ONE_FILL_SL_PCT = 0.30                     # Sell if one-fill drops 30% from entry
 
 USDC_CONTRACT = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 CLOB_HOST = "https://clob.polymarket.com"
@@ -269,7 +269,7 @@ class BTCBothSidesBot:
             log_msg(f"[PAPER] BID-UP {shares_per_side}sh @ ${BID_PRICE}")
             log_msg(f"[PAPER] BID-DN {shares_per_side}sh @ ${BID_PRICE}")
 
-        # ── MONITOR VIA WEBSOCKET ──
+        # ── MONITOR VIA HTTP POLLING (every 2 seconds) ──
         up_filled = False
         down_filled = False
         up_fill_price = 0
@@ -278,86 +278,50 @@ class BTCBothSidesBot:
         down_cancelled = False
         book_history = []
 
-        try:
-            async with websockets.connect(POLY_WS_URL, ping_interval=20, ping_timeout=10,
-                                           close_timeout=5) as ws:
-                sub_msg = json.dumps({
-                    "assets_ids": [up_token, down_token],
-                    "type": "market"
-                })
-                await ws.send(sub_msg)
-                log_msg(f"[WS] #{tid} Subscribed to both sides")
+        log_msg(f"[MONITOR] #{tid} Polling books every 2s until T-{CANCEL_BEFORE_END}")
 
-                # Track best asks from WS updates
-                up_ask = 0
-                down_ask = 0
+        while time.time() < cancel_time:
+            try:
+                up_book = await get_book(up_token)
+                down_book = await get_book(down_token)
 
-                async for raw in ws:
-                    now = time.time()
+                up_ask = up_book["ask"] if up_book else 0
+                down_ask = down_book["ask"] if down_book else 0
+                now = time.time()
+                elapsed = now - window_start
 
-                    # Check if we should cancel and exit
-                    if now >= cancel_time:
-                        break
+                # Paper fill detection: if ask drops to or below our bid, we filled
+                if not up_filled and up_ask > 0 and up_ask <= BID_PRICE:
+                    up_filled = True
+                    up_fill_price = up_ask
+                    log_msg(f"[FILL-UP] #{tid} {shares_per_side}sh @ ${up_fill_price:.2f} | "
+                            f"DOWN ask=${down_ask:.2f} | T+{elapsed:.0f}s")
 
-                    try:
-                        msg = json.loads(raw)
-                    except:
-                        continue
+                if not down_filled and down_ask > 0 and down_ask <= BID_PRICE:
+                    down_filled = True
+                    down_fill_price = down_ask
+                    log_msg(f"[FILL-DN] #{tid} {shares_per_side}sh @ ${down_fill_price:.2f} | "
+                            f"UP ask=${up_ask:.2f} | T+{elapsed:.0f}s")
 
-                    # Parse book update
-                    asset_id = msg.get("asset_id", "")
-                    asks = None
-                    if isinstance(msg.get("asks"), list):
-                        asks = msg["asks"]
-                    elif "book" in msg.get("event_type", ""):
-                        asks = msg.get("asks", [])
-                    elif "market" in msg.get("event_type", ""):
-                        asks = msg.get("asks", [])
+                # If both filled, we're done — guaranteed profit
+                if up_filled and down_filled:
+                    log_msg(f"[BOTH] #{tid} Both sides filled! UP ${up_fill_price:.2f} + DOWN ${down_fill_price:.2f} = "
+                            f"${up_fill_price + down_fill_price:.2f} | Profit: ${1.00 - up_fill_price - down_fill_price:.2f}/pair")
+                    break
 
-                    if asks:
-                        best_ask = min((float(a.get("price", a.get("p", 99))) for a in asks), default=99)
-                        if asset_id == up_token:
-                            up_ask = best_ask
-                        elif asset_id == down_token:
-                            down_ask = best_ask
+                # Record snapshot every 10 seconds
+                if int(elapsed) % 10 == 0 and up_ask > 0 and down_ask > 0:
+                    book_history.append({"t": round(elapsed), "up_ask": up_ask, "down_ask": down_ask})
 
-                    # Also check bids for fill detection
-                    bids = None
-                    if isinstance(msg.get("bids"), list):
-                        bids = msg["bids"]
-                    elif "book" in msg.get("event_type", ""):
-                        bids = msg.get("bids", [])
-                    elif "market" in msg.get("event_type", ""):
-                        bids = msg.get("bids", [])
+                # Log status every 30 seconds
+                if int(elapsed) % 30 == 0 and elapsed > 0 and up_ask > 0:
+                    log_msg(f"[WATCH] #{tid} T+{elapsed:.0f}s | UP ask=${up_ask:.2f} DN ask=${down_ask:.2f} | "
+                            f"fills: UP={'Y' if up_filled else 'N'} DN={'Y' if down_filled else 'N'}")
 
-                    # Paper fill detection: if ask drops to or below our bid, we filled
-                    if not up_filled and up_ask > 0 and up_ask <= BID_PRICE:
-                        up_filled = True
-                        up_fill_price = up_ask
-                        elapsed = now - window_start
-                        log_msg(f"[FILL-UP] #{tid} {shares_per_side}sh @ ${up_fill_price:.2f} | "
-                                f"DOWN ask=${down_ask:.2f} | T+{elapsed:.0f}s")
+            except Exception as e:
+                log_msg(f"[POLL] #{tid} Error: {e}")
 
-                    if not down_filled and down_ask > 0 and down_ask <= BID_PRICE:
-                        down_filled = True
-                        down_fill_price = down_ask
-                        elapsed = now - window_start
-                        log_msg(f"[FILL-DN] #{tid} {shares_per_side}sh @ ${down_fill_price:.2f} | "
-                                f"UP ask=${up_ask:.2f} | T+{elapsed:.0f}s")
-
-                    # If both filled, we're done — guaranteed profit
-                    if up_filled and down_filled:
-                        log_msg(f"[BOTH] #{tid} Both sides filled! UP ${up_fill_price:.2f} + DOWN ${down_fill_price:.2f} = "
-                                f"${up_fill_price + down_fill_price:.2f} | Profit: ${1.00 - up_fill_price - down_fill_price:.2f}/pair")
-                        break
-
-                    # Record snapshot every 10 seconds
-                    elapsed = now - window_start
-                    if int(elapsed) % 10 == 0 and up_ask > 0 and down_ask > 0:
-                        book_history.append({"t": round(elapsed), "up_ask": up_ask, "down_ask": down_ask})
-
-        except Exception as e:
-            log_msg(f"[WS] #{tid} Error: {e} — falling back to HTTP")
+            await asyncio.sleep(2)
 
         # ── CANCEL UNFILLED AT T-30 ──
         if not up_filled and not up_cancelled:
