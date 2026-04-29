@@ -59,7 +59,7 @@ except ImportError:
 # ── Config ─────────────────────────────────────────────
 BID_LOW = 0.45                             # Only buy if ask >= this
 BID_HIGH = 0.55                            # Only buy if ask <= this
-BET_PER_SIDE = 5.00                        # $5 per side
+SHARES_PER_SIDE = 5                        # Fixed 5 shares per side (minimum)
 MAX_COMBINED_COST = 1.05                   # Max combined per-share cost
 SL_PRICE = 0.20                            # Stop loss — sell if bid drops to $0.20
 ENTRY_DELAY = 10                           # Place bids T+10 seconds into window
@@ -75,12 +75,12 @@ PROXY_WALLET = os.getenv("POLYMARKET_PROXY_WALLET", FUNDER_ADDRESS)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-PAPER_MODE = True
+PAPER_MODE = os.getenv("BTC_BOTH_SIDES_LIVE", "0") != "1"
 POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 os.makedirs("logs", exist_ok=True)
-BOT_NAME = "BTC-BOTH-SIDES-PAPER"
+BOT_NAME = "BTC-BOTH-SIDES" if not PAPER_MODE else "BTC-BOTH-SIDES-PAPER"
 LOG_FILE = "logs/btc_both_sides_trades.jsonl"
 SUMMARY_FILE = "logs/btc_both_sides_summary.json"
 
@@ -191,7 +191,20 @@ class BTCBothSidesBot:
             self.client = ClobClient(CLOB_HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID,
                                      signature_type=SIGNATURE_TYPE, funder=FUNDER_ADDRESS)
             self.client.set_api_creds(self.client.create_or_derive_api_key())
-            log_msg("[CLOB] Auth OK")
+            log_msg("[CLOB] Auth OK — LIVE execution ready")
+            # Read wallet balance
+            try:
+                from py_clob_client_v2.clob_types import BalanceAllowanceParams
+                params = BalanceAllowanceParams(asset_type="COLLATERAL", token_id="", signature_type=2)
+                result = self.client.get_balance_allowance(params)
+                bal = int(result.get("balance", "0")) / 1_000_000
+                if bal > 0:
+                    self.bankroll = bal
+                    self.peak = bal
+                    self.starting_bankroll = bal
+                    log_msg(f"[WALLET] Balance: ${bal:.2f}")
+            except:
+                pass
         except Exception as e:
             log_msg(f"[CLOB] Auth fail: {e}")
 
@@ -237,9 +250,7 @@ class BTCBothSidesBot:
 
         up_token = mkt["up"]
         down_token = mkt["down"]
-        shares_per_side = round(BET_PER_SIDE / 0.50)  # Estimate at midpoint
-        if shares_per_side < 5:
-            shares_per_side = 5
+        shares_per_side = SHARES_PER_SIDE
 
         # ── PLACE BIDS ON BOTH SIDES ──
         log_msg(f"[PLACE] #{tid} Buying both sides ${BID_LOW}-${BID_HIGH} | SL ${SL_PRICE} | {mkt['question'][:40]}")
@@ -247,7 +258,35 @@ class BTCBothSidesBot:
         up_order_id = None
         down_order_id = None
 
-        log_msg(f"[PAPER] Watching for asks in ${BID_LOW}-${BID_HIGH} range")
+        up_order_id = None
+        down_order_id = None
+
+        if self.client and not PAPER_MODE:
+            # Get current asks to set bid price
+            up_book_init = await get_book(up_token)
+            down_book_init = await get_book(down_token)
+            up_bid_price = min(up_book_init["ask"], BID_HIGH) if up_book_init and BID_LOW <= up_book_init["ask"] <= BID_HIGH else 0.50
+            down_bid_price = min(down_book_init["ask"], BID_HIGH) if down_book_init and BID_LOW <= down_book_init["ask"] <= BID_HIGH else 0.50
+
+            try:
+                args = OrderArgs(price=up_bid_price, size=shares_per_side, side=BUY, token_id=up_token)
+                signed = self.client.create_order(args)
+                resp = self.client.post_order(signed, OrderType.GTC)
+                up_order_id = resp.get("orderID", "")
+                log_msg(f"[BID-UP] GTC {shares_per_side}sh @ ${up_bid_price:.2f} order={up_order_id[:10]}...")
+            except Exception as e:
+                log_msg(f"[BID-UP] FAILED: {str(e)[:60]}")
+
+            try:
+                args = OrderArgs(price=down_bid_price, size=shares_per_side, side=BUY, token_id=down_token)
+                signed = self.client.create_order(args)
+                resp = self.client.post_order(signed, OrderType.GTC)
+                down_order_id = resp.get("orderID", "")
+                log_msg(f"[BID-DN] GTC {shares_per_side}sh @ ${down_bid_price:.2f} order={down_order_id[:10]}...")
+            except Exception as e:
+                log_msg(f"[BID-DN] FAILED: {str(e)[:60]}")
+        else:
+            log_msg(f"[PAPER] Watching for asks in ${BID_LOW}-${BID_HIGH} range")
 
         # ── MONITOR VIA WEBSOCKET ──
         up_filled = False
@@ -313,7 +352,7 @@ class BTCBothSidesBot:
                     if not up_filled and BID_LOW <= up_ask <= BID_HIGH:
                         up_filled = True
                         up_fill_price = up_ask
-                        up_shares = round(BET_PER_SIDE / up_ask)
+                        up_shares = round(SHARES_PER_SIDE / up_ask)
                         if up_shares < 5:
                             up_shares = 5
                         log_msg(f"[FILL-UP] #{tid} {up_shares}sh @ ${up_fill_price:.2f} | "
@@ -322,7 +361,7 @@ class BTCBothSidesBot:
                     if not down_filled and BID_LOW <= down_ask <= BID_HIGH:
                         down_filled = True
                         down_fill_price = down_ask
-                        down_shares = round(BET_PER_SIDE / down_ask)
+                        down_shares = round(SHARES_PER_SIDE / down_ask)
                         if down_shares < 5:
                             down_shares = 5
                         log_msg(f"[FILL-DN] #{tid} {down_shares}sh @ ${down_fill_price:.2f} | "
@@ -349,11 +388,27 @@ class BTCBothSidesBot:
                             up_sl_hit = True
                             up_sl_price = best_bid
                             log_msg(f"[SL-UP] #{tid} UP bid ${best_bid:.2f} <= SL ${SL_PRICE} — selling")
+                            if self.client and not PAPER_MODE:
+                                try:
+                                    args = OrderArgs(price=0.01, size=up_shares, side=SELL, token_id=up_token)
+                                    signed = self.client.create_order(args)
+                                    self.client.post_order(signed, OrderType.FAK)
+                                    log_msg(f"[SL-SOLD-UP] #{tid} FAK sell {up_shares}sh")
+                                except Exception as e:
+                                    log_msg(f"[SL-SELL-UP] #{tid} Failed: {str(e)[:60]}")
 
                         if aid == down_token and down_filled and not down_sl_hit and best_bid <= SL_PRICE and best_bid > 0.01:
                             down_sl_hit = True
                             down_sl_price = best_bid
                             log_msg(f"[SL-DN] #{tid} DOWN bid ${best_bid:.2f} <= SL ${SL_PRICE} — selling")
+                            if self.client and not PAPER_MODE:
+                                try:
+                                    args = OrderArgs(price=0.01, size=down_shares, side=SELL, token_id=down_token)
+                                    signed = self.client.create_order(args)
+                                    self.client.post_order(signed, OrderType.FAK)
+                                    log_msg(f"[SL-SOLD-DN] #{tid} FAK sell {down_shares}sh")
+                                except Exception as e:
+                                    log_msg(f"[SL-SELL-DN] #{tid} Failed: {str(e)[:60]}")
 
                     # Record snapshot every 10s
                     if int(elapsed) % 10 == 0 and up_ask > 0 and down_ask > 0:
@@ -543,8 +598,8 @@ class BTCBothSidesBot:
         asyncio.create_task(send_telegram(
             f"{icon}{both_tag} <b>{BOT_NAME} #{tid}</b>\n"
             f"{result} | P&L ${pnl:+.2f} ({ret_pct:+.0f}%)\n"
-            f"UP: {up_shares}sh ${up_cost:.2f} | DOWN: {down_shares}sh ${down_cost:.2f}\n"
-            f"Winner: {winner} | Min asks: UP ${min_up:.2f} DN ${min_down:.2f}\n"
+            f"UP: {up_shares}sh @ ${up_cost/up_shares:.2f} (${up_cost:.2f}) | DOWN: {down_shares}sh @ ${down_cost/down_shares:.2f} (${down_cost:.2f})\n"
+            f"Winner: {winner} | SL: ${SL_PRICE}\n"
             f"Bank: ${self.bankroll:.2f} | {self.wins}W/{self.losses}L ({wr:.0f}%)"))
 
     def _write_summary(self):
@@ -552,7 +607,7 @@ class BTCBothSidesBot:
         total = self.wins + self.losses
         wr = self.wins / total * 100 if total else 0
         summary = {
-            "bot": BOT_NAME, "mode": "PAPER",
+            "bot": BOT_NAME, "mode": "LIVE" if not PAPER_MODE else "PAPER",
             "elapsed_minutes": round(elapsed, 1),
             "trades": total, "wins": self.wins, "losses": self.losses,
             "win_rate": round(wr, 1),
@@ -576,7 +631,7 @@ class BTCBothSidesBot:
         pnl = self.bankroll - self.starting_bankroll
 
         print(f"\n  [{ts()}] {'='*60}")
-        print(f"  {BOT_NAME} | {elapsed:.0f}min | PAPER")
+        print(f"  {BOT_NAME} | {elapsed:.0f}min | {"LIVE" if not PAPER_MODE else "PAPER"}")
         print(f"  Strategy: GTC ${BID_HIGH} on BOTH sides + WS monitor")
         print(f"  Cancel unfilled when other side ask > ${BID_HIGH}")
         print(f"  Bank: ${self.bankroll:.2f} (${pnl:+.2f}) | Peak: ${self.peak:.2f}")
@@ -598,14 +653,15 @@ async def main():
     print(f"  Place GTC bids at ${BID_HIGH} on BOTH Up and Down at window open")
     print(f"  Monitor via WebSocket for fills")
     print(f"  Cancel unfilled when other side ask > ${BID_HIGH}")
-    print(f"  ${BET_PER_SIDE}/side | Cancel at T-{CANCEL_BEFORE_END}")
+    print(f"  ${SHARES_PER_SIDE}/side | Cancel at T-{CANCEL_BEFORE_END}")
     print(f"  Paper mode")
     print()
 
     bot = BTCBothSidesBot()
     bot.init_clob()
     bot._write_summary()
-    log_msg(f"[INIT] PAPER — Bank: ${bot.bankroll:.2f}")
+    mode = "LIVE" if not PAPER_MODE else "PAPER"
+    log_msg(f"[INIT] {mode} — Bank: ${bot.bankroll:.2f}")
 
     asyncio.create_task(send_telegram(
         f"🎯 <b>{BOT_NAME}</b> [PAPER]\n"

@@ -17,12 +17,12 @@ LIVE_STARTING_WALLET = 150.02  # Reset after bug fix — fresh start
 LIVE_BOTS = [
     ("SNIPE-ALT", "logs/snipe_alt_live_trades.jsonl", "snipeALTlive"),
     ("BTC-SNIPE-LADDER", "logs/btc_snipe_ladder_trades.jsonl", "btcSnipeLadder"),
+    ("BTC-BOTH-SIDES", "logs/btc_both_sides_trades.jsonl", "btcBothSides"),
 ]
 
 PAPER_BOTS = [
     ("BTC-LADDER", "logs/btc_ladder_trades.jsonl", "btcLadder"),
     ("SNIPE-ALL", "logs/snipe_paper_all_trades.jsonl", "snipePaperAll"),
-    ("BTC-BOTH-SIDES", "logs/btc_both_sides_trades.jsonl", "btcBothSides"),
 ]
 
 PAPER_STARTING_BANKROLL = 100.0
