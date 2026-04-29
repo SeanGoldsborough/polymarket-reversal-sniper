@@ -57,8 +57,8 @@ except ImportError:
     pass
 
 # ── Config ─────────────────────────────────────────────
-BID_LOW = 0.45                             # Only buy if ask >= this
-BID_HIGH = 0.55                            # Only buy if ask <= this
+BID_LOW = 0.40                             # Only buy if ask >= this
+BID_HIGH = 0.60                            # Only buy if ask <= this
 SHARES_PER_SIDE = 5                        # Fixed 5 shares per side (minimum)
 MAX_COMBINED_COST = 1.05                   # Max combined per-share cost
 SL_PRICE = 0.20                            # Stop loss — sell if bid drops to $0.20
@@ -123,6 +123,7 @@ class MarketFinder:
         try:
             now = int(time.time())
             window_start = (now // 300) * 300
+            self._current_window_start = window_start
             slug = f"btc-updown-5m-{window_start}"
             async with aiohttp.ClientSession() as s:
                 async with s.get(f"https://gamma-api.polymarket.com/markets?slug={slug}",
@@ -143,6 +144,36 @@ class MarketFinder:
                             }
         except Exception as e:
             log_msg(f"[MKT] BTC: {e}")
+
+    async def refresh_next(self):
+        """Get the NEXT window's market (1 window ahead)."""
+        try:
+            now = int(time.time())
+            current_window = (now // 300) * 300
+            next_window = current_window + 300
+            slug = f"btc-updown-5m-{next_window}"
+            async with aiohttp.ClientSession() as s:
+                async with s.get(f"https://gamma-api.polymarket.com/markets?slug={slug}",
+                                 headers={"User-Agent": "Mozilla/5.0"},
+                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        if data and isinstance(data, list) and len(data) > 0:
+                            m = data[0]
+                            tokens = json.loads(m["clobTokenIds"]) if isinstance(m["clobTokenIds"], str) else m["clobTokenIds"]
+                            outcomes = json.loads(m["outcomes"]) if isinstance(m["outcomes"], str) else m["outcomes"]
+                            up = tokens[0] if outcomes[0] == "Up" else tokens[1]
+                            down = tokens[1] if outcomes[0] == "Up" else tokens[0]
+                            self.market = {
+                                "up": up, "down": down,
+                                "question": m.get("question", ""),
+                                "window_start": next_window,
+                            }
+                            log_msg(f"[MKT] Next window: {m.get('question', '')[:50]}")
+                        else:
+                            log_msg(f"[MKT] Next window not available yet")
+        except Exception as e:
+            log_msg(f"[MKT] Next: {e}")
 
 
 async def get_book(token_id):
@@ -211,22 +242,27 @@ class BTCBothSidesBot:
     async def run(self):
         while True:
             try:
+                # At start of current window, get NEXT window's market and place orders
                 now = time.time()
                 nxt = (int(now) // 300 + 1) * 300
                 wait = nxt - now
                 if wait > 0:
                     await asyncio.sleep(wait)
-                await asyncio.sleep(ENTRY_DELAY)
-
-                await self.mf.refresh()
-                if not self.mf.market:
-                    log_msg("[LOOP] No market found")
-                    continue
+                await asyncio.sleep(5)  # Brief delay for market to be available
 
                 log_msg(f"[LOOP] Window start | Bank: ${self.bankroll:.2f}")
 
                 if self.bankroll < 5:
                     log_msg(f"[RISK] Bankroll too low")
+                    continue
+
+                # Get the NEXT window's market (prices near $0.50)
+                await self.mf.refresh_next()
+                if not self.mf.market:
+                    # Fallback to current window
+                    await self.mf.refresh()
+                if not self.mf.market:
+                    log_msg("[LOOP] No market found")
                     continue
 
                 await self._trade_window()
@@ -244,8 +280,9 @@ class BTCBothSidesBot:
 
         self.trade_count += 1
         tid = self.trade_count
-        window_start = (int(time.time()) // 300) * 300
-        window_end = window_start + 300
+        # Use the market's window_start (could be next window)
+        target_window_start = mkt.get("window_start", (int(time.time()) // 300) * 300)
+        window_end = target_window_start + 300
         cancel_time = window_end - CANCEL_BEFORE_END
 
         up_token = mkt["up"]
