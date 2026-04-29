@@ -61,7 +61,7 @@ BID_LOW = 0.40                             # Only buy if ask >= this
 BID_HIGH = 0.60                            # Only buy if ask <= this
 SHARES_PER_SIDE = 5                        # Fixed 5 shares per side (minimum)
 MAX_COMBINED_COST = 1.05                   # Max combined per-share cost
-SL_PRICE = 0.20                            # Stop loss — sell if bid drops to $0.20
+TP_PRICE = 0.65                            # Take profit — sell when bid rises to $0.65
 ENTRY_DELAY = 10                           # Place bids T+10 seconds into window
 CANCEL_BEFORE_END = 3                      # Cancel unfilled at T-3, WS monitors until then
 
@@ -303,7 +303,7 @@ class BTCBothSidesBot:
         shares_per_side = SHARES_PER_SIDE
 
         # ── PLACE BIDS ON BOTH SIDES ──
-        log_msg(f"[PLACE] #{tid} Buying both sides ${BID_LOW}-${BID_HIGH} | SL ${SL_PRICE} | {mkt['question'][:40]}")
+        log_msg(f"[PLACE] #{tid} Buying both sides ${BID_LOW}-${BID_HIGH} | SL ${TP_PRICE} | {mkt['question'][:40]}")
 
         up_order_id = None
         down_order_id = None
@@ -351,11 +351,11 @@ class BTCBothSidesBot:
         down_ask = 0
         up_shares = shares_per_side
         down_shares = shares_per_side
-        up_sl_hit = False
-        down_sl_hit = False
+        up_tp_hit = False
+        down_tp_hit = False
         both_logged = False
-        up_sl_price = 0
-        down_sl_price = 0
+        up_tp_price = 0
+        down_tp_price = 0
         last_log_time = 0
 
         try:
@@ -445,7 +445,7 @@ class BTCBothSidesBot:
                         both_logged = True
                         combined = up_fill_price + down_fill_price
                         log_msg(f"[BOTH] #{tid} Both filled! UP ${up_fill_price:.2f} + DOWN ${down_fill_price:.2f} = "
-                                f"${combined:.2f} | SL ${SL_PRICE} on both sides — monitoring for SL")
+                                f"${combined:.2f} | SL ${TP_PRICE} on both sides — monitoring for TP")
                         # Pre-approve both tokens for selling (so SL executes instantly)
                         if self.client and not PAPER_MODE:
                             try:
@@ -453,7 +453,7 @@ class BTCBothSidesBot:
                                 self.client.update_balance_allowance(params_up)
                                 params_dn = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=down_token, signature_type=SIGNATURE_TYPE)
                                 self.client.update_balance_allowance(params_dn)
-                                log_msg(f"[APPROVED] #{tid} Both tokens pre-approved for SL sell")
+                                log_msg(f"[APPROVED] #{tid} Both tokens pre-approved for TP sell")
                             except Exception as e:
                                 log_msg(f"[APPROVE] #{tid} Failed: {str(e)[:60]}")
 
@@ -468,10 +468,10 @@ class BTCBothSidesBot:
                         except (ValueError, KeyError):
                             continue
 
-                        if aid == up_token and up_filled and not up_sl_hit and best_bid <= SL_PRICE and best_bid > 0.01:
-                            up_sl_hit = True
-                            up_sl_price = best_bid
-                            log_msg(f"[SL-UP] #{tid} UP bid ${best_bid:.2f} <= SL ${SL_PRICE} — selling")
+                        if aid == up_token and up_filled and not up_tp_hit and best_bid >= TP_PRICE:
+                            up_tp_hit = True
+                            up_tp_price = best_bid
+                            log_msg(f"[TP-UP] #{tid} UP bid ${best_bid:.2f} <= SL ${TP_PRICE} — selling")
                             if self.client and not PAPER_MODE:
                                 for attempt in range(3):
                                     try:
@@ -479,15 +479,15 @@ class BTCBothSidesBot:
                                         args = OrderArgs(price=sell_price, size=up_shares, side=SELL, token_id=up_token)
                                         signed = self.client.create_order(args)
                                         self.client.post_order(signed, OrderType.FAK)
-                                        log_msg(f"[SL-SOLD-UP] #{tid} FAK sell {up_shares}sh @ ${sell_price}")
+                                        log_msg(f"[TP-SOLD-UP] #{tid} FAK sell {up_shares}sh @ ${sell_price}")
                                         break
                                     except Exception as e:
-                                        log_msg(f"[SL-SELL-UP] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
+                                        log_msg(f"[TP-SELL-UP] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
 
-                        if aid == down_token and down_filled and not down_sl_hit and best_bid <= SL_PRICE and best_bid > 0.01:
-                            down_sl_hit = True
-                            down_sl_price = best_bid
-                            log_msg(f"[SL-DN] #{tid} DOWN bid ${best_bid:.2f} <= SL ${SL_PRICE} — selling")
+                        if aid == down_token and down_filled and not down_tp_hit and best_bid >= TP_PRICE:
+                            down_tp_hit = True
+                            down_tp_price = best_bid
+                            log_msg(f"[TP-DN] #{tid} DOWN bid ${best_bid:.2f} <= SL ${TP_PRICE} — selling")
                             if self.client and not PAPER_MODE:
                                 for attempt in range(3):
                                     try:
@@ -495,10 +495,10 @@ class BTCBothSidesBot:
                                         args = OrderArgs(price=sell_price, size=down_shares, side=SELL, token_id=down_token)
                                         signed = self.client.create_order(args)
                                         self.client.post_order(signed, OrderType.FAK)
-                                        log_msg(f"[SL-SOLD-DN] #{tid} FAK sell {down_shares}sh @ ${sell_price}")
+                                        log_msg(f"[TP-SOLD-DN] #{tid} FAK sell {down_shares}sh @ ${sell_price}")
                                         break
                                     except Exception as e:
-                                        log_msg(f"[SL-SELL-DN] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
+                                        log_msg(f"[TP-SELL-DN] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
 
                     # Record snapshot every 10s
                     if int(elapsed) % 10 == 0 and up_ask > 0 and down_ask > 0:
@@ -547,62 +547,62 @@ class BTCBothSidesBot:
             self.one_filled += 1
 
         if not both_sides and up_filled:
-            log_msg(f"[WATCH-RES] #{tid} One fill (UP) — holding to resolution, SL ${SL_PRICE}")
+            log_msg(f"[WATCH-RES] #{tid} One fill (UP) — holding to resolution, SL ${TP_PRICE}")
         elif not both_sides and down_filled:
-            log_msg(f"[WATCH-RES] #{tid} One fill (DOWN) — holding to resolution, SL ${SL_PRICE}")
+            log_msg(f"[WATCH-RES] #{tid} One fill (DOWN) — holding to resolution, SL ${TP_PRICE}")
         elif both_sides:
-            log_msg(f"[WATCH-RES] #{tid} Both filled — holding to resolution, SL ${SL_PRICE} on both")
+            log_msg(f"[WATCH-RES] #{tid} Both filled — holding to resolution, SL ${TP_PRICE} on both")
 
         # ── WAIT FOR RESOLUTION ──
         for _ in range(90):
             up_book = await get_book(up_token)
             if up_book:
                 # Check SL on filled sides (HTTP fallback for WS SL)
-                if up_filled and not up_sl_hit and up_book["bid"] <= SL_PRICE and up_book["bid"] > 0.01:
-                    up_sl_hit = True
-                    up_sl_price = up_book["bid"]
-                    log_msg(f"[SL-UP] #{tid} UP bid ${up_sl_price:.2f} <= SL ${SL_PRICE} — selling")
+                if up_filled and not up_tp_hit and up_book["bid"] >= TP_PRICE:
+                    up_tp_hit = True
+                    up_tp_price = up_book["bid"]
+                    log_msg(f"[TP-UP] #{tid} UP bid ${up_tp_price:.2f} <= SL ${TP_PRICE} — selling")
                     if self.client and not PAPER_MODE:
                         for attempt in range(3):
                             try:
-                                sell_price = snap_price(max(up_sl_price - 0.02, 0.01))
+                                sell_price = snap_price(max(up_tp_price - 0.02, 0.01))
                                 args = OrderArgs(price=sell_price, size=up_shares, side=SELL, token_id=up_token)
                                 signed = self.client.create_order(args)
                                 self.client.post_order(signed, OrderType.FAK)
-                                log_msg(f"[SL-SOLD-UP] #{tid} FAK sell {up_shares}sh @ ${sell_price}")
+                                log_msg(f"[TP-SOLD-UP] #{tid} FAK sell {up_shares}sh @ ${sell_price}")
                                 break
                             except Exception as e:
-                                log_msg(f"[SL-SELL-UP] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
+                                log_msg(f"[TP-SELL-UP] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
 
                 down_book_check = await get_book(down_token)
-                if down_book_check and down_filled and not down_sl_hit and down_book_check["bid"] <= SL_PRICE and down_book_check["bid"] > 0.01:
-                    down_sl_hit = True
-                    down_sl_price = down_book_check["bid"]
-                    log_msg(f"[SL-DN] #{tid} DOWN bid ${down_sl_price:.2f} <= SL ${SL_PRICE} — selling")
+                if down_book_check and down_filled and not down_tp_hit and down_book_check["bid"] >= TP_PRICE:
+                    down_tp_hit = True
+                    down_tp_price = down_book_check["bid"]
+                    log_msg(f"[TP-DN] #{tid} DOWN bid ${down_tp_price:.2f} <= SL ${TP_PRICE} — selling")
                     if self.client and not PAPER_MODE:
                         for attempt in range(3):
                             try:
-                                sell_price = snap_price(max(down_sl_price - 0.02, 0.01))
+                                sell_price = snap_price(max(down_tp_price - 0.02, 0.01))
                                 args = OrderArgs(price=sell_price, size=down_shares, side=SELL, token_id=down_token)
                                 signed = self.client.create_order(args)
                                 self.client.post_order(signed, OrderType.FAK)
-                                log_msg(f"[SL-SOLD-DN] #{tid} FAK sell {down_shares}sh @ ${sell_price}")
+                                log_msg(f"[TP-SOLD-DN] #{tid} FAK sell {down_shares}sh @ ${sell_price}")
                                 break
                             except Exception as e:
-                                log_msg(f"[SL-SELL-DN] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
+                                log_msg(f"[TP-SELL-DN] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
 
                 if up_book["bid"] >= 0.95:
                     winner = "UP"
                     up_pnl = (up_shares * 1.00 - up_cost) if up_filled else 0
-                    # DOWN: SL recovery or full loss
-                    if down_sl_hit and down_filled:
-                        down_pnl = down_shares * down_sl_price - down_cost
+                    # DOWN: TP recovery or full loss
+                    if down_tp_hit and down_filled:
+                        down_pnl = down_shares * down_tp_price - down_cost
                     elif down_filled:
                         down_pnl = -down_cost
                     else:
                         down_pnl = 0
                     pnl = round(up_pnl + down_pnl, 4)
-                    result = "WIN-BOTH+SL" if both_sides and down_sl_hit else ("WIN-BOTH" if both_sides else ("WIN" if up_filled else "LOSS"))
+                    result = "WIN-BOTH+TP" if both_sides and down_tp_hit else ("WIN-BOTH" if both_sides else ("WIN" if up_filled else "LOSS"))
                     self._record_trade(tid, pnl, result, total_cost, up_cost, down_cost,
                                        up_shares if up_filled else 0,
                                        down_shares if down_filled else 0,
@@ -611,15 +611,15 @@ class BTCBothSidesBot:
                 if up_book["bid"] <= 0.05:
                     winner = "DOWN"
                     down_pnl = (down_shares * 1.00 - down_cost) if down_filled else 0
-                    # UP: SL recovery or full loss
-                    if up_sl_hit and up_filled:
-                        up_pnl = up_shares * up_sl_price - up_cost
+                    # UP: TP recovery or full loss
+                    if up_tp_hit and up_filled:
+                        up_pnl = up_shares * up_tp_price - up_cost
                     elif up_filled:
                         up_pnl = -up_cost
                     else:
                         up_pnl = 0
                     pnl = round(up_pnl + down_pnl, 4)
-                    result = "WIN-BOTH+SL" if both_sides and up_sl_hit else ("WIN-BOTH" if both_sides else ("WIN" if down_filled else "LOSS"))
+                    result = "WIN-BOTH+TP" if both_sides and up_tp_hit else ("WIN-BOTH" if both_sides else ("WIN" if down_filled else "LOSS"))
                     self._record_trade(tid, pnl, result, total_cost, up_cost, down_cost,
                                        up_shares if up_filled else 0,
                                        down_shares if down_filled else 0,
@@ -711,7 +711,7 @@ class BTCBothSidesBot:
             f"{icon}{both_tag} <b>{BOT_NAME} #{tid}</b>\n"
             f"{result} | P&L ${pnl:+.2f} ({ret_pct:+.0f}%)\n"
             f"UP: {up_shares}sh @ ${up_cost/up_shares:.2f} (${up_cost:.2f}) | DOWN: {down_shares}sh @ ${down_cost/down_shares:.2f} (${down_cost:.2f})\n"
-            f"Winner: {winner} | SL: ${SL_PRICE}\n"
+            f"Winner: {winner} | SL: ${TP_PRICE}\n"
             f"Bank: ${self.bankroll:.2f} | {self.wins}W/{self.losses}L ({wr:.0f}%)"))
 
     def _write_summary(self):
