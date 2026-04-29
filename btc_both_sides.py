@@ -61,9 +61,8 @@ BID_LOW = 0.40                             # Only buy if ask >= this
 BID_HIGH = 0.60                            # Only buy if ask <= this
 SHARES_PER_SIDE = 5                        # Fixed 5 shares per side (minimum)
 MAX_COMBINED_COST = 1.05                   # Max combined per-share cost
-TP_PCT = 0.18                              # Take profit at +18% from entry
-SL_PCT = 0.18                              # Stop loss at -18% (only last 3 min, on recovery)
-SL_WINDOW_SECS = 180                       # Only look for SL in last 3 minutes
+TP_PCT = 0.12                              # Take profit at +12% from entry
+SL_PCT = 0.12                              # Stop loss at -12% from entry, active all window
 ENTRY_DELAY = 10
 CANCEL_BEFORE_END = 3
 
@@ -467,7 +466,7 @@ class BTCBothSidesBot:
                                 log_msg(f"[APPROVE] #{tid} Failed: {str(e)[:60]}")
 
                     # ── TP/SL logic per WS update ──
-                    sl_window_active = (window_end - now) <= SL_WINDOW_SECS  # Last 3 minutes
+                    # SL active all window
 
                     for item in items:
                         aid = item.get("asset_id", "")
@@ -500,13 +499,11 @@ class BTCBothSidesBot:
                                         except Exception as e:
                                             log_msg(f"[TP-SELL-UP] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
 
-                            # SL: only last 3 min, when bid drops below -18% then recovers back to -18%
-                            elif sl_window_active and best_bid <= up_sl and best_bid > 0.01:
-                                up_went_below_sl = True  # Track that it went below
-                            elif sl_window_active and up_went_below_sl and best_bid >= up_sl and best_bid < up_fill_price:
+                            # SL: sell immediately when bid drops to -12%
+                            elif best_bid <= up_sl and best_bid > 0.01:
                                 up_sl_hit = True
                                 up_sl_price = best_bid
-                                log_msg(f"[SL-UP] #{tid} UP recovered to ${best_bid:.2f} (-18% = ${up_sl}) — selling on bounce")
+                                log_msg(f"[SL-UP] #{tid} UP bid ${best_bid:.2f} <= SL ${up_sl:.2f} (-12%) — selling")
                                 if self.client and not PAPER_MODE:
                                     for attempt in range(3):
                                         try:
@@ -539,13 +536,11 @@ class BTCBothSidesBot:
                                         except Exception as e:
                                             log_msg(f"[TP-SELL-DN] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
 
-                            # SL: only last 3 min, when bid drops below -18% then recovers back to -18%
-                            elif sl_window_active and best_bid <= dn_sl and best_bid > 0.01:
-                                down_went_below_sl = True
-                            elif sl_window_active and down_went_below_sl and best_bid >= dn_sl and best_bid < down_fill_price:
+                            # SL: sell immediately when bid drops to -12%
+                            elif best_bid <= dn_sl and best_bid > 0.01:
                                 down_sl_hit = True
                                 down_sl_price = best_bid
-                                log_msg(f"[SL-DN] #{tid} DOWN recovered to ${best_bid:.2f} (-18% = ${dn_sl}) — selling on bounce")
+                                log_msg(f"[SL-DN] #{tid} DOWN bid ${best_bid:.2f} <= SL ${dn_sl:.2f} (-12%) — selling")
                                 if self.client and not PAPER_MODE:
                                     for attempt in range(3):
                                         try:
