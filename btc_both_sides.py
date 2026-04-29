@@ -63,7 +63,7 @@ SHARES_PER_SIDE = 5                        # Fixed 5 shares per side (minimum)
 MAX_COMBINED_COST = 1.05                   # Max combined per-share cost
 SL_PRICE = 0.20                            # Stop loss — sell if bid drops to $0.20
 ENTRY_DELAY = 10                           # Place bids T+10 seconds into window
-CANCEL_BEFORE_END = 30                     # Cancel unfilled at T-30
+CANCEL_BEFORE_END = 3                      # Cancel unfilled at T-3, WS monitors until then
 
 USDC_CONTRACT = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 CLOB_HOST = "https://clob.polymarket.com"
@@ -384,23 +384,19 @@ class BTCBothSidesBot:
                                 pass
 
                     # Fill detection: buy when ask is in range $0.45-$0.55
-                    elapsed = now - window_start
+                    elapsed = now - target_window_start
 
                     if not up_filled and BID_LOW <= up_ask <= BID_HIGH:
                         up_filled = True
                         up_fill_price = up_ask
-                        up_shares = round(SHARES_PER_SIDE / up_ask)
-                        if up_shares < 5:
-                            up_shares = 5
+                        up_shares = shares_per_side  # Same as GTC order size
                         log_msg(f"[FILL-UP] #{tid} {up_shares}sh @ ${up_fill_price:.2f} | "
                                 f"DOWN ask=${down_ask:.2f} | T+{elapsed:.0f}s")
 
                     if not down_filled and BID_LOW <= down_ask <= BID_HIGH:
                         down_filled = True
                         down_fill_price = down_ask
-                        down_shares = round(SHARES_PER_SIDE / down_ask)
-                        if down_shares < 5:
-                            down_shares = 5
+                        down_shares = shares_per_side  # Same as GTC order size
                         log_msg(f"[FILL-DN] #{tid} {down_shares}sh @ ${down_fill_price:.2f} | "
                                 f"UP ask=${up_ask:.2f} | T+{elapsed:.0f}s")
 
