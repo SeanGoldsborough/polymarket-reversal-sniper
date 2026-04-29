@@ -50,7 +50,7 @@ load_dotenv()
 CLOB_AVAILABLE = False
 try:
     from py_clob_client_v2.client import ClobClient
-    from py_clob_client_v2.clob_types import OrderArgs, OrderType
+    from py_clob_client_v2.clob_types import OrderArgs, OrderType, BalanceAllowanceParams
     from py_clob_client_v2.order_builder.constants import BUY, SELL
     CLOB_AVAILABLE = True
 except ImportError:
@@ -390,12 +390,21 @@ class BTCBothSidesBot:
                             log_msg(f"[SL-UP] #{tid} UP bid ${best_bid:.2f} <= SL ${SL_PRICE} — selling")
                             if self.client and not PAPER_MODE:
                                 try:
-                                    args = OrderArgs(price=0.01, size=up_shares, side=SELL, token_id=up_token)
-                                    signed = self.client.create_order(args)
-                                    self.client.post_order(signed, OrderType.FAK)
-                                    log_msg(f"[SL-SOLD-UP] #{tid} FAK sell {up_shares}sh")
-                                except Exception as e:
-                                    log_msg(f"[SL-SELL-UP] #{tid} Failed: {str(e)[:60]}")
+                                    # Approve conditional token for selling
+                                    params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=up_token, signature_type=SIGNATURE_TYPE)
+                                    self.client.update_balance_allowance(params)
+                                except:
+                                    pass
+                                for attempt in range(3):
+                                    try:
+                                        sell_price = snap_price(max(best_bid - 0.02, 0.01))
+                                        args = OrderArgs(price=sell_price, size=up_shares, side=SELL, token_id=up_token)
+                                        signed = self.client.create_order(args)
+                                        self.client.post_order(signed, OrderType.FAK)
+                                        log_msg(f"[SL-SOLD-UP] #{tid} FAK sell {up_shares}sh @ ${sell_price}")
+                                        break
+                                    except Exception as e:
+                                        log_msg(f"[SL-SELL-UP] #{tid} Attempt {attempt+1} failed: {str(e)[:60]}")
 
                         if aid == down_token and down_filled and not down_sl_hit and best_bid <= SL_PRICE and best_bid > 0.01:
                             down_sl_hit = True
@@ -403,12 +412,20 @@ class BTCBothSidesBot:
                             log_msg(f"[SL-DN] #{tid} DOWN bid ${best_bid:.2f} <= SL ${SL_PRICE} — selling")
                             if self.client and not PAPER_MODE:
                                 try:
-                                    args = OrderArgs(price=0.01, size=down_shares, side=SELL, token_id=down_token)
-                                    signed = self.client.create_order(args)
-                                    self.client.post_order(signed, OrderType.FAK)
-                                    log_msg(f"[SL-SOLD-DN] #{tid} FAK sell {down_shares}sh")
-                                except Exception as e:
-                                    log_msg(f"[SL-SELL-DN] #{tid} Failed: {str(e)[:60]}")
+                                    params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=down_token, signature_type=SIGNATURE_TYPE)
+                                    self.client.update_balance_allowance(params)
+                                except:
+                                    pass
+                                for attempt in range(3):
+                                    try:
+                                        sell_price = snap_price(max(best_bid - 0.02, 0.01))
+                                        args = OrderArgs(price=sell_price, size=down_shares, side=SELL, token_id=down_token)
+                                        signed = self.client.create_order(args)
+                                        self.client.post_order(signed, OrderType.FAK)
+                                        log_msg(f"[SL-SOLD-DN] #{tid} FAK sell {down_shares}sh @ ${sell_price}")
+                                        break
+                                    except Exception as e:
+                                        log_msg(f"[SL-SELL-DN] #{tid} Attempt {attempt+1} failed: {str(e)[:60]}")
 
                     # Record snapshot every 10s
                     if int(elapsed) % 10 == 0 and up_ask > 0 and down_ask > 0:
