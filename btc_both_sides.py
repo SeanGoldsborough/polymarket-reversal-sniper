@@ -372,6 +372,16 @@ class BTCBothSidesBot:
                         combined = up_fill_price + down_fill_price
                         log_msg(f"[BOTH] #{tid} Both filled! UP ${up_fill_price:.2f} + DOWN ${down_fill_price:.2f} = "
                                 f"${combined:.2f} | SL ${SL_PRICE} on both sides — monitoring for SL")
+                        # Pre-approve both tokens for selling (so SL executes instantly)
+                        if self.client and not PAPER_MODE:
+                            try:
+                                params_up = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=up_token, signature_type=SIGNATURE_TYPE)
+                                self.client.update_balance_allowance(params_up)
+                                params_dn = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=down_token, signature_type=SIGNATURE_TYPE)
+                                self.client.update_balance_allowance(params_dn)
+                                log_msg(f"[APPROVED] #{tid} Both tokens pre-approved for SL sell")
+                            except Exception as e:
+                                log_msg(f"[APPROVE] #{tid} Failed: {str(e)[:60]}")
 
                     # SL check on BOTH filled sides (or one-fill)
                     for item in items:
@@ -389,12 +399,6 @@ class BTCBothSidesBot:
                             up_sl_price = best_bid
                             log_msg(f"[SL-UP] #{tid} UP bid ${best_bid:.2f} <= SL ${SL_PRICE} — selling")
                             if self.client and not PAPER_MODE:
-                                try:
-                                    # Approve conditional token for selling
-                                    params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=up_token, signature_type=SIGNATURE_TYPE)
-                                    self.client.update_balance_allowance(params)
-                                except:
-                                    pass
                                 for attempt in range(3):
                                     try:
                                         sell_price = snap_price(max(best_bid - 0.02, 0.01))
@@ -404,18 +408,13 @@ class BTCBothSidesBot:
                                         log_msg(f"[SL-SOLD-UP] #{tid} FAK sell {up_shares}sh @ ${sell_price}")
                                         break
                                     except Exception as e:
-                                        log_msg(f"[SL-SELL-UP] #{tid} Attempt {attempt+1} failed: {str(e)[:60]}")
+                                        log_msg(f"[SL-SELL-UP] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
 
                         if aid == down_token and down_filled and not down_sl_hit and best_bid <= SL_PRICE and best_bid > 0.01:
                             down_sl_hit = True
                             down_sl_price = best_bid
                             log_msg(f"[SL-DN] #{tid} DOWN bid ${best_bid:.2f} <= SL ${SL_PRICE} — selling")
                             if self.client and not PAPER_MODE:
-                                try:
-                                    params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=down_token, signature_type=SIGNATURE_TYPE)
-                                    self.client.update_balance_allowance(params)
-                                except:
-                                    pass
                                 for attempt in range(3):
                                     try:
                                         sell_price = snap_price(max(best_bid - 0.02, 0.01))
@@ -425,7 +424,7 @@ class BTCBothSidesBot:
                                         log_msg(f"[SL-SOLD-DN] #{tid} FAK sell {down_shares}sh @ ${sell_price}")
                                         break
                                     except Exception as e:
-                                        log_msg(f"[SL-SELL-DN] #{tid} Attempt {attempt+1} failed: {str(e)[:60]}")
+                                        log_msg(f"[SL-SELL-DN] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
 
                     # Record snapshot every 10s
                     if int(elapsed) % 10 == 0 and up_ask > 0 and down_ask > 0:
