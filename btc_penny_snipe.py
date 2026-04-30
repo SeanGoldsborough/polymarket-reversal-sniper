@@ -505,6 +505,48 @@ class BTCPennyBot:
         except Exception as e:
             log_msg(f"[WS] #{tid} Error: {e}")
 
+        # ── FINAL FILL CHECK (catches fills missed during WS dropout) ──
+        if self.client and not PAPER_MODE:
+            for label, order_id, token, is_filled in [
+                ("UP", up_order_id, up_token, up_filled),
+                ("DN", down_order_id, down_token, down_filled),
+            ]:
+                if is_filled or not order_id:
+                    continue
+                try:
+                    order = self.client.get_order(order_id)
+                    if order:
+                        matched = float(order.get("size_matched", 0))
+                        if matched > 0:
+                            fill_price = float(order.get("price", BUY_PRICE))
+                            shares = int(matched)
+                            log_msg(f"[LATE-FILL-{label}] #{tid} {shares}sh @ ${fill_price:.2f} (detected post-WS)")
+                            if label == "UP":
+                                up_filled = True
+                                up_fill_price = fill_price
+                                up_shares = shares
+                            else:
+                                down_filled = True
+                                down_fill_price = fill_price
+                                down_shares = shares
+                            # Pre-approve and place TP
+                            try:
+                                params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token, signature_type=SIGNATURE_TYPE)
+                                self.client.update_balance_allowance(params)
+                                args = OrderArgs(price=SELL_PRICE, size=shares, side=SELL, token_id=token)
+                                signed = self.client.create_order(args)
+                                resp = self.client.post_order(signed, OrderType.GTC)
+                                tp_oid = resp.get("orderID", "")
+                                log_msg(f"[LATE-TP-{label}] GTC sell {shares}sh @ ${SELL_PRICE} order={tp_oid[:10]}...")
+                                if label == "UP":
+                                    up_tp_order_id = tp_oid
+                                else:
+                                    down_tp_order_id = tp_oid
+                            except Exception as e:
+                                log_msg(f"[LATE-TP-{label}] FAILED: {str(e)[:80]}")
+                except Exception as e:
+                    log_msg(f"[LATE-CHECK-{label}] #{tid} {str(e)[:60]}")
+
         # ── CANCEL UNFILLED ORDERS ──
         if self.client and not PAPER_MODE:
             if not up_filled and up_order_id:
