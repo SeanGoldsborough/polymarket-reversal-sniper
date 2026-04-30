@@ -159,6 +159,9 @@ def build_dashboard():
 
     wallet = get_wallet()
     if wallet is None:
+        wallet = get_onchain_balance()  # Fallback to on-chain balance
+    wallet_available = wallet is not None
+    if wallet is None:
         wallet = 0
     wallet_pnl = wallet - LIVE_STARTING_WALLET
 
@@ -182,7 +185,10 @@ def build_dashboard():
 
     # ── LIVE SECTION ──
     lines.append("\U0001F4B0 <b>LIVE</b>")
-    lines.append(f"Wallet: <b>${wallet:,.2f}</b> ({'+'if wallet_pnl>=0 else ''}{wallet_pnl:,.2f})")
+    if wallet_available:
+        lines.append(f"Wallet: <b>${wallet:,.2f}</b> ({'+'if wallet_pnl>=0 else ''}{wallet_pnl:,.2f})")
+    else:
+        lines.append("Wallet: <b>unavailable</b> (API blocked)")
     lines.append(f"Started: ${LIVE_STARTING_WALLET:,.2f}")
     lines.append("")
 
