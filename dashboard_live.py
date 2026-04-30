@@ -11,13 +11,13 @@ BOT_TOKEN = "8027434003:AAEZPOsAFCXBjdxAdY8gmWGo9-PQwEir-0E"
 CHAT_ID = "7142537098"
 INTERVAL = 300  # 5 minutes
 
-LIVE_STARTING_WALLET = 150.02  # Reset after bug fix — fresh start
+LIVE_STARTING_WALLET = 100.98  # Fresh start Apr 29
 
 # ── Bot definitions: (name, log_path, tmux_session, mode) ──
 LIVE_BOTS = [
     ("SNIPE-ALT", "logs/snipe_alt_live_trades.jsonl", "snipeALTlive"),
     ("BTC-SNIPE-LADDER", "logs/btc_snipe_ladder_trades.jsonl", "btcSnipeLadder"),
-    ("BTC-BOTH-SIDES", "logs/btc_both_sides_trades.jsonl", "btcBothSides"),
+    ("BTC-PENNY", "logs/btc_penny_trades.jsonl", "btcPenny"),
 ]
 
 PAPER_BOTS = [

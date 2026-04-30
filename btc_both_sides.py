@@ -62,7 +62,8 @@ BID_HIGH = 0.60                            # Only buy if ask <= this
 SHARES_PER_SIDE = 5                        # Fixed 5 shares per side (minimum)
 MAX_COMBINED_COST = 1.05                   # Max combined per-share cost
 TP_PCT = 0.12                              # Take profit at +12% from entry
-SL_PCT = 0.12                              # Stop loss at -12% from entry, active all window
+SL_PCT = 0.12                              # Stop loss at -12% from entry
+SL_COOLDOWN = 60                           # No SL triggers for first 60s after fill (let trade breathe)
 ENTRY_DELAY = 10
 CANCEL_BEFORE_END = 3
 
@@ -304,7 +305,7 @@ class BTCBothSidesBot:
         shares_per_side = SHARES_PER_SIDE
 
         # ── PLACE BIDS ON BOTH SIDES ──
-        log_msg(f"[PLACE] #{tid} Buying both sides ${BID_LOW}-${BID_HIGH} | TP +18% | SL -18% last 3min | {mkt['question'][:40]}")
+        log_msg(f"[PLACE] #{tid} Buying both sides ${BID_LOW}-${BID_HIGH} | TP +{TP_PCT*100:.0f}% | SL -{SL_PCT*100:.0f}% last 3min | {mkt['question'][:40]}")
 
         up_order_id = None
         down_order_id = None
@@ -361,6 +362,7 @@ class BTCBothSidesBot:
         both_logged = False
         up_sl_price = 0
         down_sl_price = 0
+        last_fill_time = 0
         last_log_time = 0
 
         try:
@@ -414,6 +416,7 @@ class BTCBothSidesBot:
                                         up_filled = True
                                         up_fill_price = float(order.get("price", up_ask))
                                         up_shares = int(matched)
+                                        last_fill_time = now
                                         log_msg(f"[FILL-UP] #{tid} {up_shares}sh @ ${up_fill_price:.2f} (verified) | "
                                                 f"DOWN ask=${down_ask:.2f} | T+{elapsed:.0f}s")
                             except:
@@ -422,6 +425,7 @@ class BTCBothSidesBot:
                             up_filled = True
                             up_fill_price = up_ask
                             up_shares = shares_per_side
+                            last_fill_time = now
                             log_msg(f"[FILL-UP] #{tid} {up_shares}sh @ ${up_fill_price:.2f} | "
                                     f"DOWN ask=${down_ask:.2f} | T+{elapsed:.0f}s")
 
@@ -435,6 +439,7 @@ class BTCBothSidesBot:
                                         down_filled = True
                                         down_fill_price = float(order.get("price", down_ask))
                                         down_shares = int(matched)
+                                        last_fill_time = now
                                         log_msg(f"[FILL-DN] #{tid} {down_shares}sh @ ${down_fill_price:.2f} (verified) | "
                                                 f"UP ask=${up_ask:.2f} | T+{elapsed:.0f}s")
                             except:
@@ -443,6 +448,7 @@ class BTCBothSidesBot:
                             down_filled = True
                             down_fill_price = down_ask
                             down_shares = shares_per_side
+                            last_fill_time = now
                         log_msg(f"[FILL-DN] #{tid} {down_shares}sh @ ${down_fill_price:.2f} | "
                                 f"UP ask=${up_ask:.2f} | T+{elapsed:.0f}s")
 
@@ -466,7 +472,8 @@ class BTCBothSidesBot:
                                 log_msg(f"[APPROVE] #{tid} Failed: {str(e)[:60]}")
 
                     # ── TP/SL logic per WS update ──
-                    # SL active all window
+                    # SL cooldown: no SL triggers for first 60s after fill (let trade breathe)
+                    sl_allowed = last_fill_time > 0 and (now - last_fill_time) >= SL_COOLDOWN
 
                     for item in items:
                         aid = item.get("asset_id", "")
@@ -483,11 +490,11 @@ class BTCBothSidesBot:
                             up_tp = round(up_fill_price * (1 + TP_PCT), 2)
                             up_sl = round(up_fill_price * (1 - SL_PCT), 2)
 
-                            # TP: sell when bid >= +18%
+                            # TP: sell when bid >= +TP_PCT
                             if best_bid >= up_tp:
                                 up_sl_hit = True
                                 up_sl_price = best_bid
-                                log_msg(f"[TP-UP] #{tid} UP bid ${best_bid:.2f} >= TP ${up_tp} (+18%) — selling")
+                                log_msg(f"[TP-UP] #{tid} UP bid ${best_bid:.2f} >= TP ${up_tp} (+{TP_PCT*100:.0f}%) — selling")
                                 if self.client and not PAPER_MODE:
                                     for attempt in range(3):
                                         try:
@@ -499,11 +506,11 @@ class BTCBothSidesBot:
                                         except Exception as e:
                                             log_msg(f"[TP-SELL-UP] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
 
-                            # SL: sell immediately when bid drops to -12%
-                            elif best_bid <= up_sl and best_bid > 0.01:
+                            # SL: sell when bid drops to -SL_PCT (after cooldown)
+                            elif sl_allowed and best_bid <= up_sl and best_bid > 0.01:
                                 up_sl_hit = True
                                 up_sl_price = best_bid
-                                log_msg(f"[SL-UP] #{tid} UP bid ${best_bid:.2f} <= SL ${up_sl:.2f} (-12%) — selling")
+                                log_msg(f"[SL-UP] #{tid} UP bid ${best_bid:.2f} <= SL ${up_sl:.2f} (-{SL_PCT*100:.0f}%) — selling")
                                 if self.client and not PAPER_MODE:
                                     for attempt in range(3):
                                         try:
@@ -520,11 +527,11 @@ class BTCBothSidesBot:
                             dn_tp = round(down_fill_price * (1 + TP_PCT), 2)
                             dn_sl = round(down_fill_price * (1 - SL_PCT), 2)
 
-                            # TP: sell when bid >= +18%
+                            # TP: sell when bid >= +TP_PCT
                             if best_bid >= dn_tp:
                                 down_sl_hit = True
                                 down_sl_price = best_bid
-                                log_msg(f"[TP-DN] #{tid} DOWN bid ${best_bid:.2f} >= TP ${dn_tp} (+18%) — selling")
+                                log_msg(f"[TP-DN] #{tid} DOWN bid ${best_bid:.2f} >= TP ${dn_tp} (+{TP_PCT*100:.0f}%) — selling")
                                 if self.client and not PAPER_MODE:
                                     for attempt in range(3):
                                         try:
@@ -536,11 +543,11 @@ class BTCBothSidesBot:
                                         except Exception as e:
                                             log_msg(f"[TP-SELL-DN] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
 
-                            # SL: sell immediately when bid drops to -12%
-                            elif best_bid <= dn_sl and best_bid > 0.01:
+                            # SL: sell when bid drops to -SL_PCT (after cooldown)
+                            elif sl_allowed and best_bid <= dn_sl and best_bid > 0.01:
                                 down_sl_hit = True
                                 down_sl_price = best_bid
-                                log_msg(f"[SL-DN] #{tid} DOWN bid ${best_bid:.2f} <= SL ${dn_sl:.2f} (-12%) — selling")
+                                log_msg(f"[SL-DN] #{tid} DOWN bid ${best_bid:.2f} <= SL ${dn_sl:.2f} (-{SL_PCT*100:.0f}%) — selling")
                                 if self.client and not PAPER_MODE:
                                     for attempt in range(3):
                                         try:
@@ -623,11 +630,11 @@ class BTCBothSidesBot:
             self.one_filled += 1
 
         if not both_sides and up_filled:
-            log_msg(f"[WATCH-RES] #{tid} One fill (UP) — holding to resolution, TP +18% | SL -18% last 3min")
+            log_msg(f"[WATCH-RES] #{tid} One fill (UP) — holding to resolution, TP +{TP_PCT*100:.0f}% | SL -{SL_PCT*100:.0f}% last 3min")
         elif not both_sides and down_filled:
-            log_msg(f"[WATCH-RES] #{tid} One fill (DOWN) — holding to resolution, TP +18% | SL -18% last 3min")
+            log_msg(f"[WATCH-RES] #{tid} One fill (DOWN) — holding to resolution, TP +{TP_PCT*100:.0f}% | SL -{SL_PCT*100:.0f}% last 3min")
         elif both_sides:
-            log_msg(f"[WATCH-RES] #{tid} Both filled — holding to resolution, TP +18% | SL -18% last 3min on both")
+            log_msg(f"[WATCH-RES] #{tid} Both filled — holding to resolution, TP +{TP_PCT*100:.0f}% | SL -{SL_PCT*100:.0f}% last 3min on both")
 
         # ── WAIT FOR RESOLUTION ──
         for _ in range(90):
@@ -791,7 +798,7 @@ class BTCBothSidesBot:
             f"{icon}{both_tag} <b>{BOT_NAME} #{tid}</b>\n"
             f"{result} | P&L ${pnl:+.2f} ({ret_pct:+.0f}%)\n"
             f"UP: {up_shares}sh @ ${up_cost/up_shares:.2f} (${up_cost:.2f}) | DOWN: {down_shares}sh @ ${down_cost/down_shares:.2f} (${down_cost:.2f})\n"
-            f"Winner: {winner} | TP +18% | SL -18%\n"
+            f"Winner: {winner} | TP +{TP_PCT*100:.0f}% | SL -{SL_PCT*100:.0f}%\n"
             f"Bank: ${self.bankroll:.2f} | {self.wins}W/{self.losses}L ({wr:.0f}%)"))
 
     def _write_summary(self):
