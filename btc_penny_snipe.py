@@ -52,7 +52,7 @@ except ImportError:
 BUY_PRICE = 0.09
 SELL_PRICE = 0.15       # TP: +67% ($0.06/share profit)
 SL_PRICE = 0.04         # SL: -56% ($0.05/share loss)
-SHARES_PER_SIDE = 50    # 50 shares × $0.09 = $4.50 per side
+SHARES_PER_SIDE = 5     # 5 shares × $0.09 = $0.45 per side
 CANCEL_BEFORE_END = 30  # Cancel unfilled at T-30 (skip last 30s)
 
 CLOB_HOST = "https://clob.polymarket.com"
