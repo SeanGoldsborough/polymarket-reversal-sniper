@@ -7,8 +7,10 @@ import urllib.parse
 import os
 from datetime import datetime, timezone
 
-BOT_TOKEN = "8027434003:AAEZPOsAFCXBjdxAdY8gmWGo9-PQwEir-0E"
-CHAT_ID = "7142537098"
+from dotenv import load_dotenv
+load_dotenv("/home/ubuntu/polymarket-bot/.env")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 INTERVAL = 300  # 5 minutes
 
 LIVE_STARTING_WALLET = 100.98  # Fresh start Apr 29
