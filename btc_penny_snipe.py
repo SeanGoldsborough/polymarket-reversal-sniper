@@ -216,8 +216,20 @@ class BTCPennyBot:
                 log_msg(f"[LOOP] Window start | Bank: ${self.bankroll:.2f}")
 
                 if self.bankroll < 3:
-                    log_msg("[RISK] Bankroll too low")
-                    continue
+                    # Internal tracking may be wrong — check actual wallet
+                    try:
+                        params = BalanceAllowanceParams(asset_type="COLLATERAL", token_id="", signature_type=2)
+                        result = self.client.get_balance_allowance(params)
+                        real_bal = int(result.get("balance", "0")) / 1_000_000
+                        if real_bal >= 3:
+                            self.bankroll = real_bal
+                            log_msg(f"[WALLET-SYNC] Internal ${self.bankroll:.2f} was wrong, synced to ${real_bal:.2f}")
+                        else:
+                            log_msg(f"[RISK] Bankroll too low (wallet ${real_bal:.2f})")
+                            continue
+                    except:
+                        log_msg("[RISK] Bankroll too low (wallet check failed)")
+                        continue
 
                 await self.mf.refresh_next()
                 if not self.mf.market:
