@@ -256,7 +256,7 @@ class BTCPennyBot:
         up_token = mkt["up"]
         down_token = mkt["down"]
 
-        log_msg(f"[PLACE] #{tid} BUY 50sh UP + 50sh DOWN @ ${BUY_PRICE} | TP ${SELL_PRICE} | SL ${SL_PRICE} | {mkt['question'][:40]}")
+        log_msg(f"[PLACE] #{tid} BUY {SHARES_PER_SIDE}sh UP + {SHARES_PER_SIDE}sh DOWN @ ${BUY_PRICE} | TP ${SELL_PRICE} | SL ${SL_PRICE} | {mkt['question'][:40]}")
 
         # ── PLACE GTC BIDS ON BOTH SIDES ──
         up_order_id = None
@@ -281,297 +281,258 @@ class BTCPennyBot:
             except Exception as e:
                 log_msg(f"[BID-DN] FAILED: {str(e)[:80]}")
 
-        # ── STATE TRACKING ──
-        up_filled = False
-        down_filled = False
-        up_fill_price = 0.0
-        down_fill_price = 0.0
-        up_shares = 0
-        down_shares = 0
-
-        up_tp_order_id = None   # GTC sell order at TP
-        down_tp_order_id = None
-
-        up_exited = False       # True when sold (TP, SL, or resolution)
-        down_exited = False
-        up_exit_price = 0.0     # Actual price we exited at
-        down_exit_price = 0.0
-        up_exit_reason = ""
-        down_exit_reason = ""
-
-        # ── MONITOR VIA WEBSOCKET ──
-        try:
-            async with websockets.connect(POLY_WS_URL, ping_interval=20, ping_timeout=10,
-                                           close_timeout=5) as ws:
-                sub_msg = json.dumps({"assets_ids": [up_token, down_token], "type": "market"})
-                await ws.send(sub_msg)
-                log_msg(f"[WS] #{tid} Connected — monitoring")
-
-                last_log_time = 0
-                up_bid = 0.0
-                down_bid = 0.0
-
-                async for raw in ws:
-                    now = time.time()
-                    if now >= cancel_time:
-                        break
-
-                    try:
-                        msg = json.loads(raw)
-                    except:
-                        continue
-
-                    items = []
-                    if isinstance(msg, list):
-                        items = [m for m in msg if isinstance(m, dict)]
-                    elif isinstance(msg, dict) and ("asks" in msg or "bids" in msg):
-                        items = [msg]
-
-                    elapsed = now - target_window_start
-
-                    # ── FILL DETECTION (live) ──
-                    if not up_filled and self.client and not PAPER_MODE and up_order_id:
-                        try:
-                            order = self.client.get_order(up_order_id)
-                            if order:
-                                matched = float(order.get("size_matched", 0))
-                                if matched > 0:
-                                    up_filled = True
-                                    up_fill_price = float(order.get("price", BUY_PRICE))
-                                    up_shares = int(matched)
-                                    log_msg(f"[FILL-UP] #{tid} {up_shares}sh @ ${up_fill_price:.2f} | T+{elapsed:.0f}s")
-                                    # Pre-approve for selling
-                                    try:
-                                        params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=up_token, signature_type=SIGNATURE_TYPE)
-                                        self.client.update_balance_allowance(params)
-                                    except:
-                                        pass
-                                    # Place GTC TP sell order
-                                    try:
-                                        args = OrderArgs(price=SELL_PRICE, size=up_shares, side=SELL, token_id=up_token)
-                                        signed = self.client.create_order(args)
-                                        resp = self.client.post_order(signed, OrderType.GTC)
-                                        up_tp_order_id = resp.get("orderID", "")
-                                        log_msg(f"[TP-UP] GTC sell {up_shares}sh @ ${SELL_PRICE} order={up_tp_order_id[:10]}...")
-                                    except Exception as e:
-                                        log_msg(f"[TP-UP] FAILED: {str(e)[:80]}")
-                        except:
-                            pass
-
-                    if not down_filled and self.client and not PAPER_MODE and down_order_id:
-                        try:
-                            order = self.client.get_order(down_order_id)
-                            if order:
-                                matched = float(order.get("size_matched", 0))
-                                if matched > 0:
-                                    down_filled = True
-                                    down_fill_price = float(order.get("price", BUY_PRICE))
-                                    down_shares = int(matched)
-                                    log_msg(f"[FILL-DN] #{tid} {down_shares}sh @ ${down_fill_price:.2f} | T+{elapsed:.0f}s")
-                                    # Pre-approve for selling
-                                    try:
-                                        params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=down_token, signature_type=SIGNATURE_TYPE)
-                                        self.client.update_balance_allowance(params)
-                                    except:
-                                        pass
-                                    # Place GTC TP sell order
-                                    try:
-                                        args = OrderArgs(price=SELL_PRICE, size=down_shares, side=SELL, token_id=down_token)
-                                        signed = self.client.create_order(args)
-                                        resp = self.client.post_order(signed, OrderType.GTC)
-                                        down_tp_order_id = resp.get("orderID", "")
-                                        log_msg(f"[TP-DN] GTC sell {down_shares}sh @ ${SELL_PRICE} order={down_tp_order_id[:10]}...")
-                                    except Exception as e:
-                                        log_msg(f"[TP-DN] FAILED: {str(e)[:80]}")
-                        except:
-                            pass
-
-                    # ── CHECK TP FILL (GTC sell order matched?) ──
-                    if up_filled and not up_exited and up_tp_order_id and self.client:
-                        try:
-                            order = self.client.get_order(up_tp_order_id)
-                            if order:
-                                matched = float(order.get("size_matched", 0))
-                                if matched >= up_shares:
-                                    up_exited = True
-                                    up_exit_price = float(order.get("price", SELL_PRICE))
-                                    up_exit_reason = "TP"
-                                    log_msg(f"[TP-SOLD-UP] #{tid} {up_shares}sh @ ${up_exit_price:.2f}")
-                        except:
-                            pass
-
-                    if down_filled and not down_exited and down_tp_order_id and self.client:
-                        try:
-                            order = self.client.get_order(down_tp_order_id)
-                            if order:
-                                matched = float(order.get("size_matched", 0))
-                                if matched >= down_shares:
-                                    down_exited = True
-                                    down_exit_price = float(order.get("price", SELL_PRICE))
-                                    down_exit_reason = "TP"
-                                    log_msg(f"[TP-SOLD-DN] #{tid} {down_shares}sh @ ${down_exit_price:.2f}")
-                        except:
-                            pass
-
-                    # ── SL CHECK via WS bids ──
-                    for item in items:
-                        aid = item.get("asset_id", "")
-                        bids_data = item.get("bids", [])
-                        if not bids_data:
-                            continue
-                        try:
-                            best_bid = max(float(b["price"]) for b in bids_data if isinstance(b, dict) and "price" in b)
-                        except (ValueError, KeyError):
-                            continue
-
-                        if aid == up_token:
-                            up_bid = best_bid
-                        elif aid == down_token:
-                            down_bid = best_bid
-
-                        # SL on UP
-                        if aid == up_token and up_filled and not up_exited and best_bid <= SL_PRICE and best_bid > 0.005:
-                            up_exited = True
-                            up_exit_reason = "SL"
-                            # Cancel TP order first
-                            if up_tp_order_id and self.client:
-                                try:
-                                    self.client.cancel(up_tp_order_id)
-                                except:
-                                    pass
-                            # FAK sell at market
-                            if self.client and not PAPER_MODE:
-                                for attempt in range(3):
-                                    try:
-                                        sell_p = snap_price(best_bid - 0.01)
-                                        args = OrderArgs(price=sell_p, size=up_shares, side=SELL, token_id=up_token)
-                                        signed = self.client.create_order(args)
-                                        self.client.post_order(signed, OrderType.FAK)
-                                        up_exit_price = sell_p
-                                        log_msg(f"[SL-SOLD-UP] #{tid} FAK sell {up_shares}sh @ ${sell_p}")
-                                        break
-                                    except Exception as e:
-                                        log_msg(f"[SL-UP] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
-                            else:
-                                up_exit_price = best_bid
-                                log_msg(f"[SL-UP] #{tid} PAPER SL @ ${best_bid:.2f}")
-
-                        # SL on DOWN
-                        if aid == down_token and down_filled and not down_exited and best_bid <= SL_PRICE and best_bid > 0.005:
-                            down_exited = True
-                            down_exit_reason = "SL"
-                            if down_tp_order_id and self.client:
-                                try:
-                                    self.client.cancel(down_tp_order_id)
-                                except:
-                                    pass
-                            if self.client and not PAPER_MODE:
-                                for attempt in range(3):
-                                    try:
-                                        sell_p = snap_price(best_bid - 0.01)
-                                        args = OrderArgs(price=sell_p, size=down_shares, side=SELL, token_id=down_token)
-                                        signed = self.client.create_order(args)
-                                        self.client.post_order(signed, OrderType.FAK)
-                                        down_exit_price = sell_p
-                                        log_msg(f"[SL-SOLD-DN] #{tid} FAK sell {down_shares}sh @ ${sell_p}")
-                                        break
-                                    except Exception as e:
-                                        log_msg(f"[SL-DN] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
-                            else:
-                                down_exit_price = best_bid
-                                log_msg(f"[SL-DN] #{tid} PAPER SL @ ${best_bid:.2f}")
-
-                    # ── LOG every 15s ──
-                    if now - last_log_time >= 15 and elapsed > 5:
-                        last_log_time = now
-                        fills = []
-                        if up_filled:
-                            status = "EXITED" if up_exited else f"bid ${up_bid:.2f}"
-                            fills.append(f"UP {up_shares}sh {status}")
-                        if down_filled:
-                            status = "EXITED" if down_exited else f"bid ${down_bid:.2f}"
-                            fills.append(f"DN {down_shares}sh {status}")
-                        fill_str = " | ".join(fills) if fills else "waiting for fills"
-                        log_msg(f"[WATCH] #{tid} T+{elapsed:.0f}s | {fill_str}")
-
-                    # Early exit if both sides exited
-                    if up_exited and down_exited:
-                        break
-                    if (up_filled or down_filled) and up_exited and not down_filled:
-                        break
-                    if (up_filled or down_filled) and down_exited and not up_filled:
-                        break
-
-        except Exception as e:
-            log_msg(f"[WS] #{tid} Error: {e}")
-
-        # ── FINAL FILL CHECK (catches fills missed during WS dropout) ──
-        if self.client and not PAPER_MODE:
-            for label, order_id, token, is_filled in [
-                ("UP", up_order_id, up_token, up_filled),
-                ("DN", down_order_id, down_token, down_filled),
-            ]:
-                if is_filled or not order_id:
-                    continue
+            # ── PRE-APPROVE both tokens immediately (before fill) ──
+            for label, token in [("UP", up_token), ("DN", down_token)]:
                 try:
-                    order = self.client.get_order(order_id)
-                    if order:
-                        matched = float(order.get("size_matched", 0))
-                        if matched > 0:
-                            fill_price = float(order.get("price", BUY_PRICE))
-                            shares = int(matched)
-                            log_msg(f"[LATE-FILL-{label}] #{tid} {shares}sh @ ${fill_price:.2f} (detected post-WS)")
-                            if label == "UP":
-                                up_filled = True
-                                up_fill_price = fill_price
-                                up_shares = shares
-                            else:
-                                down_filled = True
-                                down_fill_price = fill_price
-                                down_shares = shares
-                            # Pre-approve and place TP
-                            try:
-                                params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token, signature_type=SIGNATURE_TYPE)
-                                self.client.update_balance_allowance(params)
-                                args = OrderArgs(price=SELL_PRICE, size=shares, side=SELL, token_id=token)
-                                signed = self.client.create_order(args)
-                                resp = self.client.post_order(signed, OrderType.GTC)
-                                tp_oid = resp.get("orderID", "")
-                                log_msg(f"[LATE-TP-{label}] GTC sell {shares}sh @ ${SELL_PRICE} order={tp_oid[:10]}...")
-                                if label == "UP":
-                                    up_tp_order_id = tp_oid
-                                else:
-                                    down_tp_order_id = tp_oid
-                            except Exception as e:
-                                log_msg(f"[LATE-TP-{label}] FAILED: {str(e)[:80]}")
+                    params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token, signature_type=SIGNATURE_TYPE)
+                    self.client.update_balance_allowance(params)
+                except:
+                    pass
+            log_msg(f"[PRE-APPROVE] #{tid} Both tokens pre-approved for instant sell")
+
+        # ── SHARED STATE (accessed by both poll and WS tasks) ──
+        state = {
+            "up_filled": False, "down_filled": False,
+            "up_fill_price": 0.0, "down_fill_price": 0.0,
+            "up_shares": 0, "down_shares": 0,
+            "up_tp_order_id": None, "down_tp_order_id": None,
+            "up_exited": False, "down_exited": False,
+            "up_exit_price": 0.0, "down_exit_price": 0.0,
+            "up_exit_reason": "", "down_exit_reason": "",
+            "up_bid": 0.0, "down_bid": 0.0,
+            "done": False,
+        }
+
+        async def _handle_fill(label, order_id, token):
+            """Called when a fill is detected. Places TP sell immediately."""
+            key = "up" if label == "UP" else "down"
+            try:
+                order = self.client.get_order(order_id)
+                if not order:
+                    return False
+                matched = float(order.get("size_matched", 0))
+                if matched <= 0:
+                    return False
+
+                fill_price = float(order.get("price", BUY_PRICE))
+                shares = int(matched)
+                elapsed = time.time() - target_window_start
+
+                state[f"{key}_filled"] = True
+                state[f"{key}_fill_price"] = fill_price
+                state[f"{key}_shares"] = shares
+                log_msg(f"[FILL-{label}] #{tid} {shares}sh @ ${fill_price:.2f} | T+{elapsed:.0f}s")
+
+                # Place GTC TP sell immediately (tokens already pre-approved)
+                try:
+                    args = OrderArgs(price=SELL_PRICE, size=shares, side=SELL, token_id=token)
+                    signed = self.client.create_order(args)
+                    resp = self.client.post_order(signed, OrderType.GTC)
+                    tp_oid = resp.get("orderID", "")
+                    state[f"{key}_tp_order_id"] = tp_oid
+                    log_msg(f"[TP-{label}] GTC sell {shares}sh @ ${SELL_PRICE} order={tp_oid[:10]}...")
                 except Exception as e:
-                    log_msg(f"[LATE-CHECK-{label}] #{tid} {str(e)[:60]}")
+                    log_msg(f"[TP-{label}] FAILED: {str(e)[:80]}")
+                return True
+            except Exception as e:
+                log_msg(f"[FILL-CHECK-{label}] {str(e)[:60]}")
+                return False
+
+        async def _check_tp_fill(label, token):
+            """Check if a TP sell order has been filled."""
+            key = "up" if label == "UP" else "down"
+            tp_oid = state[f"{key}_tp_order_id"]
+            if not tp_oid or state[f"{key}_exited"]:
+                return
+            try:
+                order = self.client.get_order(tp_oid)
+                if order:
+                    matched = float(order.get("size_matched", 0))
+                    if matched >= state[f"{key}_shares"]:
+                        state[f"{key}_exited"] = True
+                        state[f"{key}_exit_price"] = float(order.get("price", SELL_PRICE))
+                        state[f"{key}_exit_reason"] = "TP"
+                        log_msg(f"[TP-SOLD-{label}] #{tid} {state[f'{key}_shares']}sh @ ${state[f'{key}_exit_price']:.2f}")
+            except:
+                pass
+
+        async def _execute_sl(label, token, bid_price):
+            """Execute stop loss sell."""
+            key = "up" if label == "UP" else "down"
+            if state[f"{key}_exited"] or not state[f"{key}_filled"]:
+                return
+            state[f"{key}_exited"] = True
+            state[f"{key}_exit_reason"] = "SL"
+            # Cancel TP order
+            tp_oid = state[f"{key}_tp_order_id"]
+            if tp_oid and self.client:
+                try:
+                    self.client.cancel(tp_oid)
+                except:
+                    pass
+            if self.client and not PAPER_MODE:
+                for attempt in range(3):
+                    try:
+                        sell_p = snap_price(bid_price - 0.01)
+                        args = OrderArgs(price=sell_p, size=state[f"{key}_shares"], side=SELL, token_id=token)
+                        signed = self.client.create_order(args)
+                        self.client.post_order(signed, OrderType.FAK)
+                        state[f"{key}_exit_price"] = sell_p
+                        log_msg(f"[SL-SOLD-{label}] #{tid} FAK sell {state[f'{key}_shares']}sh @ ${sell_p}")
+                        break
+                    except Exception as e:
+                        log_msg(f"[SL-{label}] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
+            else:
+                state[f"{key}_exit_price"] = bid_price
+                log_msg(f"[SL-{label}] #{tid} PAPER SL @ ${bid_price:.2f}")
+
+        # ── TASK 1: API POLL (1s interval) — fill + TP detection ──
+        async def _poll_loop():
+            """Primary fill detection via order API. Reliable, 1s latency."""
+            while not state["done"] and time.time() < cancel_time:
+                if self.client and not PAPER_MODE:
+                    # Check buy fills
+                    if not state["up_filled"] and up_order_id:
+                        await _handle_fill("UP", up_order_id, up_token)
+                    if not state["down_filled"] and down_order_id:
+                        await _handle_fill("DN", down_order_id, down_token)
+                    # Check TP sell fills
+                    if state["up_filled"] and not state["up_exited"]:
+                        await _check_tp_fill("UP", up_token)
+                    if state["down_filled"] and not state["down_exited"]:
+                        await _check_tp_fill("DN", down_token)
+                    # Check if all done
+                    all_filled_exited = True
+                    for key in ["up", "down"]:
+                        if state[f"{key}_filled"] and not state[f"{key}_exited"]:
+                            all_filled_exited = False
+                    if (state["up_filled"] or state["down_filled"]) and all_filled_exited:
+                        state["done"] = True
+                        break
+                await asyncio.sleep(1)
+
+        # ── TASK 2: MARKET WS — SL monitoring + logging ──
+        async def _ws_loop():
+            """WebSocket for real-time SL price monitoring. Fast but may drop."""
+            last_log_time = 0
+            retry = 0
+            while not state["done"] and time.time() < cancel_time:
+                try:
+                    async with websockets.connect(POLY_WS_URL, ping_interval=20, ping_timeout=15,
+                                                   close_timeout=5) as ws:
+                        sub_msg = json.dumps({"assets_ids": [up_token, down_token], "type": "market"})
+                        await ws.send(sub_msg)
+                        if retry == 0:
+                            log_msg(f"[WS] #{tid} Connected — SL monitor active")
+                        else:
+                            log_msg(f"[WS] #{tid} Reconnected (attempt {retry})")
+                        retry = 0
+
+                        async for raw in ws:
+                            now = time.time()
+                            if now >= cancel_time or state["done"]:
+                                return
+
+                            try:
+                                msg = json.loads(raw)
+                            except:
+                                continue
+
+                            items = []
+                            if isinstance(msg, list):
+                                items = [m for m in msg if isinstance(m, dict)]
+                            elif isinstance(msg, dict) and ("asks" in msg or "bids" in msg):
+                                items = [msg]
+
+                            for item in items:
+                                aid = item.get("asset_id", "")
+                                bids_data = item.get("bids", [])
+                                if not bids_data:
+                                    continue
+                                try:
+                                    best_bid = max(float(b["price"]) for b in bids_data if isinstance(b, dict) and "price" in b)
+                                except (ValueError, KeyError):
+                                    continue
+
+                                if aid == up_token:
+                                    state["up_bid"] = best_bid
+                                elif aid == down_token:
+                                    state["down_bid"] = best_bid
+
+                                # SL on UP
+                                if aid == up_token and state["up_filled"] and not state["up_exited"] and best_bid <= SL_PRICE and best_bid > 0.005:
+                                    await _execute_sl("UP", up_token, best_bid)
+
+                                # SL on DOWN
+                                if aid == down_token and state["down_filled"] and not state["down_exited"] and best_bid <= SL_PRICE and best_bid > 0.005:
+                                    await _execute_sl("DN", down_token, best_bid)
+
+                            # Log every 15s
+                            elapsed = now - target_window_start
+                            if now - last_log_time >= 15 and elapsed > 5:
+                                last_log_time = now
+                                fills = []
+                                if state["up_filled"]:
+                                    status = "EXITED" if state["up_exited"] else f"bid ${state['up_bid']:.2f}"
+                                    fills.append(f"UP {state['up_shares']}sh {status}")
+                                if state["down_filled"]:
+                                    status = "EXITED" if state["down_exited"] else f"bid ${state['down_bid']:.2f}"
+                                    fills.append(f"DN {state['down_shares']}sh {status}")
+                                fill_str = " | ".join(fills) if fills else "waiting"
+                                log_msg(f"[WATCH] #{tid} T+{elapsed:.0f}s | {fill_str}")
+
+                except Exception as e:
+                    if not state["done"]:
+                        retry += 1
+                        log_msg(f"[WS] #{tid} Dropped: {str(e)[:40]} — reconnecting ({retry})...")
+                        await asyncio.sleep(min(retry * 0.5, 3))  # Quick reconnect
+
+        # ── RUN BOTH TASKS CONCURRENTLY ──
+        poll_task = asyncio.create_task(_poll_loop())
+        ws_task = asyncio.create_task(_ws_loop())
+        await asyncio.gather(poll_task, ws_task, return_exceptions=True)
 
         # ── CANCEL UNFILLED ORDERS ──
         if self.client and not PAPER_MODE:
-            if not up_filled and up_order_id:
+            if not state["up_filled"] and up_order_id:
                 try:
                     self.client.cancel(up_order_id)
                     log_msg(f"[CANCEL-UP] #{tid} Unfilled buy cancelled")
                 except:
                     pass
-            if not down_filled and down_order_id:
+            if not state["down_filled"] and down_order_id:
                 try:
                     self.client.cancel(down_order_id)
                     log_msg(f"[CANCEL-DN] #{tid} Unfilled buy cancelled")
                 except:
                     pass
-            # Cancel any remaining TP sell orders
-            if up_filled and not up_exited and up_tp_order_id:
+            # Cancel remaining TP sell orders
+            if state["up_filled"] and not state["up_exited"] and state["up_tp_order_id"]:
                 try:
-                    self.client.cancel(up_tp_order_id)
+                    self.client.cancel(state["up_tp_order_id"])
                 except:
                     pass
-            if down_filled and not down_exited and down_tp_order_id:
+            if state["down_filled"] and not state["down_exited"] and state["down_tp_order_id"]:
                 try:
-                    self.client.cancel(down_tp_order_id)
+                    self.client.cancel(state["down_tp_order_id"])
                 except:
                     pass
+
+        # ── UNPACK STATE ──
+        up_filled = state["up_filled"]
+        down_filled = state["down_filled"]
+        up_fill_price = state["up_fill_price"]
+        down_fill_price = state["down_fill_price"]
+        up_shares = state["up_shares"]
+        down_shares = state["down_shares"]
+        up_exited = state["up_exited"]
+        down_exited = state["down_exited"]
+        up_exit_price = state["up_exit_price"]
+        down_exit_price = state["down_exit_price"]
+        up_exit_reason = state["up_exit_reason"]
+        down_exit_reason = state["down_exit_reason"]
+        up_tp_order_id = state["up_tp_order_id"]
+        down_tp_order_id = state["down_tp_order_id"]
 
         # ── NO FILLS ──
         if not up_filled and not down_filled:
