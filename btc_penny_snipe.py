@@ -50,8 +50,8 @@ except ImportError:
 
 # ── Config ─────────────────────────────────────────────
 BUY_PRICE = 0.09
-SELL_PRICE = 0.15       # TP: +67% ($0.06/share profit)
-SL_PRICE = 0.04         # SL: -56% ($0.05/share loss)
+SELL_PRICE = 0.11       # TP: lowered from 0.15 to increase fill chance
+SL_PRICE = 0.03         # SL: lowered from 0.04 to reduce premature exits
 SHARES_PER_SIDE = 5     # 5 shares × $0.09 = $0.45 per side
 CANCEL_BEFORE_END = 30  # Cancel unfilled at T-30 (skip last 30s)
 
@@ -204,23 +204,28 @@ class BTCPennyBot:
             log_msg(f"[CLOB] Auth fail: {e}")
 
     async def run(self):
+        log_msg("[RUN] Starting main loop")
         while True:
             try:
                 now = time.time()
                 nxt = (int(now) // 300 + 1) * 300
                 wait = nxt - now
+                log_msg(f"[RUN] Sleeping {wait:.0f}s until next window")
                 if wait > 0:
                     await asyncio.sleep(wait)
                 await asyncio.sleep(3)
 
                 log_msg(f"[LOOP] Window start | Bank: ${self.bankroll:.2f}")
 
-                # Sync bankroll from wallet every loop (fallback to internal if API blocked)
+                # Sync bankroll from wallet every loop (run in thread to avoid blocking event loop)
                 if self.client and not PAPER_MODE:
                     try:
-                        params = BalanceAllowanceParams(asset_type="COLLATERAL", token_id="", signature_type=2)
-                        result = self.client.get_balance_allowance(params)
-                        real_bal = int(result.get("balance", "0")) / 1_000_000
+                        def _check_wallet():
+                            params = BalanceAllowanceParams(asset_type="COLLATERAL", token_id="", signature_type=2)
+                            result = self.client.get_balance_allowance(params)
+                            return int(result.get("balance", "0")) / 1_000_000
+                        real_bal = await asyncio.wait_for(
+                            asyncio.get_event_loop().run_in_executor(None, _check_wallet), timeout=5)
                         if real_bal > 0:
                             self.bankroll = real_bal
                     except:
@@ -334,7 +339,13 @@ class BTCPennyBot:
                 state[f"{key}_shares"] = shares
                 log_msg(f"[FILL-{label}] #{tid} {shares}sh @ ${fill_price:.2f} | T+{elapsed:.0f}s")
 
-                # Place GTC TP sell immediately (tokens already pre-approved)
+                # Re-approve token right before sell (approval may be stale)
+                try:
+                    params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token, signature_type=SIGNATURE_TYPE)
+                    self.client.update_balance_allowance(params)
+                except Exception as e:
+                    log_msg(f"[APPROVE-{label}] #{tid} Re-approve failed: {str(e)[:60]}")
+                # Place GTC TP sell
                 try:
                     args = OrderArgs(price=SELL_PRICE, size=shares, side=SELL, token_id=token)
                     signed = self.client.create_order(args)
@@ -383,6 +394,12 @@ class BTCPennyBot:
                     pass
             if self.client and not PAPER_MODE:
                 for attempt in range(3):
+                    # Re-approve before SL sell
+                    try:
+                        params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token, signature_type=SIGNATURE_TYPE)
+                        self.client.update_balance_allowance(params)
+                    except:
+                        pass
                     try:
                         sell_p = snap_price(bid_price - 0.01)
                         args = OrderArgs(price=sell_p, size=state[f"{key}_shares"], side=SELL, token_id=token)
