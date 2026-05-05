@@ -3,6 +3,7 @@
 Per-bot changelogs are in the `changelogs/` directory:
 - [SNIPE_ALT.md](changelogs/SNIPE_ALT.md) — Altcoin taker sniper (LIVE)
 - [BTC_SNIPE_LADDER.md](changelogs/BTC_SNIPE_LADDER.md) — BTC maker ladder (LIVE)
+- [BTC_COINBASE_SCALP.md](changelogs/BTC_COINBASE_SCALP.md) — CB signal scalper (PAPER)
 - [BTC_PENNY.md](changelogs/BTC_PENNY.md) — BTC penny both-sides (PAUSED)
 - [BTC_BOTH_SIDES.md](changelogs/BTC_BOTH_SIDES.md) — BTC both-sides at $0.50 (STOPPED)
 - [BTC_LADDER.md](changelogs/BTC_LADDER.md) — BTC gap signal ladder (PAPER)
@@ -12,6 +13,8 @@ Per-bot changelogs are in the `changelogs/` directory:
 - [RETIRED_STRATEGIES.md](changelogs/RETIRED_STRATEGIES.md) — All retired/paper strategies
 
 ## 2026-05-05
+- NEW: BTC-COINBASE-SCALP — scalp tokens on Coinbase >$5 moves, TP +$0.04, SL -$0.03
+  - Realistic paper mode: 125ms latency, book depth fills, taker fees on SL
 - Fix hedge trigger on BTC-SNIPE-LADDER: websocket-based token bid monitoring replaces broken BTC-price hedge
 - Fix BTC-PENNY: SL 0.04->0.03, TP 0.15->0.11, balance approval bug fix
 - Add all EC2 bot files to repo (22 previously untracked files)
