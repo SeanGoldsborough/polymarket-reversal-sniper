@@ -480,16 +480,17 @@ class BTCScalpBot:
                         f"Entry ${entry_price:.2f} | TP ${tp_price:.2f} | SL ${sl_price:.2f}")
 
                 await self._execute_trade(tid, direction, entry_price, tp_price, sl_price,
-                                          signal["cb_move"], mkt["question"], window_end, force_exit_time)
+                                          signal["cb_move"], mkt["question"], window_start, window_end, force_exit_time)
 
                 self.in_trade = False
 
         await asyncio.gather(cb_ws(), poly_ws(), trade_executor(), return_exceptions=True)
 
     async def _execute_trade(self, tid, direction, entry_price, tp_price, sl_price,
-                             cb_move, question, window_end, force_exit_time):
+                             cb_move, question, window_start, window_end, force_exit_time):
         """Execute a single trade: buy → wait for fill → TP/SL → record."""
         t_start = time.time()
+        window_elapsed = round(t_start - window_start, 1)  # seconds into the 5-min window
         token = None  # Not needed for paper but kept for live
 
         # ── STEP 1: Place GTC limit buy ──
@@ -505,7 +506,7 @@ class BTCScalpBot:
             except Exception as e:
                 log_msg(f"[BUY] #{tid} FAILED: {str(e)[:80]}")
                 self._record_trade(tid, direction, entry_price, entry_price, 0, 0, "BUY-FAIL",
-                                   0, cb_move, question)
+                                   0, cb_move, question, window_elapsed)
                 return
         else:
             # Paper: simulate 125ms latency for order placement
@@ -584,7 +585,7 @@ class BTCScalpBot:
             self.fill_timeout_count += 1
             log_msg(f"[UNFILL] #{tid} No fill after {FILL_TIMEOUT}s — cancelled")
             self._record_trade(tid, direction, entry_price, entry_price, 0, 0, "UNFILLED",
-                               0, cb_move, question)
+                               0, cb_move, question, window_elapsed)
             return
 
         # Recalculate TP/SL based on actual fill price
@@ -763,10 +764,10 @@ class BTCScalpBot:
         # ── STEP 6: Record trade ──
         hold_time = time.time() - t_start
         self._record_trade(tid, direction, fill_price, exit_price, fill_shares, taker_fee,
-                           exit_reason, hold_time, cb_move, question)
+                           exit_reason, hold_time, cb_move, question, window_elapsed)
 
     def _record_trade(self, tid, direction, entry, exit_price, shares, taker_fee, reason,
-                      hold_time, cb_move, question):
+                      hold_time, cb_move, question, window_elapsed=0):
         cost = round(entry * shares, 4)
         revenue = round(exit_price * shares, 4)
         pnl = round(revenue - cost - taker_fee, 4)
@@ -802,7 +803,7 @@ class BTCScalpBot:
             fee_str = f" (fee ${taker_fee:.3f})" if taker_fee > 0 else ""
 
             log_msg(f"[{reason}] #{tid} {direction} | ${entry:.2f} → ${exit_price:.2f}{fee_str} | "
-                    f"P&L ${pnl:+.2f} | {hold_time:.1f}s | "
+                    f"P&L ${pnl:+.2f} | {hold_time:.1f}s | T+{window_elapsed:.0f}s | "
                     f"bank ${self.bankroll:.2f} | {self.wins}W/{self.losses}L ({wr:.0f}%)")
 
         # Log to file
@@ -811,7 +812,10 @@ class BTCScalpBot:
                 "id": tid, "direction": direction, "entry": entry, "exit": exit_price,
                 "shares": shares, "cost": cost, "revenue": revenue, "taker_fee": taker_fee,
                 "pnl": pnl, "reason": reason, "hold_time": round(hold_time, 2),
-                "cb_move": round(cb_move, 2), "bankroll": self.bankroll, "question": question,
+                "cb_move": round(cb_move, 2),
+                "window_elapsed": round(window_elapsed, 1),
+                "entry_bucket": "low" if entry <= 0.30 else "mid" if entry <= 0.60 else "high",
+                "bankroll": self.bankroll, "question": question,
                 "paper": PAPER_MODE,
                 "time": datetime.now(timezone.utc).isoformat(),
             }) + "\n")
