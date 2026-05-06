@@ -74,6 +74,7 @@ except ImportError:
 CB_TRIGGER = 5.00           # Coinbase move threshold (dollars)
 TP_OFFSET = 0.04            # Take profit: entry + $0.04
 SL_OFFSET = 0.03            # Stop loss: entry - $0.03
+MAX_HOLD_SECONDS = 15       # Hard exit after 15 seconds if TP not hit — don't hold to resolution
 SHARES_PER_TRADE = 5        # Shares per trade
 FILL_TIMEOUT = 4            # Cancel unfilled buy after 4 seconds
 MIN_ENTRY_PRICE = 0.15      # Don't buy below this
@@ -627,9 +628,50 @@ class BTCScalpBot:
         exit_price = fill_price
         exit_reason = "TIMEOUT"
         taker_fee = 0
+        trade_start = time.time()
 
         while not exited and time.time() < window_end:
             now = time.time()
+            hold_elapsed = now - trade_start
+
+            # Max hold timeout — exit at market, don't hold to resolution
+            if hold_elapsed >= MAX_HOLD_SECONDS:
+                current_bid = self.up_bid if direction == "UP" else self.down_bid
+                log_msg(f"[MAX-HOLD] #{tid} {MAX_HOLD_SECONDS}s elapsed, TP not hit — exiting at market (bid ${current_bid:.2f})")
+                if tp_order_id and self.client and not PAPER_MODE:
+                    try:
+                        self.client.cancel_orders([tp_order_id])
+                    except:
+                        pass
+                if self.client and not PAPER_MODE:
+                    try:
+                        token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
+                        params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
+                                                       signature_type=SIGNATURE_TYPE)
+                        self.client.update_balance_allowance(params)
+                    except:
+                        pass
+                    try:
+                        sell_p = snap_price(current_bid - 0.01)
+                        args = OrderArgs(price=sell_p, size=int(fill_shares), side=SELL, token_id=token_id)
+                        signed = self.client.create_order(args)
+                        self.client.post_order(signed, OrderType.FOK)
+                        exit_price = sell_p
+                    except Exception as e:
+                        log_msg(f"[MAX-HOLD] #{tid} Sell failed: {str(e)[:60]}")
+                        exit_price = current_bid
+                else:
+                    await asyncio.sleep(PAPER_LATENCY)
+                    # Re-read bid after latency
+                    current_bid_after = self.up_bid if direction == "UP" else self.down_bid
+                    exit_price = snap_price(min(current_bid, current_bid_after) - 0.01)
+                    if exit_price < 0.01:
+                        exit_price = 0.01
+                    taker_fee = calc_taker_fee(exit_price, fill_shares)
+                    log_msg(f"[PAPER-MAX-HOLD] #{tid} Sell @ ${exit_price:.2f} (fee ${taker_fee:.3f})")
+                exit_reason = "MAX-HOLD"
+                exited = True
+                break
 
             # Force exit before resolution
             if now >= force_exit_time:
@@ -789,7 +831,7 @@ class BTCScalpBot:
                 self.tp_count += 1
             elif reason == "SL":
                 self.sl_count += 1
-            elif reason in ("TIMEOUT", "FORCE-EXIT", "RES-WIN", "RES-LOSS"):
+            elif reason in ("TIMEOUT", "FORCE-EXIT", "MAX-HOLD", "RES-WIN", "RES-LOSS"):
                 self.timeout_count += 1
 
             if self.bankroll > self.peak:
