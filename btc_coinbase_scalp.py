@@ -74,11 +74,12 @@ except ImportError:
 CB_TRIGGER = 5.00           # Coinbase move threshold (dollars)
 TP_OFFSET = 0.04            # Take profit: entry + $0.04
 SL_OFFSET = 0.03            # Stop loss: entry - $0.03
-MAX_HOLD_SECONDS = 15       # Hard exit after 15 seconds if TP not hit — don't hold to resolution
+MAX_HOLD_SECONDS = 30       # Hard exit after 30 seconds if TP not hit — don't hold to resolution
 SHARES_PER_TRADE = 5        # Shares per trade
 FILL_TIMEOUT = 4            # Cancel unfilled buy after 4 seconds
-MIN_ENTRY_PRICE = 0.15      # Don't buy below this
+MIN_ENTRY_PRICE = 0.30      # Don't buy below this (was 0.15, filtered by data)
 MAX_ENTRY_PRICE = 0.85      # Don't buy above this
+ENTRY_WINDOW_SECONDS = 60   # Only trade in first 60 seconds of window
 CUTOFF_BEFORE_END = 20      # No new trades within 20s of window end
 FORCE_EXIT_BEFORE_END = 5   # Force exit any open position 5s before end
 
@@ -209,37 +210,7 @@ class BTCScalpBot:
         self.down_bid = 0.0
         self.up_ask = 0.0
         self.down_ask = 0.0
-        # Book depth: {price: size} for bids and asks per side
-        self.up_bids_depth = {}    # {0.55: 100, 0.54: 50, ...}
-        self.up_asks_depth = {}    # {0.56: 80, 0.57: 120, ...}
-        self.down_bids_depth = {}
-        self.down_asks_depth = {}
         self.in_trade = False
-
-    def _get_depth(self, direction, side):
-        """Get depth dict: direction=UP/DN, side=bids/asks."""
-        if direction == "UP":
-            return self.up_bids_depth if side == "bids" else self.up_asks_depth
-        else:
-            return self.down_bids_depth if side == "bids" else self.down_asks_depth
-
-    def _available_at_price(self, direction, side, price):
-        """How many shares available at exactly this price level?"""
-        depth = self._get_depth(direction, side)
-        return depth.get(price, 0)
-
-    def _available_at_or_better(self, direction, side, price):
-        """How many shares available at this price or better?
-        For asks (buying): shares at price or lower.
-        For bids (selling): shares at price or higher."""
-        depth = self._get_depth(direction, side)
-        total = 0
-        for p, sz in depth.items():
-            if side == "asks" and p <= price:
-                total += sz
-            elif side == "bids" and p >= price:
-                total += sz
-        return total
 
     def init_clob(self):
         if PAPER_MODE:
@@ -271,7 +242,7 @@ class BTCScalpBot:
     async def run(self):
         log_msg(f"[INIT] {BOT_NAME}")
         log_msg(f"[INIT] Trigger: CB move > ${CB_TRIGGER} | TP: +${TP_OFFSET} | SL: -${SL_OFFSET}")
-        log_msg(f"[INIT] Shares: {SHARES_PER_TRADE} | Fill timeout: {FILL_TIMEOUT}s | Entry: ${MIN_ENTRY_PRICE}-${MAX_ENTRY_PRICE}")
+        log_msg(f"[INIT] Shares: {SHARES_PER_TRADE} | Fill timeout: {FILL_TIMEOUT}s | Entry: ${MIN_ENTRY_PRICE}-${MAX_ENTRY_PRICE} | First {ENTRY_WINDOW_SECONDS}s only")
         mode = "LIVE" if not PAPER_MODE else "PAPER"
         log_msg(f"[INIT] {mode} mode — Bank: ${self.bankroll:.2f}")
 
@@ -313,11 +284,6 @@ class BTCScalpBot:
 
         self.prev_cb_price = 0.0
         self.cb_updated_at = 0.0
-        # Reset book depth for new window tokens
-        self.up_bids_depth = {}
-        self.up_asks_depth = {}
-        self.down_bids_depth = {}
-        self.down_asks_depth = {}
 
         signal_queue = asyncio.Queue()
 
@@ -336,9 +302,11 @@ class BTCScalpBot:
                             log_msg(f"[CB-WS] Reconnected ({retry})")
                         retry = 0
 
-                        async for raw in ws:
-                            if time.time() >= window_end:
-                                return
+                        while time.time() < window_end:
+                            try:
+                                raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                            except asyncio.TimeoutError:
+                                continue
                             try:
                                 msg = json.loads(raw)
                                 if msg.get("type") == "ticker" and "price" in msg:
@@ -367,7 +335,9 @@ class BTCScalpBot:
                         log_msg(f"[CB-WS] Dropped: {str(e)[:40]} — reconnecting ({retry})...")
                         await asyncio.sleep(min(retry * 0.5, 3))
 
-        # ── POLYMARKET WEBSOCKET (price + depth tracking) ──
+        # ── POLYMARKET WEBSOCKET ──
+        # Uses price_changes messages which include best_bid/best_ask directly.
+        # Initial snapshot (bids/asks arrays) used for first read only.
         async def poly_ws():
             retry = 0
             while time.time() < window_end + 10:
@@ -376,71 +346,95 @@ class BTCScalpBot:
                                                   close_timeout=5) as ws:
                         await ws.send(json.dumps({"assets_ids": [up_token, down_token], "type": "market"}))
                         if retry == 0:
-                            log_msg("[POLY-WS] Connected — tracking bids, asks, and depth")
+                            log_msg("[POLY-WS] Connected — using price_changes best_bid/best_ask")
                         else:
                             log_msg(f"[POLY-WS] Reconnected ({retry})")
                         retry = 0
 
-                        async for raw in ws:
-                            if time.time() >= window_end + 10:
-                                return
+                        while time.time() < window_end + 10:
+                            try:
+                                raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                            except asyncio.TimeoutError:
+                                continue
                             try:
                                 msg = json.loads(raw)
                             except:
                                 continue
-                            items = []
-                            if isinstance(msg, list):
-                                items = [m for m in msg if isinstance(m, dict)]
-                            elif isinstance(msg, dict) and ("bids" in msg or "asks" in msg):
-                                items = [msg]
-                            for item in items:
-                                aid = item.get("asset_id", "")
-                                is_up = aid == up_token
-                                is_down = aid == down_token
-                                if not is_up and not is_down:
-                                    continue
 
-                                # Update bids
-                                bids_data = item.get("bids", [])
+                            # Handle initial snapshot (list with bids/asks arrays)
+                            if isinstance(msg, list):
+                                for item in msg:
+                                    if not isinstance(item, dict):
+                                        continue
+                                    aid = item.get("asset_id", "")
+                                    bids_data = item.get("bids", [])
+                                    asks_data = item.get("asks", [])
+                                    if bids_data:
+                                        try:
+                                            bb = max(float(b["price"]) for b in bids_data if isinstance(b, dict) and "price" in b)
+                                            if aid == up_token:
+                                                self.up_bid = bb
+                                            elif aid == down_token:
+                                                self.down_bid = bb
+                                        except ValueError:
+                                            pass
+                                    if asks_data:
+                                        try:
+                                            ba = min(float(a["price"]) for a in asks_data if isinstance(a, dict) and "price" in a)
+                                            if aid == up_token:
+                                                self.up_ask = ba
+                                            elif aid == down_token:
+                                                self.down_ask = ba
+                                        except ValueError:
+                                            pass
+                                continue
+
+                            if not isinstance(msg, dict):
+                                continue
+
+                            # Handle snapshot message (has bids/asks + asset_id)
+                            if "bids" in msg and "asset_id" in msg:
+                                aid = msg["asset_id"]
+                                bids_data = msg.get("bids", [])
+                                asks_data = msg.get("asks", [])
                                 if bids_data:
-                                    depth = self.up_bids_depth if is_up else self.down_bids_depth
-                                    for b in bids_data:
-                                        if isinstance(b, dict) and "price" in b and "size" in b:
-                                            p = float(b["price"])
-                                            sz = float(b["size"])
-                                            if sz > 0:
-                                                depth[p] = sz
-                                            elif p in depth:
-                                                del depth[p]
                                     try:
-                                        bb = max(depth.keys()) if depth else 0
-                                        if is_up:
+                                        bb = max(float(b["price"]) for b in bids_data if isinstance(b, dict) and "price" in b)
+                                        if aid == up_token:
                                             self.up_bid = bb
-                                        else:
+                                        elif aid == down_token:
                                             self.down_bid = bb
                                     except ValueError:
                                         pass
-
-                                # Update asks
-                                asks_data = item.get("asks", [])
                                 if asks_data:
-                                    depth = self.up_asks_depth if is_up else self.down_asks_depth
-                                    for a in asks_data:
-                                        if isinstance(a, dict) and "price" in a and "size" in a:
-                                            p = float(a["price"])
-                                            sz = float(a["size"])
-                                            if sz > 0:
-                                                depth[p] = sz
-                                            elif p in depth:
-                                                del depth[p]
                                     try:
-                                        ba = min(depth.keys()) if depth else 0
-                                        if is_up:
+                                        ba = min(float(a["price"]) for a in asks_data if isinstance(a, dict) and "price" in a)
+                                        if aid == up_token:
                                             self.up_ask = ba
-                                        else:
+                                        elif aid == down_token:
                                             self.down_ask = ba
                                     except ValueError:
                                         pass
+
+                            # Handle price_changes messages (the real-time updates)
+                            price_changes = msg.get("price_changes", [])
+                            for pc in price_changes:
+                                if not isinstance(pc, dict):
+                                    continue
+                                aid = pc.get("asset_id", "")
+                                best_bid = pc.get("best_bid")
+                                best_ask = pc.get("best_ask")
+
+                                if aid == up_token:
+                                    if best_bid is not None:
+                                        self.up_bid = float(best_bid)
+                                    if best_ask is not None:
+                                        self.up_ask = float(best_ask)
+                                elif aid == down_token:
+                                    if best_bid is not None:
+                                        self.down_bid = float(best_bid)
+                                    if best_ask is not None:
+                                        self.down_ask = float(best_ask)
 
                 except Exception as e:
                     if time.time() < window_end + 10:
@@ -463,6 +457,11 @@ class BTCScalpBot:
 
                 direction = signal["direction"]
                 side_bid = self.up_bid if direction == "UP" else self.down_bid
+
+                # Check entry time window (first 60s only)
+                window_elapsed = time.time() - window_start
+                if window_elapsed > ENTRY_WINDOW_SECONDS:
+                    continue
 
                 # Check entry bounds
                 if side_bid < MIN_ENTRY_PRICE or side_bid > MAX_ENTRY_PRICE:
@@ -542,32 +541,15 @@ class BTCScalpBot:
 
                 # Our GTC buy sits at entry_price. It fills when:
                 # 1. The ask drops to our price (someone market-sells into us), OR
-                # 2. There are already asks at or below our price
+                # 2. The bid moves above our price (market crossed through us)
                 if current_ask > 0 and current_ask <= entry_price:
-                    # Asks exist at or below our price — check depth
-                    available = self._available_at_or_better(direction, "asks", entry_price)
-                    if available >= SHARES_PER_TRADE:
-                        fill_shares = SHARES_PER_TRADE
-                        fill_price = entry_price  # We're maker, fill at our price
-                        filled = True
-                        # Simulate fill check latency
-                        await asyncio.sleep(PAPER_LATENCY)
-                        break
-                    elif available > 0:
-                        # Partial fill
-                        fill_shares = min(available, SHARES_PER_TRADE)
-                        fill_price = entry_price
-                        filled = True
-                        self.partial_fill_count += 1
-                        await asyncio.sleep(PAPER_LATENCY)
-                        log_msg(f"[PAPER-PARTIAL] #{tid} Only {fill_shares:.0f}/{SHARES_PER_TRADE}sh filled "
-                                f"(ask depth: {available:.0f})")
-                        break
-                elif current_bid >= entry_price:
-                    # Bid is at or above our buy price — market has moved through us
-                    # In reality our order would have filled as the price crossed
-                    available = self._available_at_or_better(direction, "asks", entry_price + 0.01)
-                    fill_shares = SHARES_PER_TRADE  # Assume full fill on cross
+                    fill_shares = SHARES_PER_TRADE
+                    fill_price = entry_price
+                    filled = True
+                    await asyncio.sleep(PAPER_LATENCY)
+                    break
+                elif current_bid > entry_price:
+                    fill_shares = SHARES_PER_TRADE
                     fill_price = entry_price
                     filled = True
                     await asyncio.sleep(PAPER_LATENCY)
@@ -629,8 +611,29 @@ class BTCScalpBot:
         exit_reason = "TIMEOUT"
         taker_fee = 0
         trade_start = time.time()
+        min_bid_during = fill_price
+        max_bid_during = fill_price
+        sl_bounce_data = None  # Filled if SL triggers
+
+        # Also fetch book via HTTP at start and end of trade for ground truth comparison
+        trade_token = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
+        http_book_start = await get_book(trade_token)
+        if http_book_start:
+            log_msg(f"[DEBUG] #{tid} HTTP book at entry: bid=${http_book_start['bid']:.2f} ask=${http_book_start['ask']:.2f} | "
+                    f"WS bid=${self.up_bid if direction == 'UP' else self.down_bid:.2f}")
+
+        ws_updates_during_trade = 0
 
         while not exited and time.time() < window_end:
+            # Track min/max bid FIRST every iteration
+            _cur = self.up_bid if direction == "UP" else self.down_bid
+            if _cur > 0:
+                if _cur < min_bid_during:
+                    min_bid_during = _cur
+                if _cur > max_bid_during:
+                    max_bid_during = _cur
+            ws_updates_during_trade += 1
+
             now = time.time()
             hold_elapsed = now - trade_start
 
@@ -717,63 +720,111 @@ class BTCScalpBot:
                 except:
                     pass
             else:
-                # Paper: TP fills when bid reaches our TP price AND there's depth
+                # Paper: TP fills when bid reaches our TP price
                 current_bid = self.up_bid if direction == "UP" else self.down_bid
                 if current_bid >= tp_price:
-                    # Check: are there buyers at our TP price?
-                    bid_depth = self._available_at_or_better(direction, "bids", tp_price)
-                    if bid_depth >= fill_shares:
-                        await asyncio.sleep(PAPER_LATENCY)  # Fill detection latency
-                        exit_price = tp_price
-                        exit_reason = "TP"
-                        # TP is maker sell — 0% fee
-                        exited = True
-                        break
-                    elif bid_depth > 0:
-                        # Partial TP — for now wait for full fill per spec
-                        pass
+                    await asyncio.sleep(PAPER_LATENCY)
+                    exit_price = tp_price
+                    exit_reason = "TP"
+                    exited = True
+                    break
 
             # Check SL trigger (websocket bid)
             current_bid = self.up_bid if direction == "UP" else self.down_bid
             if current_bid <= sl_price and sl_price > 0.01:
+                trigger_bid = current_bid
                 log_msg(f"[SL-TRIGGER] #{tid} Bid ${current_bid:.2f} <= SL ${sl_price:.2f}")
 
+                # Track bid for 5 seconds after SL trigger to see if it bounces back
+                sl_track = []
+                track_start = time.time()
+                while time.time() - track_start < 5.0:
+                    await asyncio.sleep(0.1)
+                    _bid = self.up_bid if direction == "UP" else self.down_bid
+                    sl_track.append({"t": round(time.time() - track_start, 2), "bid": _bid})
+
+                # Analyze: did price return to SL level?
+                min_during = min(s["bid"] for s in sl_track) if sl_track else trigger_bid
+                max_during = max(s["bid"] for s in sl_track) if sl_track else trigger_bid
+                final_bid = sl_track[-1]["bid"] if sl_track else trigger_bid
+                returned_to_sl = max_during >= sl_price
+                returned_above_entry = max_during >= fill_price
+
+                log_msg(f"[SL-TRACK] #{tid} 5s after trigger: "
+                        f"trigger=${trigger_bid:.2f} min=${min_during:.2f} max=${max_during:.2f} "
+                        f"final=${final_bid:.2f} | "
+                        f"returned_to_SL={'YES' if returned_to_sl else 'NO'} "
+                        f"returned_above_entry={'YES' if returned_above_entry else 'NO'}")
+
+                # Log sampled bids at 0.5s intervals
+                samples = [s for s in sl_track if int(s["t"] * 10) % 5 == 0][:10]
+                bid_str = " ".join([f"{s['t']:.1f}s:${s['bid']:.2f}" for s in samples])
+                log_msg(f"[SL-BIDS] #{tid} {bid_str}")
+
+                sl_bounce_data = {
+                    "trigger_bid": trigger_bid,
+                    "min_after": min_during,
+                    "max_after": max_during,
+                    "final_after": final_bid,
+                    "returned_to_sl": returned_to_sl,
+                    "returned_above_entry": returned_above_entry,
+                }
+
+                # Cancel TP, instant FAK sell at SL price — no waiting
+                token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
+
                 if self.client and not PAPER_MODE:
-                    # Cancel TP
                     if tp_order_id:
                         try:
                             self.client.cancel_orders([tp_order_id])
                         except:
                             pass
-                    # Re-approve + FAK sell
                     try:
-                        token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
                         params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
                                                        signature_type=SIGNATURE_TYPE)
                         self.client.update_balance_allowance(params)
                     except:
                         pass
+                    # Instant FAK sell at SL price
                     try:
-                        sell_p = snap_price(current_bid - 0.01)
-                        args = OrderArgs(price=sell_p, size=int(fill_shares), side=SELL, token_id=token_id)
+                        args = OrderArgs(price=sl_price, size=int(fill_shares), side=SELL, token_id=token_id)
                         signed = self.client.create_order(args)
                         self.client.post_order(signed, OrderType.FOK)
-                        exit_price = sell_p
+                        exit_price = sl_price
+                        log_msg(f"[SL-INSTANT] #{tid} FOK sell {int(fill_shares)}sh @ ${sl_price:.2f}")
                     except Exception as e:
-                        log_msg(f"[SL-SELL] #{tid} FAILED: {str(e)[:60]}")
-                        exit_price = current_bid
+                        # FOK failed — FAK at current bid as last resort
+                        log_msg(f"[SL-INSTANT] #{tid} FOK failed: {str(e)[:60]}")
+                        fallback_bid = self.up_bid if direction == "UP" else self.down_bid
+                        try:
+                            sell_p = snap_price(fallback_bid - 0.01)
+                            args = OrderArgs(price=sell_p, size=int(fill_shares), side=SELL, token_id=token_id)
+                            signed = self.client.create_order(args)
+                            self.client.post_order(signed, OrderType.FAK)
+                            exit_price = sell_p
+                            log_msg(f"[SL-FAK] #{tid} FAK sell @ ${sell_p:.2f}")
+                        except Exception as e2:
+                            log_msg(f"[SL-FAK] #{tid} FAILED: {str(e2)[:60]}")
+                            exit_price = fallback_bid
                 else:
-                    # Paper: simulate cancel TP + SL sell with latency
-                    await asyncio.sleep(PAPER_LATENCY * 2)  # Cancel TP + place SL sell
-                    # Re-read bid after latency (price may have moved further)
+                    # Paper: simulate instant SL execution
+                    await asyncio.sleep(PAPER_LATENCY)  # Cancel TP latency (~125ms)
+                    # Re-read bid after cancel latency
                     current_bid_after = self.up_bid if direction == "UP" else self.down_bid
-                    # SL is taker — sell at bid - 0.01 with slippage
-                    exit_price = snap_price(min(current_bid, current_bid_after) - 0.01)
-                    if exit_price < 0.01:
-                        exit_price = 0.01
-                    taker_fee = calc_taker_fee(exit_price, fill_shares)
-                    log_msg(f"[PAPER-SL] #{tid} Sell @ ${exit_price:.2f} after {PAPER_LATENCY*2*1000:.0f}ms "
-                            f"(bid moved ${current_bid:.2f}→${current_bid_after:.2f}, fee ${taker_fee:.3f})")
+                    # FOK at SL price fills if bid >= SL price
+                    if current_bid_after >= sl_price:
+                        exit_price = sl_price
+                        taker_fee = calc_taker_fee(sl_price, fill_shares)
+                        log_msg(f"[PAPER-SL] #{tid} FOK fill @ ${sl_price:.2f} (fee ${taker_fee:.3f}) | "
+                                f"bid=${current_bid_after:.2f}")
+                    else:
+                        # Bid already past SL — sell at current bid immediately
+                        exit_price = snap_price(current_bid_after - 0.01)
+                        if exit_price < 0.01:
+                            exit_price = 0.01
+                        taker_fee = calc_taker_fee(exit_price, fill_shares)
+                        log_msg(f"[PAPER-SL-SLIP] #{tid} Bid past SL, FAK @ ${exit_price:.2f} "
+                                f"(bid=${current_bid_after:.2f}, fee ${taker_fee:.3f})")
 
                 exit_reason = "SL"
                 exited = True
@@ -803,13 +854,25 @@ class BTCScalpBot:
 
             await asyncio.sleep(0.3)
 
+        # HTTP book check at exit for ground truth
+        http_book_end = await get_book(trade_token)
+        ws_bid_now = self.up_bid if direction == "UP" else self.down_bid
+        http_bid = http_book_end['bid'] if http_book_end else 0
+
+        log_msg(f"[DEBUG] #{tid} EXIT | WS bid=${ws_bid_now:.2f} | HTTP bid=${http_bid:.2f} | "
+                f"WS loops={ws_updates_during_trade}")
+        if http_book_end and abs(ws_bid_now - http_bid) > 0.01:
+            log_msg(f"[DEBUG] #{tid} *** WS/HTTP MISMATCH *** WS=${ws_bid_now:.2f} HTTP=${http_bid:.2f}")
+
         # ── STEP 6: Record trade ──
         hold_time = time.time() - t_start
         self._record_trade(tid, direction, fill_price, exit_price, fill_shares, taker_fee,
-                           exit_reason, hold_time, cb_move, question, window_elapsed)
+                           exit_reason, hold_time, cb_move, question, window_elapsed,
+                           min_bid_during, max_bid_during, sl_bounce_data)
 
     def _record_trade(self, tid, direction, entry, exit_price, shares, taker_fee, reason,
-                      hold_time, cb_move, question, window_elapsed=0):
+                      hold_time, cb_move, question, window_elapsed=0,
+                      min_bid=0, max_bid=0, sl_bounce=None):
         cost = round(entry * shares, 4)
         revenue = round(exit_price * shares, 4)
         pnl = round(revenue - cost - taker_fee, 4)
@@ -846,6 +909,7 @@ class BTCScalpBot:
 
             log_msg(f"[{reason}] #{tid} {direction} | ${entry:.2f} → ${exit_price:.2f}{fee_str} | "
                     f"P&L ${pnl:+.2f} | {hold_time:.1f}s | T+{window_elapsed:.0f}s | "
+                    f"min ${min_bid:.2f} max ${max_bid:.2f} | "
                     f"bank ${self.bankroll:.2f} | {self.wins}W/{self.losses}L ({wr:.0f}%)")
 
         # Log to file
@@ -856,6 +920,8 @@ class BTCScalpBot:
                 "pnl": pnl, "reason": reason, "hold_time": round(hold_time, 2),
                 "cb_move": round(cb_move, 2),
                 "window_elapsed": round(window_elapsed, 1),
+                "min_bid": min_bid, "max_bid": max_bid,
+                "sl_bounce": sl_bounce,
                 "entry_bucket": "low" if entry <= 0.30 else "mid" if entry <= 0.60 else "high",
                 "bankroll": self.bankroll, "question": question,
                 "paper": PAPER_MODE,
