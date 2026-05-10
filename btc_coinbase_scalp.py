@@ -28,6 +28,10 @@ REVISIT:
   - Partial TP fills: currently waits for full fill.
     Consider selling remainder at market.
   - Concurrent positions: currently sequential, one at a time.
+  - PRICE HIT COUNTER: Track how many times price touches TP, BE, or SL levels
+    before making exit decision. E.g., if price hits SL 3 times but keeps bouncing
+    back, that's different from hitting it once and crashing through. Use touch count
+    + direction to decide: sell at TP/BE/SL or hold for more data.
 """
 
 import asyncio
@@ -84,7 +88,7 @@ CUTOFF_BEFORE_END = 20      # No new trades within 20s of window end
 FORCE_EXIT_BEFORE_END = 5   # Force exit any open position 5s before end
 
 # Paper simulation
-PAPER_LATENCY = 0.125       # 125ms simulated execution latency per operation
+PAPER_LATENCY = 0.050       # 50ms simulated execution latency (actual API benchmarked at 22-50ms)
 PAPER_TAKER_FEE_MULT = 0.022  # ~2.2% of min(price, 1-price) for taker orders
 
 CLOB_HOST = "https://clob.polymarket.com"
@@ -211,6 +215,10 @@ class BTCScalpBot:
         self.up_ask = 0.0
         self.down_ask = 0.0
         self.in_trade = False
+        # Event-driven SL: websocket sets this when bid hits SL
+        self.sl_triggered = asyncio.Event() if False else None  # Initialized per trade
+        self.active_sl_price = 0
+        self.active_sl_direction = ""
 
     def init_clob(self):
         if PAPER_MODE:
@@ -436,6 +444,17 @@ class BTCScalpBot:
                                     if best_ask is not None:
                                         self.down_ask = float(best_ask)
 
+                                # Instant SL detection from websocket
+                                if (self.sl_triggered is not None and
+                                    not self.sl_triggered.is_set() and
+                                    best_bid is not None and
+                                    self.active_sl_price > 0):
+                                    bid_val = float(best_bid)
+                                    if self.active_sl_direction == "UP" and aid == up_token and bid_val <= self.active_sl_price:
+                                        self.sl_triggered.set()
+                                    elif self.active_sl_direction == "DN" and aid == down_token and bid_val <= self.active_sl_price:
+                                        self.sl_triggered.set()
+
                 except Exception as e:
                     if time.time() < window_end + 10:
                         retry += 1
@@ -615,6 +634,11 @@ class BTCScalpBot:
         max_bid_during = fill_price
         sl_bounce_data = None  # Filled if SL triggers
 
+        # Set up event-driven SL — websocket will trigger this instantly
+        self.sl_triggered = asyncio.Event()
+        self.active_sl_price = sl_price
+        self.active_sl_direction = direction
+
         # Also fetch book via HTTP at start and end of trade for ground truth comparison
         trade_token = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
         http_book_start = await get_book(trade_token)
@@ -729,37 +753,96 @@ class BTCScalpBot:
                     exited = True
                     break
 
-            # Check SL trigger (websocket bid)
+            # Check SL trigger (event-driven from websocket OR poll fallback)
             current_bid = self.up_bid if direction == "UP" else self.down_bid
-            if current_bid <= sl_price and sl_price > 0.01:
+            sl_hit = self.sl_triggered.is_set() or (current_bid <= sl_price and sl_price > 0.01)
+            if sl_hit:
                 trigger_bid = current_bid
-                log_msg(f"[SL-TRIGGER] #{tid} Bid ${current_bid:.2f} <= SL ${sl_price:.2f}")
+                log_msg(f"[SL-TRIGGER] #{tid} Bid ${current_bid:.2f} <= SL ${sl_price:.2f} — keeping TP on book, waiting for bounce")
 
-                # Track bid for 5 seconds after SL trigger to see if it bounces back
+                # BOUNCE WAIT: Keep TP on book, wait up to 10 seconds
+                # TP can still fill during this wait (it's on the book)
+                # Exit at best available: TP > BE > SL > FAK
+                SL_WAIT_SECONDS = 10
                 sl_track = []
-                track_start = time.time()
-                while time.time() - track_start < 5.0:
+                bounce_start = time.time()
+                bounce_exited = False
+
+                while time.time() - bounce_start < SL_WAIT_SECONDS:
                     await asyncio.sleep(0.1)
                     _bid = self.up_bid if direction == "UP" else self.down_bid
-                    sl_track.append({"t": round(time.time() - track_start, 2), "bid": _bid})
+                    sl_track.append({"t": round(time.time() - bounce_start, 2), "bid": _bid})
 
-                # Analyze: did price return to SL level?
+                    # Check if TP filled during bounce wait
+                    if self.client and not PAPER_MODE and tp_order_id:
+                        try:
+                            order = self.client.get_order(tp_order_id)
+                            if order and float(order.get("size_matched", 0)) >= fill_shares:
+                                exit_price = tp_price
+                                exit_reason = "TP-BOUNCE"
+                                taker_fee = 0
+                                bounce_exited = True
+                                log_msg(f"[TP-BOUNCE] #{tid} TP filled during bounce wait! +${tp_price:.2f}")
+                                break
+                        except:
+                            pass
+                    else:
+                        # Paper: check if bid reached TP during wait
+                        if _bid >= tp_price:
+                            await asyncio.sleep(PAPER_LATENCY)
+                            exit_price = tp_price
+                            exit_reason = "TP-BOUNCE"
+                            taker_fee = 0
+                            bounce_exited = True
+                            log_msg(f"[PAPER-TP-BOUNCE] #{tid} TP filled during bounce! bid=${_bid:.2f}")
+                            break
+
+                    # Check if price returned to breakeven — exit there
+                    if _bid >= fill_price and not bounce_exited:
+                        # Price is at or above entry — cancel TP and sell at entry for breakeven
+                        token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
+                        if self.client and not PAPER_MODE:
+                            if tp_order_id:
+                                try:
+                                    self.client.cancel_orders([tp_order_id])
+                                except:
+                                    pass
+                            try:
+                                params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
+                                                               signature_type=SIGNATURE_TYPE)
+                                self.client.update_balance_allowance(params)
+                            except:
+                                pass
+                            try:
+                                args = OrderArgs(price=fill_price, size=int(fill_shares), side=SELL, token_id=token_id)
+                                signed = self.client.create_order(args)
+                                self.client.post_order(signed, OrderType.FOK)
+                                exit_price = fill_price
+                                log_msg(f"[SL-BE] #{tid} Bounce to breakeven, sold @ ${fill_price:.2f}")
+                            except:
+                                exit_price = fill_price
+                        else:
+                            await asyncio.sleep(PAPER_LATENCY)
+                            exit_price = fill_price
+                            taker_fee = calc_taker_fee(fill_price, fill_shares)
+                            log_msg(f"[PAPER-SL-BE] #{tid} Bounce to breakeven @ ${fill_price:.2f} (fee ${taker_fee:.3f})")
+                        exit_reason = "SL-BE"
+                        bounce_exited = True
+                        break
+
+                # Analyze bounce
                 min_during = min(s["bid"] for s in sl_track) if sl_track else trigger_bid
                 max_during = max(s["bid"] for s in sl_track) if sl_track else trigger_bid
                 final_bid = sl_track[-1]["bid"] if sl_track else trigger_bid
                 returned_to_sl = max_during >= sl_price
                 returned_above_entry = max_during >= fill_price
 
-                log_msg(f"[SL-TRACK] #{tid} 5s after trigger: "
+                log_msg(f"[SL-TRACK] #{tid} {SL_WAIT_SECONDS}s bounce: "
                         f"trigger=${trigger_bid:.2f} min=${min_during:.2f} max=${max_during:.2f} "
                         f"final=${final_bid:.2f} | "
-                        f"returned_to_SL={'YES' if returned_to_sl else 'NO'} "
-                        f"returned_above_entry={'YES' if returned_above_entry else 'NO'}")
-
-                # Log sampled bids at 0.5s intervals
-                samples = [s for s in sl_track if int(s["t"] * 10) % 5 == 0][:10]
-                bid_str = " ".join([f"{s['t']:.1f}s:${s['bid']:.2f}" for s in samples])
-                log_msg(f"[SL-BIDS] #{tid} {bid_str}")
+                        f"returned_SL={'Y' if returned_to_sl else 'N'} "
+                        f"returned_BE={'Y' if returned_above_entry else 'N'} "
+                        f"exit={exit_reason if bounce_exited else 'pending'}")
 
                 sl_bounce_data = {
                     "trigger_bid": trigger_bid,
@@ -770,63 +853,62 @@ class BTCScalpBot:
                     "returned_above_entry": returned_above_entry,
                 }
 
-                # Cancel TP, instant FAK sell at SL price — no waiting
-                token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
+                if not bounce_exited:
+                    # Bounce wait expired — sell at best available price
+                    token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
+                    sell_bid = self.up_bid if direction == "UP" else self.down_bid
 
-                if self.client and not PAPER_MODE:
-                    if tp_order_id:
+                    if self.client and not PAPER_MODE:
+                        if tp_order_id:
+                            try:
+                                self.client.cancel_orders([tp_order_id])
+                            except:
+                                pass
                         try:
-                            self.client.cancel_orders([tp_order_id])
+                            params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
+                                                           signature_type=SIGNATURE_TYPE)
+                            self.client.update_balance_allowance(params)
                         except:
                             pass
-                    try:
-                        params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
-                                                       signature_type=SIGNATURE_TYPE)
-                        self.client.update_balance_allowance(params)
-                    except:
-                        pass
-                    # Instant FAK sell at SL price
-                    try:
-                        args = OrderArgs(price=sl_price, size=int(fill_shares), side=SELL, token_id=token_id)
-                        signed = self.client.create_order(args)
-                        self.client.post_order(signed, OrderType.FOK)
-                        exit_price = sl_price
-                        log_msg(f"[SL-INSTANT] #{tid} FOK sell {int(fill_shares)}sh @ ${sl_price:.2f}")
-                    except Exception as e:
-                        # FOK failed — FAK at current bid as last resort
-                        log_msg(f"[SL-INSTANT] #{tid} FOK failed: {str(e)[:60]}")
-                        fallback_bid = self.up_bid if direction == "UP" else self.down_bid
-                        try:
-                            sell_p = snap_price(fallback_bid - 0.01)
-                            args = OrderArgs(price=sell_p, size=int(fill_shares), side=SELL, token_id=token_id)
-                            signed = self.client.create_order(args)
-                            self.client.post_order(signed, OrderType.FAK)
-                            exit_price = sell_p
-                            log_msg(f"[SL-FAK] #{tid} FAK sell @ ${sell_p:.2f}")
-                        except Exception as e2:
-                            log_msg(f"[SL-FAK] #{tid} FAILED: {str(e2)[:60]}")
-                            exit_price = fallback_bid
-                else:
-                    # Paper: simulate instant SL execution
-                    await asyncio.sleep(PAPER_LATENCY)  # Cancel TP latency (~125ms)
-                    # Re-read bid after cancel latency
-                    current_bid_after = self.up_bid if direction == "UP" else self.down_bid
-                    # FOK at SL price fills if bid >= SL price
-                    if current_bid_after >= sl_price:
-                        exit_price = sl_price
-                        taker_fee = calc_taker_fee(sl_price, fill_shares)
-                        log_msg(f"[PAPER-SL] #{tid} FOK fill @ ${sl_price:.2f} (fee ${taker_fee:.3f}) | "
-                                f"bid=${current_bid_after:.2f}")
+                        # Try to sell at SL price first (maker), then FAK
+                        if sell_bid >= sl_price:
+                            try:
+                                args = OrderArgs(price=sl_price, size=int(fill_shares), side=SELL, token_id=token_id)
+                                signed = self.client.create_order(args)
+                                self.client.post_order(signed, OrderType.FOK)
+                                exit_price = sl_price
+                                log_msg(f"[SL-EXIT] #{tid} Sold at SL price ${sl_price:.2f}")
+                            except:
+                                exit_price = sell_bid
+                        else:
+                            try:
+                                sell_p = snap_price(sell_bid - 0.01)
+                                args = OrderArgs(price=sell_p, size=int(fill_shares), side=SELL, token_id=token_id)
+                                signed = self.client.create_order(args)
+                                self.client.post_order(signed, OrderType.FAK)
+                                exit_price = sell_p
+                                log_msg(f"[SL-FAK] #{tid} FAK sell @ ${sell_p:.2f}")
+                            except Exception as e:
+                                log_msg(f"[SL-FAK] #{tid} FAILED: {str(e)[:60]}")
+                                exit_price = sell_bid
                     else:
-                        # Bid already past SL — sell at current bid immediately
-                        exit_price = snap_price(current_bid_after - 0.01)
-                        if exit_price < 0.01:
-                            exit_price = 0.01
-                        taker_fee = calc_taker_fee(exit_price, fill_shares)
-                        log_msg(f"[PAPER-SL-SLIP] #{tid} Bid past SL, FAK @ ${exit_price:.2f} "
-                                f"(bid=${current_bid_after:.2f}, fee ${taker_fee:.3f})")
+                        await asyncio.sleep(PAPER_LATENCY)
+                        sell_bid = self.up_bid if direction == "UP" else self.down_bid
+                        if sell_bid >= sl_price:
+                            exit_price = sl_price
+                            taker_fee = calc_taker_fee(sl_price, fill_shares)
+                            log_msg(f"[PAPER-SL-EXIT] #{tid} Bounce to SL, sold @ ${sl_price:.2f} (fee ${taker_fee:.3f})")
+                            exit_reason = "SL"
+                        else:
+                            exit_price = snap_price(sell_bid - 0.01)
+                            if exit_price < 0.01:
+                                exit_price = 0.01
+                            taker_fee = calc_taker_fee(exit_price, fill_shares)
+                            log_msg(f"[PAPER-SL-FAK] #{tid} No bounce, FAK @ ${exit_price:.2f} (fee ${taker_fee:.3f})")
+                            exit_reason = "SL-FAK"
 
-                exit_reason = "SL"
+                if not bounce_exited and exit_reason not in ("SL", "SL-FAK"):
+                    exit_reason = "SL"
                 exited = True
                 break
 
@@ -852,7 +934,12 @@ class BTCScalpBot:
                 exited = True
                 break
 
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.05)  # Check every 50ms for faster SL detection
+
+        # Clear SL event
+        self.sl_triggered = None
+        self.active_sl_price = 0
+        self.active_sl_direction = ""
 
         # HTTP book check at exit for ground truth
         http_book_end = await get_book(trade_token)

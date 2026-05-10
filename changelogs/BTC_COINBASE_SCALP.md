@@ -20,3 +20,9 @@
   - Price re-checked after latency delay (slippage)
   - Taker fee simulated on SL/force-exit sells
   - Partial fill detection and tracking
+
+## 2026-05-10
+- **Bounce-wait SL**: When SL triggers, keep TP on book and wait up to 10 seconds for bounce. Exit hierarchy: TP-BOUNCE (if price recovers to TP) > SL-BE (breakeven at entry) > SL (at SL price) > SL-FAK (panic sell). Based on data showing 65% of SL triggers bounce back.
+- **Event-driven SL detection**: Websocket triggers SL event instantly when bid updates, instead of 300ms polling. Reduced to 50ms monitoring loop.
+- **50ms paper latency**: Changed from 125ms to match actual API benchmark.
+- **REMINDER**: Build price-hit-counter approach — track how many times price touches TP/BE/SL before deciding exit.
