@@ -32,6 +32,12 @@ REVISIT:
     before making exit decision. E.g., if price hits SL 3 times but keeps bouncing
     back, that's different from hitting it once and crashing through. Use touch count
     + direction to decide: sell at TP/BE/SL or hold for more data.
+  - DYNAMIC ORDER SIZING: Before placing a buy, check ask-side depth and size
+    the order to match available liquidity. E.g., if best ask has 80 shares,
+    buy 80 not 100. Scale from 30sh up to 100sh based on book depth.
+    Benefits: zero slippage (always fill at best price), more shares when book
+    is deep, fewer when thin. Implement when scaling up from 30 to 100 shares.
+    Use the volume_by_hour.csv data to determine which hours have best depth.
   - MULTI-ASSET SCALING: After V2 BTC proves profitable, duplicate for ETH.
     Run 50sh BTC + 50sh ETH instead of 100sh on one book.
     ETH has good liquidity (50sh slip $0.003, 100sh slip $0.011).
