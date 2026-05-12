@@ -77,7 +77,7 @@ except ImportError:
 # ── Config ─────────────────────────────────────────────
 CB_TRIGGER = 5.00           # Coinbase move threshold (dollars)
 TP_OFFSET = 0.04            # Take profit: entry + $0.04
-SL_OFFSET = 0.03            # Stop loss: entry - $0.03
+SL_OFFSET = 0.02            # Stop loss: entry - $0.02 (tighter — data shows minimal TP loss, better recovery)
 MAX_HOLD_SECONDS = 30       # Hard exit after 30 seconds if TP not hit — don't hold to resolution
 SHARES_PER_TRADE = 5        # Shares per trade
 FILL_TIMEOUT = 4            # Cancel unfilled buy after 4 seconds
