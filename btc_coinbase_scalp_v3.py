@@ -99,6 +99,8 @@ TARGET_SHARES = 100         # Ideal trade size (will scale down if book is thin)
 FILL_TIMEOUT = 4            # Cancel unfilled buy after 4 seconds
 MIN_ENTRY_PRICE = 0.30      # Don't buy below this (was 0.15, filtered by data)
 MAX_ENTRY_PRICE = 0.85      # Don't buy above this
+SKIP_PRICE_LOW = 0.43       # Skip entries in the undecided zone (high FAK/ladder loss rate)
+SKIP_PRICE_HIGH = 0.55      # Skip entries in the undecided zone
 ENTRY_WINDOW_SECONDS = 60   # Only trade in first 60 seconds of window
 CUTOFF_BEFORE_END = 20      # No new trades within 20s of window end
 FORCE_EXIT_BEFORE_END = 5   # Force exit any open position 5s before end
@@ -567,6 +569,11 @@ class BTCScalpBot:
                 # Check entry bounds
                 if side_bid < MIN_ENTRY_PRICE or side_bid > MAX_ENTRY_PRICE:
                     log_msg(f"[SKIP] {direction} bid ${side_bid:.2f} outside ${MIN_ENTRY_PRICE}-${MAX_ENTRY_PRICE}")
+                    continue
+
+                # Skip undecided zone (high loss rate)
+                if SKIP_PRICE_LOW <= side_bid <= SKIP_PRICE_HIGH:
+                    log_msg(f"[SKIP] {direction} bid ${side_bid:.2f} in undecided zone ${SKIP_PRICE_LOW}-${SKIP_PRICE_HIGH}")
                     continue
 
                 entry_price = snap_price(side_bid)
