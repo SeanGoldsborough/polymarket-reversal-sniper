@@ -32,6 +32,11 @@ REVISIT:
     before making exit decision. E.g., if price hits SL 3 times but keeps bouncing
     back, that's different from hitting it once and crashing through. Use touch count
     + direction to decide: sell at TP/BE/SL or hold for more data.
+  - MULTI-ASSET SCALING: After V2 BTC proves profitable, duplicate for ETH.
+    Run 50sh BTC + 50sh ETH instead of 100sh on one book.
+    ETH has good liquidity (50sh slip $0.003, 100sh slip $0.011).
+    SOL/XRP/DOGE books are too thin — don't use.
+    Need separate Coinbase ETH/USD websocket feed for signals.
 """
 
 import asyncio
