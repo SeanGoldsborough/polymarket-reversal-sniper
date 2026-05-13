@@ -35,3 +35,15 @@
 - **V3: Same tiered exit applied** — replaces old ladder sell + panic floor.
 - **V2 scaled to 69 shares** — based on book depth analysis showing consistent fills.
 - **V3 skip zone $0.43-$0.55** — mid-price entries had 20% FAK rate, now excluded.
+
+- **V2: 5s bounce wait before tiered exit** — SL triggers, keep TP on book for 5s watching
+  for TP-BOUNCE or SL-BE. If no bounce, then tiered exit. Catches 60% of bounces.
+- **V4: NEW — Hold until BE, no time limit** — When SL triggers, hold position with TP on
+  book until price returns to entry (100% of SL trades eventually return to BE based on data).
+  Only force-exits if window is about to resolve. No tiered exit, no ladder, no FAK.
+  The ultimate test: if price always returns to BE, this should have zero SL losses.
+- **V5: NEW — Tiered TP (sell in 4 chunks at +$0.01/+$0.02/+$0.03/+$0.04)** —
+  Instead of all-or-nothing TP at +$0.04, sell 25% at each level. If price only
+  reaches +$0.02, captures partial profit on 50% of shares. Unfilled tiers cascade
+  down to BE then -$0.01, -$0.02. Simulation: +$100 vs -$110 on same data.
+  Max loss per trade ~$1 instead of ~$19.
