@@ -89,9 +89,8 @@ except ImportError:
 CB_TRIGGER = 5.00           # Coinbase move threshold (dollars)
 TP_OFFSET = 0.04            # Take profit: entry + $0.04
 SL_OFFSET = 0.02            # Stop loss: entry - $0.02 (tighter — data shows minimal TP loss, better recovery)
-PANIC_FLOOR = 0.05          # If bid drops > $0.05 below entry during bounce wait, start ladder selling
-LADDER_STEP = 0.01          # Each retry drops $0.01
-LADDER_WAIT = 0.5           # Wait 0.5s per ladder attempt
+TIERED_WAIT = 0.05          # Check fill status quickly, react to price
+TIER_COUNT = 3              # Split shares into 3 tiers
 MAX_HOLD_SECONDS = 30       # Hard exit after 30 seconds if TP not hit — don't hold to resolution
 MIN_SHARES = 5              # Minimum trade size
 MAX_SHARES = 100            # Maximum trade size
@@ -861,161 +860,136 @@ class BTCScalpBot:
             sl_hit = self.sl_triggered.is_set() or (current_bid <= sl_price and sl_price > 0.01)
             if sl_hit:
                 trigger_bid = current_bid
-                log_msg(f"[SL-TRIGGER] #{tid} Bid ${current_bid:.2f} <= SL ${sl_price:.2f} — TP stays on book, watching for bounce")
+                log_msg(f"[SL-TRIGGER] #{tid} Bid ${current_bid:.2f} <= SL ${sl_price:.2f} — starting tiered exit")
 
-                # Activate BE event trigger — websocket will fire it instantly when bid >= entry
+                # Activate BE event trigger
                 self.be_triggered = asyncio.Event()
                 self.active_be_price = fill_price
                 token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
 
-                # Bounce-wait with ladder sell on crash
-                # - Keep TP on book (catches full recovery)
-                # - Watch for BE event (catches breakeven bounce)
-                # - If bid drops > PANIC_FLOOR below entry, start ladder selling
-                SL_WAIT_SECONDS = 10
-                sl_track = []
-                bounce_start = time.time()
-                bounce_exited = False
-                ladder_active = False
-                ladder_attempts = 0
-                panic_level = fill_price - PANIC_FLOOR
-
-                while time.time() - bounce_start < SL_WAIT_SECONDS:
+                # Cancel TP and pre-approve for selling
+                if self.client and not PAPER_MODE and tp_order_id:
                     try:
-                        await asyncio.wait_for(self.be_triggered.wait(), timeout=0.05)
-                    except asyncio.TimeoutError:
+                        self.client.cancel_orders([tp_order_id])
+                    except:
+                        pass
+                if self.client and not PAPER_MODE:
+                    try:
+                        params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
+                                                       signature_type=SIGNATURE_TYPE)
+                        self.client.update_balance_allowance(params)
+                    except:
                         pass
 
-                    _bid = self.up_bid if direction == "UP" else self.down_bid
-                    sl_track.append({"t": round(time.time() - bounce_start, 2), "bid": _bid})
+                # TIERED EXIT: Split shares into 3 tiers, sell from best to worst
+                tier_size = int(fill_shares) // TIER_COUNT
+                remainder = int(fill_shares) - (tier_size * TIER_COUNT)
+                tiers = [
+                    {"price": snap_price(fill_price + 0.01), "shares": tier_size + remainder, "label": "+$0.01"},
+                    {"price": snap_price(fill_price), "shares": tier_size, "label": "BE"},
+                    {"price": snap_price(fill_price - 0.01), "shares": tier_size, "label": "-$0.01"},
+                ]
 
-                    # TP filled? (GTC on book — exchange fills it automatically)
-                    if self.client and not PAPER_MODE and tp_order_id:
-                        try:
-                            order = self.client.get_order(tp_order_id)
-                            if order and float(order.get("size_matched", 0)) >= fill_shares:
-                                exit_price = tp_price
-                                exit_reason = "TP-BOUNCE"
-                                taker_fee = 0
-                                bounce_exited = True
-                                log_msg(f"[TP-BOUNCE] #{tid} TP filled during bounce!")
-                                break
-                        except:
-                            pass
-                    else:
-                        if _bid >= tp_price:
-                            exit_price = tp_price
-                            exit_reason = "TP-BOUNCE"
-                            taker_fee = 0
-                            bounce_exited = True
-                            log_msg(f"[PAPER-TP-BOUNCE] #{tid} TP filled during bounce! bid=${_bid:.2f}")
-                            break
+                sl_track = []
+                bounce_start = time.time()
+                total_sold = 0
+                total_revenue = 0
+                tier_results = []
 
-                    # BE event fired? (websocket detected bid >= entry)
-                    if self.be_triggered.is_set() and not bounce_exited:
-                        if self.client and not PAPER_MODE:
-                            if tp_order_id:
-                                try:
-                                    self.client.cancel_orders([tp_order_id])
-                                except:
-                                    pass
-                            try:
-                                params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
-                                                               signature_type=SIGNATURE_TYPE)
-                                self.client.update_balance_allowance(params)
-                            except:
-                                pass
-                            try:
-                                args = OrderArgs(price=fill_price, size=int(fill_shares), side=SELL, token_id=token_id)
-                                signed = self.client.create_order(args)
-                                self.client.post_order(signed, OrderType.FOK)
-                                exit_price = fill_price
-                            except:
-                                exit_price = _bid
-                        else:
-                            exit_price = fill_price
-                            taker_fee = calc_taker_fee(fill_price, fill_shares)
-                        exit_reason = "SL-BE"
-                        bounce_exited = True
-                        log_msg(f"[SL-BE] #{tid} Bounce to breakeven @ ${fill_price:.2f}")
+                log_msg(f"[TIERED] #{tid} Selling {int(fill_shares)}sh in {TIER_COUNT} tiers: " +
+                        " | ".join([f"{t['shares']}sh@${t['price']:.2f}({t['label']})" for t in tiers]))
+
+                for tier in tiers:
+                    if total_sold >= int(fill_shares):
                         break
 
-                    # PANIC FLOOR: bid dropped too far — start ladder selling
-                    if _bid <= panic_level and not bounce_exited:
-                        if not ladder_active:
-                            ladder_active = True
-                            log_msg(f"[SL-LADDER] #{tid} Bid ${_bid:.2f} <= panic floor ${panic_level:.2f} — starting ladder sell")
-                            # Cancel TP first
-                            if self.client and not PAPER_MODE and tp_order_id:
-                                try:
-                                    self.client.cancel_orders([tp_order_id])
-                                except:
-                                    pass
-                            # Pre-approve
-                            if self.client and not PAPER_MODE:
-                                try:
-                                    params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
-                                                                   signature_type=SIGNATURE_TYPE)
-                                    self.client.update_balance_allowance(params)
-                                except:
-                                    pass
+                    sell_price = tier["price"]
+                    sell_shares = tier["shares"]
 
-                        # Ladder sell attempt
-                        ladder_attempts += 1
-                        ladder_price = snap_price(_bid)
-                        if ladder_price < 0.01:
-                            ladder_price = 0.01
+                    max_retries = 10
+                    for retry in range(max_retries):
+                        if sell_price < 0.01:
+                            sell_price = 0.01
+
+                        _bid = self.up_bid if direction == "UP" else self.down_bid
+                        sl_track.append({"t": round(time.time() - bounce_start, 2), "bid": _bid})
 
                         if self.client and not PAPER_MODE:
                             try:
-                                args = OrderArgs(price=ladder_price, size=int(fill_shares), side=SELL, token_id=token_id)
+                                args = OrderArgs(price=sell_price, size=sell_shares, side=SELL, token_id=token_id)
                                 signed = self.client.create_order(args)
                                 resp = self.client.post_order(signed, OrderType.GTC)
-                                ladder_oid = resp.get("orderID", "")
-                                log_msg(f"[SL-LADDER] #{tid} Attempt {ladder_attempts}: GTC sell @ ${ladder_price:.2f}")
+                                tier_oid = resp.get("orderID", "")
 
-                                # Wait for fill
-                                await asyncio.sleep(LADDER_WAIT)
-                                try:
-                                    order = self.client.get_order(ladder_oid)
-                                    if order and float(order.get("size_matched", 0)) >= fill_shares:
-                                        exit_price = ladder_price
-                                        exit_reason = "SL-LADDER"
-                                        bounce_exited = True
-                                        log_msg(f"[SL-LADDER] #{tid} Filled @ ${ladder_price:.2f} (attempt {ladder_attempts})")
-                                        break
-                                    else:
-                                        self.client.cancel_orders([ladder_oid])
-                                except:
+                                await asyncio.sleep(TIERED_WAIT)
+
+                                order = self.client.get_order(tier_oid)
+                                matched = float(order.get("size_matched", 0)) if order else 0
+                                if matched >= sell_shares:
+                                    total_sold += sell_shares
+                                    total_revenue += sell_shares * sell_price
+                                    tier_results.append({"price": sell_price, "shares": sell_shares, "filled": True})
+                                    log_msg(f"[TIERED] #{tid} {tier['label']}: {sell_shares}sh @ ${sell_price:.2f} FILLED")
+                                    break
+                                else:
                                     try:
-                                        self.client.cancel_orders([ladder_oid])
+                                        self.client.cancel_orders([tier_oid])
                                     except:
                                         pass
+                                    sell_price = snap_price(sell_price - 0.01)
                             except Exception as e:
-                                log_msg(f"[SL-LADDER] #{tid} Attempt {ladder_attempts} failed: {str(e)[:50]}")
+                                sell_price = snap_price(sell_price - 0.01)
                         else:
-                            # Paper: simulate ladder
-                            await asyncio.sleep(LADDER_WAIT)
+                            await asyncio.sleep(TIERED_WAIT)
                             _bid_now = self.up_bid if direction == "UP" else self.down_bid
-                            # GTC at ladder_price fills if bid >= ladder_price
-                            if _bid_now >= ladder_price:
-                                exit_price = ladder_price
-                                exit_reason = "SL-LADDER"
-                                taker_fee = 0  # Maker order
-                                bounce_exited = True
-                                log_msg(f"[PAPER-SL-LADDER] #{tid} Filled @ ${ladder_price:.2f} (attempt {ladder_attempts}, bid=${_bid_now:.2f})")
+                            if _bid_now >= sell_price:
+                                total_sold += sell_shares
+                                total_revenue += sell_shares * sell_price
+                                tier_results.append({"price": sell_price, "shares": sell_shares, "filled": True})
+                                log_msg(f"[PAPER-TIERED] #{tid} {tier['label']}: {sell_shares}sh @ ${sell_price:.2f} FILLED (bid=${_bid_now:.2f})")
                                 break
                             else:
-                                log_msg(f"[PAPER-SL-LADDER] #{tid} Attempt {ladder_attempts}: ${ladder_price:.2f} missed (bid=${_bid_now:.2f}), retrying ${LADDER_STEP:.2f} lower")
+                                tier_results.append({"price": sell_price, "shares": 0, "filled": False})
+                                log_msg(f"[PAPER-TIERED] #{tid} {tier['label']}: missed @ ${sell_price:.2f} (bid=${_bid_now:.2f}), retry lower")
+                                sell_price = snap_price(sell_price - 0.01)
 
-                # Analyze bounce
+                # Any remaining shares — emergency FAK
+                unsold = int(fill_shares) - total_sold
+                if unsold > 0:
+                    _bid = self.up_bid if direction == "UP" else self.down_bid
+                    if self.client and not PAPER_MODE:
+                        try:
+                            sell_p = snap_price(_bid - 0.01)
+                            args = OrderArgs(price=sell_p, size=unsold, side=SELL, token_id=token_id)
+                            signed = self.client.create_order(args)
+                            self.client.post_order(signed, OrderType.FAK)
+                            total_revenue += unsold * sell_p
+                            total_sold += unsold
+                            log_msg(f"[TIERED-FAK] #{tid} Emergency: {unsold}sh @ ${sell_p:.2f}")
+                        except:
+                            total_revenue += unsold * _bid
+                            total_sold += unsold
+                    else:
+                        await asyncio.sleep(PAPER_LATENCY)
+                        _bid = self.up_bid if direction == "UP" else self.down_bid
+                        sell_p = snap_price(_bid - 0.01)
+                        if sell_p < 0.01:
+                            sell_p = 0.01
+                        total_revenue += unsold * sell_p
+                        total_sold += unsold
+                        taker_fee = calc_taker_fee(sell_p, unsold)
+                        log_msg(f"[PAPER-TIERED-FAK] #{tid} Emergency: {unsold}sh @ ${sell_p:.2f}")
+
+                exit_price = total_revenue / total_sold if total_sold > 0 else fill_price
+                exit_reason = "SL-TIERED"
+
                 min_during = min(s["bid"] for s in sl_track) if sl_track else trigger_bid
                 max_during = max(s["bid"] for s in sl_track) if sl_track else trigger_bid
                 final_bid = sl_track[-1]["bid"] if sl_track else trigger_bid
 
-                log_msg(f"[SL-TRACK] #{tid} {SL_WAIT_SECONDS}s: trigger=${trigger_bid:.2f} "
-                        f"min=${min_during:.2f} max=${max_during:.2f} final=${final_bid:.2f} | "
-                        f"ladder={ladder_attempts} | exit={exit_reason if bounce_exited else 'expired'}")
+                total_pnl_calc = total_revenue - (fill_price * total_sold)
+                log_msg(f"[TIERED-DONE] #{tid} Sold {total_sold}sh | avg exit ${exit_price:.3f} | "
+                        f"P&L ${total_pnl_calc:+.2f} | {len(tier_results)} tier fills")
 
                 sl_bounce_data = {
                     "trigger_bid": trigger_bid,
@@ -1024,45 +998,8 @@ class BTCScalpBot:
                     "final_after": final_bid,
                     "returned_to_sl": max_during >= sl_price,
                     "returned_above_entry": max_during >= fill_price,
-                    "ladder_attempts": ladder_attempts,
+                    "tier_results": tier_results,
                 }
-
-                if not bounce_exited:
-                    # Timer expired without fill — final FAK attempt
-                    sell_bid = self.up_bid if direction == "UP" else self.down_bid
-                    if self.client and not PAPER_MODE:
-                        if tp_order_id and not ladder_active:
-                            try:
-                                self.client.cancel_orders([tp_order_id])
-                            except:
-                                pass
-                        if not ladder_active:
-                            try:
-                                params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
-                                                               signature_type=SIGNATURE_TYPE)
-                                self.client.update_balance_allowance(params)
-                            except:
-                                pass
-                        sell_p = snap_price(sell_bid - 0.01)
-                        try:
-                            args = OrderArgs(price=sell_p, size=int(fill_shares), side=SELL, token_id=token_id)
-                            signed = self.client.create_order(args)
-                            self.client.post_order(signed, OrderType.FAK)
-                            exit_price = sell_p
-                        except:
-                            exit_price = sell_bid
-                    else:
-                        await asyncio.sleep(PAPER_LATENCY)
-                        sell_bid = self.up_bid if direction == "UP" else self.down_bid
-                        exit_price = snap_price(sell_bid - 0.01)
-                        if exit_price < 0.01:
-                            exit_price = 0.01
-                        taker_fee = calc_taker_fee(exit_price, fill_shares)
-                    exit_reason = "SL-FAK"
-                    log_msg(f"[SL-FAK] #{tid} Final FAK @ ${exit_price:.2f} after {ladder_attempts} ladder attempts")
-
-                if not bounce_exited and exit_reason not in ("SL", "SL-FAK"):
-                    exit_reason = "SL"
 
                 # Deactivate BE trigger
                 self.be_triggered = None

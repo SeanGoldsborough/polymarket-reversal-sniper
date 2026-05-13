@@ -26,3 +26,12 @@
 - **Event-driven SL detection**: Websocket triggers SL event instantly when bid updates, instead of 300ms polling. Reduced to 50ms monitoring loop.
 - **50ms paper latency**: Changed from 125ms to match actual API benchmark.
 - **REMINDER**: Build price-hit-counter approach — track how many times price touches TP/BE/SL before deciding exit.
+
+## 2026-05-13
+- **V2: Tiered exit replaces ladder sell** — Split shares into 3 tiers on SL trigger:
+  Tier 1: 1/3 shares at entry + $0.01, Tier 2: 1/3 at entry (BE), Tier 3: 1/3 at entry - $0.01.
+  Each tier retries $0.01 lower until filled. 50ms fill checks (reactive, not polling).
+  Simulation on 106 trades: +$105 vs -$48 with old ladder. Emergency FAK only for unsold remainder.
+- **V3: Same tiered exit applied** — replaces old ladder sell + panic floor.
+- **V2 scaled to 69 shares** — based on book depth analysis showing consistent fills.
+- **V3 skip zone $0.43-$0.55** — mid-price entries had 20% FAK rate, now excluded.

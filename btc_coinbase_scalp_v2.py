@@ -89,7 +89,7 @@ except ImportError:
 CB_TRIGGER = 5.00           # Coinbase move threshold (dollars)
 TP_OFFSET = 0.04            # Take profit: entry + $0.04
 SL_OFFSET = 0.02            # Stop loss: entry - $0.02 (tighter — data shows minimal TP loss, better recovery)
-TIERED_WAIT = 0.5           # Wait 0.5s per tier attempt before retrying lower
+TIERED_WAIT = 0.05          # Check fill status quickly, react to price
 TIER_COUNT = 3              # Split shares into 3 tiers
 MAX_HOLD_SECONDS = 30       # Hard exit after 30 seconds if TP not hit — don't hold to resolution
 SHARES_PER_TRADE = 69       # Shares per trade (was 5, scaling up based on book depth data)
