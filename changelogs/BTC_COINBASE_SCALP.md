@@ -47,3 +47,13 @@
   reaches +$0.02, captures partial profit on 50% of shares. Unfilled tiers cascade
   down to BE then -$0.01, -$0.02. Simulation: +$100 vs -$110 on same data.
   Max loss per trade ~$1 instead of ~$19.
+
+## 2026-05-14
+- **V6: NEW — V4 + volatility gate** — Same hold-until-BE as V4, but only trades when
+  CB price shows trending behavior: <4 reversals, >$10 net move, >0.3 directionality
+  ratio over 30s window. Filters out choppy markets that caused V4's force-exit losses.
+- **V5 bug fixes**: Fixed NameError (min_bid_during), fixed NameError (ws_updates_during_trade).
+  V5 tiered TP now recording trades correctly.
+- **V1, V2, V3 stopped** — final results: V1 -$26, V2 -$5, V3 +$11.
+- **REMINDER (V5)**: Option 3 volatility — track per-window reversal patterns across many
+  windows to identify time-of-day trends.

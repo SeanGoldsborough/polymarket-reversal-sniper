@@ -37,11 +37,6 @@ REVISIT:
     buy 80 not 100. Scale from 30sh up to 100sh based on book depth.
     Benefits: zero slippage (always fill at best price), more shares when book
     is deep, fewer when thin. Implement when scaling up from 30 to 100 shares.
-  - VOLATILITY GATE OPTION 3: Track ratio of direction changes to net movement
-    over rolling window. High reversals / low net = choppy (skip). Few reversals /
-    high net = trending (trade). Can compute from CB feed in real-time. V6 uses
-    option 2 (range vs net move + reversal count). Option 3 adds per-window
-    tracking across many windows to identify patterns by time of day.
     Use the volume_by_hour.csv data to determine which hours have best depth.
   - MULTI-ASSET SCALING: After V2 BTC proves profitable, duplicate for ETH.
     Run 50sh BTC + 50sh ETH instead of 100sh on one book.
@@ -105,6 +100,13 @@ ENTRY_WINDOW_SECONDS = 60   # Only trade in first 60 seconds of window
 CUTOFF_BEFORE_END = 20      # No new trades within 20s of window end
 FORCE_EXIT_BEFORE_END = 5   # Force exit any open position 5s before end
 
+# Volatility gate: measure CB price behavior over rolling window
+# Only trade when market is trending (low choppiness)
+VOL_WINDOW_SECONDS = 30     # Look back 30 seconds of CB prices
+VOL_MAX_REVERSALS = 4       # Max direction changes allowed (fewer = trending)
+VOL_MIN_NET_MOVE = 10.0     # Min net $ move in the window (higher = stronger trend)
+VOL_MIN_RATIO = 0.3         # Min ratio of net_move / total_range (higher = more directional)
+
 # Paper simulation
 PAPER_LATENCY = 0.050       # 50ms simulated execution latency (actual API benchmarked at 22-50ms)
 PAPER_TAKER_FEE_MULT = 0.022  # ~2.2% of min(price, 1-price) for taker orders
@@ -117,14 +119,14 @@ SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "0"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-PAPER_MODE = os.getenv("BTC_SCALP_V5_LIVE", "0") != "1"
+PAPER_MODE = os.getenv("BTC_SCALP_V6_LIVE", "0") != "1"
 POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 CB_WS_URL = "wss://ws-feed.exchange.coinbase.com"
 
 os.makedirs("logs", exist_ok=True)
-BOT_NAME = "BTC-SCALP-V5" if not PAPER_MODE else "BTC-SCALP-V5-PAPER"
-LOG_FILE = "logs/btc_scalp_v5_trades.jsonl"
-SUMMARY_FILE = "logs/btc_scalp_v5_summary.json"
+BOT_NAME = "BTC-SCALP-V6" if not PAPER_MODE else "BTC-SCALP-V6-PAPER"
+LOG_FILE = "logs/btc_scalp_v6_trades.jsonl"
+SUMMARY_FILE = "logs/btc_scalp_v6_summary.json"
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -141,6 +143,45 @@ def snap_price(price):
 def calc_taker_fee(price, shares):
     """Approximate Polymarket taker fee."""
     return round(min(price, 1.0 - price) * PAPER_TAKER_FEE_MULT * shares, 4)
+
+
+def check_volatility(price_history, window_seconds=VOL_WINDOW_SECONDS):
+    """Check if market is trending (good to trade) or choppy (skip).
+    Returns (is_trending, reversals, net_move, ratio, reason)."""
+    now = time.time()
+    recent = [(t, p) for t, p in price_history if t >= now - window_seconds]
+
+    if len(recent) < 5:
+        return False, 0, 0, 0, "insufficient data"
+
+    prices = [p for _, p in recent]
+    net_move = abs(prices[-1] - prices[0])
+    price_range = max(prices) - min(prices)
+    ratio = net_move / price_range if price_range > 0 else 0
+
+    # Count direction changes
+    reversals = 0
+    prev_dir = None
+    for i in range(1, len(prices)):
+        if prices[i] > prices[i-1]:
+            d = "up"
+        elif prices[i] < prices[i-1]:
+            d = "down"
+        else:
+            continue
+        if prev_dir and d != prev_dir:
+            reversals += 1
+        prev_dir = d
+
+    # Check gates
+    if reversals > VOL_MAX_REVERSALS:
+        return False, reversals, net_move, ratio, f"too choppy ({reversals} reversals)"
+    if net_move < VOL_MIN_NET_MOVE:
+        return False, reversals, net_move, ratio, f"weak move (${net_move:.1f})"
+    if ratio < VOL_MIN_RATIO:
+        return False, reversals, net_move, ratio, f"low directionality ({ratio:.2f})"
+
+    return True, reversals, net_move, ratio, "trending"
 
 
 async def send_telegram(msg):
@@ -228,6 +269,7 @@ class BTCScalpBot:
         self.cb_price = 0.0
         self.prev_cb_price = 0.0
         self.cb_updated_at = 0.0
+        self.cb_price_history = []  # List of (timestamp, price) for volatility calc
         self.up_bid = 0.0
         self.down_bid = 0.0
         self.up_ask = 0.0
@@ -271,6 +313,7 @@ class BTCScalpBot:
         log_msg(f"[INIT] {BOT_NAME}")
         log_msg(f"[INIT] Trigger: CB move > ${CB_TRIGGER} | TP: +${TP_OFFSET} | SL: -${SL_OFFSET}")
         log_msg(f"[INIT] Shares: {SHARES_PER_TRADE} | Fill timeout: {FILL_TIMEOUT}s | Entry: ${MIN_ENTRY_PRICE}-${MAX_ENTRY_PRICE} | First {ENTRY_WINDOW_SECONDS}s only")
+        log_msg(f"[INIT] Vol gate: max {VOL_MAX_REVERSALS} reversals, min ${VOL_MIN_NET_MOVE} move, min {VOL_MIN_RATIO} ratio over {VOL_WINDOW_SECONDS}s")
         mode = "LIVE" if not PAPER_MODE else "PAPER"
         log_msg(f"[INIT] {mode} mode — Bank: ${self.bankroll:.2f}")
 
@@ -355,6 +398,11 @@ class BTCScalpBot:
                                     self.prev_cb_price = new_price
                                     self.cb_price = new_price
                                     self.cb_updated_at = now
+                                    # Track price history for volatility gate
+                                    self.cb_price_history.append((now, new_price))
+                                    # Trim to last 60 seconds
+                                    cutoff = now - 60
+                                    self.cb_price_history = [(t, p) for t, p in self.cb_price_history if t >= cutoff]
                             except:
                                 pass
                 except Exception as e:
@@ -513,6 +561,12 @@ class BTCScalpBot:
                 if window_elapsed > ENTRY_WINDOW_SECONDS:
                     continue
 
+                # Volatility gate: only trade when market is trending
+                is_trending, reversals, net_move, ratio, vol_reason = check_volatility(self.cb_price_history)
+                if not is_trending:
+                    log_msg(f"[VOL-SKIP] {direction} — {vol_reason} (rev={reversals} net=${net_move:.1f} ratio={ratio:.2f})")
+                    continue
+
                 # Check entry bounds
                 if side_bid < MIN_ENTRY_PRICE or side_bid > MAX_ENTRY_PRICE:
                     log_msg(f"[SKIP] {direction} bid ${side_bid:.2f} outside ${MIN_ENTRY_PRICE}-${MAX_ENTRY_PRICE}")
@@ -639,171 +693,293 @@ class BTCScalpBot:
             except:
                 pass
 
-        trade_token = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
-
-        # ── STEP 4: Place 4 tiered GTC TP sells ──
-        tier_count = 4
-        tier_shares_list = [int(fill_shares) // tier_count + (1 if i < int(fill_shares) % tier_count else 0) for i in range(tier_count)]
-        tier_offsets = [0.01, 0.02, 0.03, 0.04]
-        tier_prices_list = [snap_price(fill_price + off) for off in tier_offsets]
-        tier_filled = [False] * tier_count
-
-        log_msg(f"[V5-TIERS] #{tid} Placing 4 TP tiers: " +
-                " | ".join([f"{tier_shares_list[i]}sh@${tier_prices_list[i]:.2f}" for i in range(tier_count)]))
-
-        if not PAPER_MODE and self.client:
-            for i in range(tier_count):
-                try:
-                    args = OrderArgs(price=tier_prices_list[i], size=tier_shares_list[i], side=SELL, token_id=trade_token)
-                    signed = self.client.create_order(args)
-                    self.client.post_order(signed, OrderType.GTC)
-                except:
-                    pass
+        # ── STEP 4: Place GTC TP sell ──
+        tp_order_id = None
+        if self.client and not PAPER_MODE:
+            try:
+                token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
+                args = OrderArgs(price=tp_price, size=int(fill_shares), side=SELL, token_id=token_id)
+                signed = self.client.create_order(args)
+                resp = self.client.post_order(signed, OrderType.GTC)
+                tp_order_id = resp.get("orderID", "")
+                log_msg(f"[TP] #{tid} GTC sell {int(fill_shares)}sh @ ${tp_price:.2f} order={tp_order_id[:10]}...")
+            except Exception as e:
+                log_msg(f"[TP] #{tid} FAILED: {str(e)[:80]}")
         else:
-            await asyncio.sleep(PAPER_LATENCY)
-            log_msg(f"[V5-PAPER] #{tid} 4 tier orders placed")
+            await asyncio.sleep(PAPER_LATENCY)  # TP placement latency
+            log_msg(f"[PAPER-TP] #{tid} GTC sell {int(fill_shares)}sh @ ${tp_price:.2f}")
 
-        # ── STEP 5: Monitor — wait for fills, cascade on SL ──
-        total_sold = 0
-        total_revenue = 0.0
-        cascade_started = False
-        sl_bounce_data = None
+        # ── STEP 5: Monitor for TP fill or SL trigger ──
+        exited = False
+        exit_price = fill_price
+        exit_reason = "TIMEOUT"
+        taker_fee = 0
+        trade_start = time.time()
         min_bid_during = fill_price
         max_bid_during = fill_price
+        sl_bounce_data = None  # Filled if SL triggers
 
-        try:  # Catch any crash in monitoring to ensure trade always records
+        # Set up event-driven SL — websocket will trigger this instantly
+        self.sl_triggered = asyncio.Event()
+        self.be_triggered = None  # Activated after SL triggers
+        self.active_sl_price = sl_price
+        self.active_be_price = 0
+        self.active_sl_direction = direction
 
-            while total_sold < int(fill_shares) and time.time() < window_end:
-                await asyncio.sleep(0.05)
+        # Also fetch book via HTTP at start and end of trade for ground truth comparison
+        trade_token = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
+        http_book_start = await get_book(trade_token)
+        if http_book_start:
+            log_msg(f"[DEBUG] #{tid} HTTP book at entry: bid=${http_book_start['bid']:.2f} ask=${http_book_start['ask']:.2f} | "
+                    f"WS bid=${self.up_bid if direction == 'UP' else self.down_bid:.2f}")
 
-                _bid = self.up_bid if direction == "UP" else self.down_bid
-                if _bid <= 0:
-                    continue
+        ws_updates_during_trade = 0
 
-                # Track min/max
-                if _bid < min_bid_during:
-                    min_bid_during = _bid
-                if _bid > max_bid_during:
-                    max_bid_during = _bid
+        while not exited and time.time() < window_end:
+            # Track min/max bid FIRST every iteration
+            _cur = self.up_bid if direction == "UP" else self.down_bid
+            if _cur > 0:
+                if _cur < min_bid_during:
+                    min_bid_during = _cur
+                if _cur > max_bid_during:
+                    max_bid_during = _cur
+            ws_updates_during_trade += 1
 
-                # Force exit before resolution
-                if time.time() >= window_end - FORCE_EXIT_BEFORE_END:
-                    unsold = int(fill_shares) - total_sold
-                    if unsold > 0:
-                        _bid_now = self.up_bid if direction == "UP" else self.down_bid
-                        sell_p = snap_price(_bid_now - 0.01)
-                        if sell_p < 0.01:
-                            sell_p = 0.01
-                        total_revenue += unsold * sell_p
-                        total_sold += unsold
-                        taker_fee += calc_taker_fee(sell_p, unsold)
-                        log_msg(f"[V5-FORCE] #{tid} Window ending, sold {unsold}sh @ ${sell_p:.2f}")
+            now = time.time()
+            hold_elapsed = now - trade_start
+
+            # Max hold timeout — exit at market, don't hold to resolution
+            if hold_elapsed >= MAX_HOLD_SECONDS:
+                current_bid = self.up_bid if direction == "UP" else self.down_bid
+                log_msg(f"[MAX-HOLD] #{tid} {MAX_HOLD_SECONDS}s elapsed, TP not hit — exiting at market (bid ${current_bid:.2f})")
+                if tp_order_id and self.client and not PAPER_MODE:
+                    try:
+                        self.client.cancel_orders([tp_order_id])
+                    except:
+                        pass
+                if self.client and not PAPER_MODE:
+                    try:
+                        token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
+                        params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
+                                                       signature_type=SIGNATURE_TYPE)
+                        self.client.update_balance_allowance(params)
+                    except:
+                        pass
+                    try:
+                        sell_p = snap_price(current_bid - 0.01)
+                        args = OrderArgs(price=sell_p, size=int(fill_shares), side=SELL, token_id=token_id)
+                        signed = self.client.create_order(args)
+                        self.client.post_order(signed, OrderType.FOK)
+                        exit_price = sell_p
+                    except Exception as e:
+                        log_msg(f"[MAX-HOLD] #{tid} Sell failed: {str(e)[:60]}")
+                        exit_price = current_bid
+                else:
+                    await asyncio.sleep(PAPER_LATENCY)
+                    # Re-read bid after latency
+                    current_bid_after = self.up_bid if direction == "UP" else self.down_bid
+                    exit_price = snap_price(min(current_bid, current_bid_after) - 0.01)
+                    if exit_price < 0.01:
+                        exit_price = 0.01
+                    taker_fee = calc_taker_fee(exit_price, fill_shares)
+                    log_msg(f"[PAPER-MAX-HOLD] #{tid} Sell @ ${exit_price:.2f} (fee ${taker_fee:.3f})")
+                exit_reason = "MAX-HOLD"
+                exited = True
+                break
+
+            # Force exit before resolution
+            if now >= force_exit_time:
+                log_msg(f"[FORCE-EXIT] #{tid} Window ending — exiting at market")
+                if tp_order_id and self.client and not PAPER_MODE:
+                    try:
+                        self.client.cancel_orders([tp_order_id])
+                    except:
+                        pass
+                current_bid = self.up_bid if direction == "UP" else self.down_bid
+                if self.client and not PAPER_MODE:
+                    try:
+                        token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
+                        sell_p = snap_price(current_bid - 0.01)
+                        args = OrderArgs(price=sell_p, size=int(fill_shares), side=SELL, token_id=token_id)
+                        signed = self.client.create_order(args)
+                        self.client.post_order(signed, OrderType.FOK)
+                        exit_price = sell_p
+                    except Exception as e:
+                        log_msg(f"[FORCE-EXIT] #{tid} Sell failed: {str(e)[:60]}")
+                        exit_price = current_bid
+                else:
+                    await asyncio.sleep(PAPER_LATENCY)  # Cancel + sell latency
+                    # Paper: sell at bid - 0.01 (slippage), pay taker fee
+                    exit_price = snap_price(current_bid - 0.01)
+                    taker_fee = calc_taker_fee(exit_price, fill_shares)
+                    log_msg(f"[PAPER-FORCE-EXIT] #{tid} Sell @ ${exit_price:.2f} (fee ${taker_fee:.3f})")
+                exit_reason = "FORCE-EXIT"
+                exited = True
+                break
+
+            # Check TP fill
+            if self.client and not PAPER_MODE and tp_order_id:
+                try:
+                    order = self.client.get_order(tp_order_id)
+                    if order:
+                        matched = float(order.get("size_matched", 0))
+                        if matched >= fill_shares:
+                            exit_price = tp_price
+                            exit_reason = "TP"
+                            exited = True
+                            break
+                except:
+                    pass
+            else:
+                # Paper: TP fills when bid reaches our TP price
+                current_bid = self.up_bid if direction == "UP" else self.down_bid
+                if current_bid >= tp_price:
+                    await asyncio.sleep(PAPER_LATENCY)
+                    exit_price = tp_price
+                    exit_reason = "TP"
+                    exited = True
                     break
 
-                # Check tier fills (highest first — if bid >= tier price, that tier fills)
-                for i in range(tier_count):
-                    if tier_filled[i]:
-                        continue
-                    if _bid >= tier_prices_list[i]:
-                        tier_filled[i] = True
-                        total_sold += tier_shares_list[i]
-                        total_revenue += tier_shares_list[i] * tier_prices_list[i]
-                        log_msg(f"[V5-FILL] #{tid} Tier {i+1}: {tier_shares_list[i]}sh @ ${tier_prices_list[i]:.2f} | "
-                                f"bid=${_bid:.2f} | {total_sold}/{int(fill_shares)} sold")
+            # Check SL trigger (event-driven from websocket OR poll fallback)
+            current_bid = self.up_bid if direction == "UP" else self.down_bid
+            sl_hit = self.sl_triggered.is_set() or (current_bid <= sl_price and sl_price > 0.01)
+            if sl_hit:
+                trigger_bid = current_bid
+                log_msg(f"[SL-TRIGGER] #{tid} Bid ${current_bid:.2f} <= SL ${sl_price:.2f} — holding for BE/TP, no time limit")
 
-                # All sold?
-                if total_sold >= int(fill_shares):
-                    break
+                # Activate BE event trigger
+                self.be_triggered = asyncio.Event()
+                self.active_be_price = fill_price
+                token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
 
-                # CASCADE: bid dropped to SL level — start selling unfilled tiers at market
-                if _bid <= fill_price - SL_OFFSET and not cascade_started:
-                    cascade_started = True
-                    log_msg(f"[V5-CASCADE] #{tid} Bid ${_bid:.2f} hit SL — cascading unfilled tiers")
+                # HOLD UNTIL BE OR TP — only exit at BE, TP, or force-exit before resolution
+                sl_bounce_data = {"trigger_bid": trigger_bid}
 
-                    # Hold for bounce like V4 — wait until bid returns to entry
-                    # If it returns, sell unfilled tiers at BE or better
-                    # If window runs out, force exit
-                    cascade_wait_start = time.time()
-                    while time.time() < window_end - FORCE_EXIT_BEFORE_END:
-                        await asyncio.sleep(0.05)
-                        _bid_now = self.up_bid if direction == "UP" else self.down_bid
+                while time.time() < window_end - FORCE_EXIT_BEFORE_END:
+                    try:
+                        await asyncio.wait_for(self.be_triggered.wait(), timeout=0.05)
+                    except asyncio.TimeoutError:
+                        pass
 
-                        if _bid_now <= 0:
-                            continue
-                        if _bid_now < min_bid_during:
-                            min_bid_during = _bid_now
-                        if _bid_now > max_bid_during:
-                            max_bid_during = _bid_now
-
-                        # Check if any unfilled tiers can now fill (price recovered)
-                        for i in range(tier_count):
-                            if tier_filled[i]:
-                                continue
-                            if _bid_now >= tier_prices_list[i]:
-                                tier_filled[i] = True
-                                total_sold += tier_shares_list[i]
-                                total_revenue += tier_shares_list[i] * tier_prices_list[i]
-                                log_msg(f"[V5-BOUNCE-FILL] #{tid} Tier {i+1}: {tier_shares_list[i]}sh @ ${tier_prices_list[i]:.2f} on bounce | {total_sold}/{int(fill_shares)} sold")
-
-                        # Price returned to BE — sell remaining unfilled tiers at entry price
-                        if _bid_now >= fill_price:
-                            for i in range(tier_count):
-                                if tier_filled[i]:
-                                    continue
-                                tier_filled[i] = True
-                                total_sold += tier_shares_list[i]
-                                total_revenue += tier_shares_list[i] * fill_price
-                                taker_fee += calc_taker_fee(fill_price, tier_shares_list[i])
-                                log_msg(f"[V5-BE] #{tid} Tier {i+1}: {tier_shares_list[i]}sh @ ${fill_price:.2f} (BE) | {total_sold}/{int(fill_shares)} sold")
-
-                        if total_sold >= int(fill_shares):
+                    # TP filled? (still on book)
+                    if self.client and not PAPER_MODE and tp_order_id:
+                        try:
+                            order = self.client.get_order(tp_order_id)
+                            if order and float(order.get("size_matched", 0)) >= fill_shares:
+                                exit_price = tp_price
+                                exit_reason = "TP-BOUNCE"
+                                taker_fee = 0
+                                log_msg(f"[TP-BOUNCE] #{tid} TP filled while holding!")
+                                self.be_triggered = None
+                                self.active_be_price = 0
+                                exited = True
+                                break
+                        except:
+                            pass
+                    else:
+                        _bid = self.up_bid if direction == "UP" else self.down_bid
+                        if _bid >= tp_price:
+                            exit_price = tp_price
+                            exit_reason = "TP-BOUNCE"
+                            taker_fee = 0
+                            log_msg(f"[PAPER-TP-BOUNCE] #{tid} TP filled while holding! bid=${_bid:.2f}")
+                            self.be_triggered = None
+                            self.active_be_price = 0
+                            exited = True
                             break
 
-                    # Force-sell any remaining unsold shares
-                    unsold = int(fill_shares) - total_sold
-                    if unsold > 0:
-                        _bid_now = self.up_bid if direction == "UP" else self.down_bid
-                        sell_p = snap_price(_bid_now - 0.01) if _bid_now > 0.01 else 0.01
-                        total_revenue += unsold * sell_p
-                        total_sold += unsold
-                        taker_fee += calc_taker_fee(sell_p, unsold)
-                        log_msg(f"[V5-CASCADE-EXIT] #{tid} Force sold {unsold}sh @ ${sell_p:.2f}")
+                    # BE event?
+                    if self.be_triggered.is_set():
+                        if self.client and not PAPER_MODE:
+                            if tp_order_id:
+                                try:
+                                    self.client.cancel_orders([tp_order_id])
+                                except:
+                                    pass
+                            try:
+                                params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
+                                                               signature_type=SIGNATURE_TYPE)
+                                self.client.update_balance_allowance(params)
+                            except:
+                                pass
+                            try:
+                                args = OrderArgs(price=fill_price, size=int(fill_shares), side=SELL, token_id=token_id)
+                                signed = self.client.create_order(args)
+                                self.client.post_order(signed, OrderType.FOK)
+                                exit_price = fill_price
+                            except:
+                                exit_price = fill_price
+                        else:
+                            exit_price = fill_price
+                            taker_fee = calc_taker_fee(fill_price, fill_shares)
+                        elapsed = time.time() - trade_start
+                        exit_reason = "SL-BE"
+                        log_msg(f"[SL-BE] #{tid} Price returned to BE @ ${fill_price:.2f} after {elapsed:.1f}s")
+                        self.be_triggered = None
+                        self.active_be_price = 0
+                        exited = True
+                        break
 
-                    break  # Exit outer loop
+                if not exited:
+                    # Force exit — window ending
+                    _bid = self.up_bid if direction == "UP" else self.down_bid
+                    log_msg(f"[FORCE-EXIT-V4] #{tid} Window ending, bid ${_bid:.2f}")
+                    if self.client and not PAPER_MODE:
+                        if tp_order_id:
+                            try:
+                                self.client.cancel_orders([tp_order_id])
+                            except:
+                                pass
+                        try:
+                            params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
+                                                           signature_type=SIGNATURE_TYPE)
+                            self.client.update_balance_allowance(params)
+                        except:
+                            pass
+                        try:
+                            sell_p = snap_price(_bid - 0.01)
+                            args = OrderArgs(price=sell_p, size=int(fill_shares), side=SELL, token_id=token_id)
+                            signed = self.client.create_order(args)
+                            self.client.post_order(signed, OrderType.FAK)
+                            exit_price = sell_p
+                        except:
+                            exit_price = _bid
+                    else:
+                        await asyncio.sleep(PAPER_LATENCY)
+                        _bid = self.up_bid if direction == "UP" else self.down_bid
+                        exit_price = snap_price(_bid - 0.01)
+                        if exit_price < 0.01:
+                            exit_price = 0.01
+                        taker_fee = calc_taker_fee(exit_price, fill_shares)
+                    exit_reason = "FORCE-EXIT"
+                    self.be_triggered = None
+                    self.active_be_price = 0
+                    exited = True
+                break
 
-            # Force-sell if outer loop timed out without cascade
-            unsold = int(fill_shares) - total_sold
-            if unsold > 0:
-                _bid_now = self.up_bid if direction == "UP" else self.down_bid
-                sell_p = snap_price(_bid_now - 0.01) if _bid_now > 0.01 else 0.01
-                total_revenue += unsold * sell_p
-                total_sold += unsold
-                taker_fee += calc_taker_fee(sell_p, unsold)
-                log_msg(f"[V5-TIMEOUT-EXIT] #{tid} Force sold {unsold}sh @ ${sell_p:.2f}")
+            # Check for resolution
+            if current_bid >= 0.95:
+                if tp_order_id and self.client and not PAPER_MODE:
+                    try:
+                        self.client.cancel_orders([tp_order_id])
+                    except:
+                        pass
+                exit_price = 0.99
+                exit_reason = "RES-WIN"
+                exited = True
+                break
+            if current_bid <= 0.05:
+                if tp_order_id and self.client and not PAPER_MODE:
+                    try:
+                        self.client.cancel_orders([tp_order_id])
+                    except:
+                        pass
+                exit_price = 0.01
+                exit_reason = "RES-LOSS"
+                exited = True
+                break
 
-        except Exception as e:
-            log_msg(f"[V5-ERROR] #{tid} Monitoring crashed: {str(e)[:80]}")
-            import traceback
-            traceback.print_exc()
-            # Ensure remaining shares are accounted for
-            unsold = int(fill_shares) - total_sold
-            if unsold > 0:
-                total_revenue += unsold * fill_price  # Assume BE as fallback
-                total_sold += unsold
-
-        # Calculate result
-        if total_sold > 0:
-            exit_price = total_revenue / total_sold
-        else:
-            exit_price = fill_price
-
-        filled_count = sum(1 for f in tier_filled if f)
-        exit_reason = f"V5-{filled_count}T"
-        if cascade_started:
-            exit_reason += "+C"
-
-        log_msg(f"[V5-DONE] #{tid} {total_sold}/{int(fill_shares)}sh sold | avg ${exit_price:.3f} | "
-                f"P&L ${total_revenue - fill_price * int(fill_shares):+.2f} | {filled_count}/4 tiers")
+            await asyncio.sleep(0.05)  # Check every 50ms for faster SL detection
 
         # Clear SL + BE events
         self.sl_triggered = None
@@ -817,7 +993,8 @@ class BTCScalpBot:
         ws_bid_now = self.up_bid if direction == "UP" else self.down_bid
         http_bid = http_book_end['bid'] if http_book_end else 0
 
-        log_msg(f"[DEBUG] #{tid} EXIT | WS bid=${ws_bid_now:.2f} | HTTP bid=${http_bid:.2f}")
+        log_msg(f"[DEBUG] #{tid} EXIT | WS bid=${ws_bid_now:.2f} | HTTP bid=${http_bid:.2f} | "
+                f"WS loops={ws_updates_during_trade}")
         if http_book_end and abs(ws_bid_now - http_bid) > 0.01:
             log_msg(f"[DEBUG] #{tid} *** WS/HTTP MISMATCH *** WS=${ws_bid_now:.2f} HTTP=${http_bid:.2f}")
 
