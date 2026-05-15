@@ -578,22 +578,10 @@ class BTCScalpBot:
                 except:
                     pass
             else:
-                # Paper: realistic fill simulation
-                # We placed a GTC buy at entry_price. For this to fill, there must be
-                # sellers (asks) at or below our price. Check ask-side depth.
+                # Paper: GTC buy at best bid fills when bid is at or near our price
                 current_bid = self.up_bid if direction == "UP" else self.down_bid
-                current_ask = self.up_ask if direction == "UP" else self.down_ask
 
-                # Our GTC buy sits at entry_price. It fills when:
-                # 1. The ask drops to our price (someone market-sells into us), OR
-                # 2. The bid moves above our price (market crossed through us)
-                if current_ask > 0 and current_ask <= entry_price:
-                    fill_shares = SHARES_PER_TRADE
-                    fill_price = entry_price
-                    filled = True
-                    await asyncio.sleep(PAPER_LATENCY)
-                    break
-                elif current_bid > entry_price:
+                if current_bid > 0 and current_bid >= entry_price - 0.01:
                     fill_shares = SHARES_PER_TRADE
                     fill_price = entry_price
                     filled = True

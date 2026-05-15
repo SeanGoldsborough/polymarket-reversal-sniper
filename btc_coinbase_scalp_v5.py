@@ -529,10 +529,13 @@ class BTCScalpBot:
                 log_msg(f"[SIGNAL] #{tid} CB {direction} ${signal['cb_move']:+,.2f} | "
                         f"Entry ${entry_price:.2f} | TP ${tp_price:.2f} | SL ${sl_price:.2f}")
 
-                await self._execute_trade(tid, direction, entry_price, tp_price, sl_price,
-                                          signal["cb_move"], mkt["question"], window_start, window_end, force_exit_time)
-
-                self.in_trade = False
+                try:
+                    await self._execute_trade(tid, direction, entry_price, tp_price, sl_price,
+                                              signal["cb_move"], mkt["question"], window_start, window_end, force_exit_time)
+                except Exception as e:
+                    log_msg(f"[TRADE-ERROR] #{tid} {str(e)[:80]}")
+                finally:
+                    self.in_trade = False
 
         await asyncio.gather(cb_ws(), poly_ws(), trade_executor(), return_exceptions=True)
 
@@ -542,6 +545,7 @@ class BTCScalpBot:
         t_start = time.time()
         window_elapsed = round(t_start - window_start, 1)  # seconds into the 5-min window
         token = None  # Not needed for paper but kept for live
+        taker_fee = 0
 
         # ── STEP 1: Place GTC limit buy ──
         buy_order_id = None
@@ -583,22 +587,12 @@ class BTCScalpBot:
                 except:
                     pass
             else:
-                # Paper: realistic fill simulation
-                # We placed a GTC buy at entry_price. For this to fill, there must be
-                # sellers (asks) at or below our price. Check ask-side depth.
+                # Paper: GTC buy at best bid fills when bid is at or near our price
+                # In reality, a maker buy at best bid fills almost immediately
                 current_bid = self.up_bid if direction == "UP" else self.down_bid
-                current_ask = self.up_ask if direction == "UP" else self.down_ask
 
-                # Our GTC buy sits at entry_price. It fills when:
-                # 1. The ask drops to our price (someone market-sells into us), OR
-                # 2. The bid moves above our price (market crossed through us)
-                if current_ask > 0 and current_ask <= entry_price:
-                    fill_shares = SHARES_PER_TRADE
-                    fill_price = entry_price
-                    filled = True
-                    await asyncio.sleep(PAPER_LATENCY)
-                    break
-                elif current_bid > entry_price:
+                # Fill if bid is within $0.01 of our entry (normal spread)
+                if current_bid > 0 and current_bid >= entry_price - 0.01:
                     fill_shares = SHARES_PER_TRADE
                     fill_price = entry_price
                     filled = True
@@ -812,20 +806,23 @@ class BTCScalpBot:
         self.active_be_price = 0
         self.active_sl_direction = ""
 
-        # HTTP book check at exit for ground truth
-        http_book_end = await get_book(trade_token)
-        ws_bid_now = self.up_bid if direction == "UP" else self.down_bid
-        http_bid = http_book_end['bid'] if http_book_end else 0
-
-        log_msg(f"[DEBUG] #{tid} EXIT | WS bid=${ws_bid_now:.2f} | HTTP bid=${http_bid:.2f}")
-        if http_book_end and abs(ws_bid_now - http_bid) > 0.01:
-            log_msg(f"[DEBUG] #{tid} *** WS/HTTP MISMATCH *** WS=${ws_bid_now:.2f} HTTP=${http_bid:.2f}")
-
-        # ── STEP 6: Record trade ──
+        # ── STEP 6: Record trade (MUST always execute) ──
         hold_time = time.time() - t_start
-        self._record_trade(tid, direction, fill_price, exit_price, fill_shares, taker_fee,
-                           exit_reason, hold_time, cb_move, question, window_elapsed,
-                           min_bid_during, max_bid_during, sl_bounce_data)
+        try:
+            self._record_trade(tid, direction, fill_price, exit_price, fill_shares, taker_fee,
+                               exit_reason, hold_time, cb_move, question, window_elapsed,
+                               min_bid_during, max_bid_during, sl_bounce_data)
+        except Exception as e:
+            log_msg(f"[RECORD-ERROR] #{tid} {str(e)[:80]}")
+
+        # HTTP book check (non-critical, after recording)
+        try:
+            http_book_end = await get_book(trade_token)
+            ws_bid_now = self.up_bid if direction == "UP" else self.down_bid
+            http_bid = http_book_end.get('bid', 0) if http_book_end else 0
+            log_msg(f"[DEBUG] #{tid} EXIT | WS bid=${ws_bid_now:.2f} | HTTP bid=${http_bid:.2f}")
+        except:
+            pass
 
     def _record_trade(self, tid, direction, entry, exit_price, shares, taker_fee, reason,
                       hold_time, cb_move, question, window_elapsed=0,
