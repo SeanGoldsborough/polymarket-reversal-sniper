@@ -65,3 +65,26 @@
   Data shows 100% of BE bounces within 180s. Earlier exit should prevent
   catastrophic force-exit losses that account for all V4 losses.
 - V4 original stopped after 580 trades of validation.
+
+## 2026-05-17
+- **V4-LIVE first deployment** — 10 shares, real money. First trade: buy filled but TP failed
+  (token not settled on-chain). Trade exited at BE via hold-until-BE logic. Lost $4.40 on
+  earlier V4-LIVE (0.1) from partial fill bug (Bug 1).
+- **V4-LIVE-0.2 deployed** — All 12 bugs fixed:
+  - Bug 1: Partial fills detected (any matched > 0), post-cancel recheck, wallet safety
+  - Bug 2/3: Cancel verification via post-cancel recheck
+  - Bug 4: All bare except:pass replaced with error logging
+  - Bug 5: Sell failures retry with FAK at progressively lower prices
+  - Bug 7: TP order re-verified in monitoring loop, re-placed if cancelled by exchange
+  - Bug 8: Balance allowance retries 3x with verification
+  - Bug 9: Websocket staleness detection (10s) + HTTP fallback for bid data
+  - Bug 10: Orphaned order cleanup on startup
+  - Bug 11: HTTP debug wrapped safely
+  - Bug 12: Force-exit at T+180 instead of T+295
+- **TP placement fix** — Pre-approve both tokens at window start. TP retries every 100ms
+  during 1-3s settlement. Monitors price via websocket during settlement — if price hits
+  TP before order is placed, sells manually via FOK. No more blocking gaps.
+- **V4-180 paper test** running alongside (same as V4 but T+180 force-exit)
+- **V5 fixed** — taker_fee init, try/finally on in_trade, recording trades correctly.
+  Paper fill logic relaxed (bid within $0.01 = fill).
+- Wallet: $66.65 → $70.68 (partial recovery from first trade BE exit)
