@@ -676,34 +676,54 @@ class BTCScalpBot:
                 f"TP ${tp_price:.2f} | SL ${sl_price:.2f}")
 
         # ── STEP 3: Pre-approve token for selling (CRITICAL for all sells) ──
+        # Must wait for fill to settle on-chain before approval works
         if self.client and not PAPER_MODE:
             token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
             approved = False
-            for attempt in range(3):
+            for attempt in range(10):  # Up to 5 seconds (10 x 0.5s)
                 try:
                     params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
                                                    signature_type=SIGNATURE_TYPE)
                     self.client.update_balance_allowance(params)
-                    approved = True
-                    break
+                    # Verify the allowance is actually set by checking balance
+                    result = self.client.get_balance_allowance(params)
+                    bal = int(result.get("balance", "0"))
+                    if bal > 0:
+                        approved = True
+                        log_msg(f"[APPROVE] #{tid} Token approved (balance={bal}, attempt {attempt+1})")
+                        break
+                    else:
+                        log_msg(f"[APPROVE-WAIT] #{tid} Balance still 0, waiting for settlement (attempt {attempt+1})")
                 except Exception as e:
                     log_msg(f"[APPROVE-FAIL] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
-                    await asyncio.sleep(0.5)
+                await asyncio.sleep(0.5)
             if not approved:
-                log_msg(f"[APPROVE-FAIL] #{tid} CRITICAL — all 3 attempts failed, sells may fail")
+                log_msg(f"[APPROVE-FAIL] #{tid} CRITICAL — token not approved after 10 attempts, sells will fail")
 
-        # ── STEP 4: Place GTC TP sell ──
+        # ── STEP 4: Place GTC TP sell (retry until placed) ──
         tp_order_id = None
         if self.client and not PAPER_MODE:
-            try:
-                token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
-                args = OrderArgs(price=tp_price, size=int(fill_shares), side=SELL, token_id=token_id)
-                signed = self.client.create_order(args)
-                resp = self.client.post_order(signed, OrderType.GTC)
-                tp_order_id = resp.get("orderID", "")
-                log_msg(f"[TP] #{tid} GTC sell {int(fill_shares)}sh @ ${tp_price:.2f} order={tp_order_id[:10]}...")
-            except Exception as e:
-                log_msg(f"[TP] #{tid} FAILED: {str(e)[:80]}")
+            token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
+            for tp_attempt in range(5):
+                try:
+                    # Re-approve before each attempt
+                    try:
+                        params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
+                                                       signature_type=SIGNATURE_TYPE)
+                        self.client.update_balance_allowance(params)
+                    except:
+                        pass
+                    args = OrderArgs(price=tp_price, size=int(fill_shares), side=SELL, token_id=token_id)
+                    signed = self.client.create_order(args)
+                    resp = self.client.post_order(signed, OrderType.GTC)
+                    tp_order_id = resp.get("orderID", "")
+                    log_msg(f"[TP] #{tid} GTC sell {int(fill_shares)}sh @ ${tp_price:.2f} order={tp_order_id[:10]}... (attempt {tp_attempt+1})")
+                    break
+                except Exception as e:
+                    log_msg(f"[TP-FAIL] #{tid} Attempt {tp_attempt+1}: {str(e)[:80]}")
+                    await asyncio.sleep(1.0)  # Wait for settlement
+            if not tp_order_id:
+                log_msg(f"[TP-FAIL] #{tid} CRITICAL — could not place TP after 5 attempts")
         else:
             await asyncio.sleep(PAPER_LATENCY)  # TP placement latency
             log_msg(f"[PAPER-TP] #{tid} GTC sell {int(fill_shares)}sh @ ${tp_price:.2f}")
