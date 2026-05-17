@@ -564,19 +564,21 @@ class BTCScalpBot:
         fill_price = entry_price
         fill_shares = 0
 
-        for check in range(FILL_TIMEOUT * 4):  # Check every 0.25s for finer granularity
+        for check in range(FILL_TIMEOUT * 4):  # Check every 0.25s
             if self.client and not PAPER_MODE and buy_order_id:
                 try:
                     order = self.client.get_order(buy_order_id)
                     if order:
                         matched = float(order.get("size_matched", 0))
-                        if matched >= SHARES_PER_TRADE:
+                        if matched > 0:
                             fill_price = float(order.get("price", entry_price))
                             fill_shares = matched
                             filled = True
+                            if matched < SHARES_PER_TRADE:
+                                log_msg(f"[PARTIAL-FILL] #{tid} {matched:.0f}/{SHARES_PER_TRADE}sh filled — proceeding with partial")
                             break
-                except:
-                    pass
+                except Exception as e:
+                    log_msg(f"[FILL-CHECK-ERR] #{tid} {str(e)[:60]}")
             else:
                 current_bid = self.up_bid if direction == "UP" else self.down_bid
                 current_ask = self.up_ask if direction == "UP" else self.down_ask
@@ -597,18 +599,51 @@ class BTCScalpBot:
             await asyncio.sleep(0.25)
 
         if not filled:
+            # Cancel unfilled order
             if self.client and not PAPER_MODE and buy_order_id:
                 try:
                     self.client.cancel_orders([buy_order_id])
-                except:
-                    pass
+                except Exception as e:
+                    log_msg(f"[CANCEL-ERR] #{tid} {str(e)[:60]}")
+
+                # CRITICAL: Check one more time if shares were filled before/during cancel
+                await asyncio.sleep(0.1)
+                try:
+                    order = self.client.get_order(buy_order_id)
+                    if order:
+                        final_matched = float(order.get("size_matched", 0))
+                        if final_matched > 0:
+                            fill_price = float(order.get("price", entry_price))
+                            fill_shares = final_matched
+                            filled = True
+                            log_msg(f"[LATE-FILL] #{tid} {final_matched:.0f}sh filled after cancel attempt — managing position")
+                except Exception as e:
+                    log_msg(f"[LATE-FILL-CHECK-ERR] #{tid} {str(e)[:60]}")
+
+                # SAFETY: Verify wallet balance changed
+                if not filled:
+                    try:
+                        params = BalanceAllowanceParams(asset_type="COLLATERAL", token_id="", signature_type=2)
+                        result = self.client.get_balance_allowance(params)
+                        current_bal = int(result.get("balance", "0")) / 1_000_000
+                        expected_cost = SHARES_PER_TRADE * entry_price
+                        if current_bal < self.bankroll - expected_cost * 0.5:
+                            log_msg(f"[WALLET-ALERT] #{tid} Balance ${current_bal:.2f} dropped from ${self.bankroll:.2f} — shares may have filled!")
+                            # Try to find and manage the position
+                            fill_shares = SHARES_PER_TRADE
+                            fill_price = entry_price
+                            filled = True
+                    except:
+                        pass
             else:
-                await asyncio.sleep(PAPER_LATENCY)  # Cancel latency
-            self.fill_timeout_count += 1
-            log_msg(f"[UNFILL] #{tid} No fill after {FILL_TIMEOUT}s — cancelled")
-            self._record_trade(tid, direction, entry_price, entry_price, 0, 0, "UNFILLED",
-                               0, cb_move, question, window_elapsed)
-            return
+                await asyncio.sleep(PAPER_LATENCY)
+
+            if not filled:
+                self.fill_timeout_count += 1
+                log_msg(f"[UNFILL] #{tid} No fill after {FILL_TIMEOUT}s — confirmed cancelled")
+                self._record_trade(tid, direction, entry_price, entry_price, 0, 0, "UNFILLED",
+                                   0, cb_move, question, window_elapsed)
+                return
 
         # Recalculate TP/SL based on actual fill price
         tp_price = snap_price(fill_price + TP_OFFSET)
@@ -618,15 +653,22 @@ class BTCScalpBot:
         log_msg(f"[FILL] #{tid} {fill_shares:.0f}sh @ ${fill_price:.2f} in {fill_time:.1f}s | "
                 f"TP ${tp_price:.2f} | SL ${sl_price:.2f}")
 
-        # ── STEP 3: Pre-approve token for selling ──
+        # ── STEP 3: Pre-approve token for selling (CRITICAL for all sells) ──
         if self.client and not PAPER_MODE:
-            try:
-                token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
-                params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
-                                               signature_type=SIGNATURE_TYPE)
-                self.client.update_balance_allowance(params)
-            except:
-                pass
+            token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
+            approved = False
+            for attempt in range(3):
+                try:
+                    params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
+                                                   signature_type=SIGNATURE_TYPE)
+                    self.client.update_balance_allowance(params)
+                    approved = True
+                    break
+                except Exception as e:
+                    log_msg(f"[APPROVE-FAIL] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
+                    await asyncio.sleep(0.5)
+            if not approved:
+                log_msg(f"[APPROVE-FAIL] #{tid} CRITICAL — all 3 attempts failed, sells may fail")
 
         # ── STEP 4: Place GTC TP sell ──
         tp_order_id = None
@@ -663,10 +705,13 @@ class BTCScalpBot:
 
         # Also fetch book via HTTP at start and end of trade for ground truth comparison
         trade_token = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
-        http_book_start = await get_book(trade_token)
-        if http_book_start:
-            log_msg(f"[DEBUG] #{tid} HTTP book at entry: bid=${http_book_start['bid']:.2f} ask=${http_book_start['ask']:.2f} | "
-                    f"WS bid=${self.up_bid if direction == 'UP' else self.down_bid:.2f}")
+        try:
+            http_book_start = await get_book(trade_token)
+            if http_book_start:
+                log_msg(f"[DEBUG] #{tid} HTTP book at entry: bid=${http_book_start.get('bid',0):.2f} ask=${http_book_start.get('ask',0):.2f} | "
+                        f"WS bid=${self.up_bid if direction == 'UP' else self.down_bid:.2f}")
+        except:
+            pass
 
         ws_updates_during_trade = 0
 
@@ -732,15 +777,33 @@ class BTCScalpBot:
                         pass
                 current_bid = self.up_bid if direction == "UP" else self.down_bid
                 if self.client and not PAPER_MODE:
+                    token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
+                    # Re-approve before sell
                     try:
-                        token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
-                        sell_p = snap_price(current_bid - 0.01)
-                        args = OrderArgs(price=sell_p, size=int(fill_shares), side=SELL, token_id=token_id)
-                        signed = self.client.create_order(args)
-                        self.client.post_order(signed, OrderType.FOK)
-                        exit_price = sell_p
-                    except Exception as e:
-                        log_msg(f"[FORCE-EXIT] #{tid} Sell failed: {str(e)[:60]}")
+                        params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
+                                                       signature_type=SIGNATURE_TYPE)
+                        self.client.update_balance_allowance(params)
+                    except:
+                        pass
+                    # Try FOK, then FAK, then lower price — must sell
+                    sold = False
+                    for sell_attempt in range(3):
+                        try:
+                            sell_p = snap_price(current_bid - 0.01 * (sell_attempt + 1))
+                            if sell_p < 0.01:
+                                sell_p = 0.01
+                            args = OrderArgs(price=sell_p, size=int(fill_shares), side=SELL, token_id=token_id)
+                            signed = self.client.create_order(args)
+                            self.client.post_order(signed, OrderType.FAK)
+                            exit_price = sell_p
+                            sold = True
+                            log_msg(f"[FORCE-EXIT] #{tid} Sold @ ${sell_p:.2f} (attempt {sell_attempt+1})")
+                            break
+                        except Exception as e:
+                            log_msg(f"[FORCE-EXIT] #{tid} Sell attempt {sell_attempt+1} failed: {str(e)[:60]}")
+                            current_bid = self.up_bid if direction == "UP" else self.down_bid
+                    if not sold:
+                        log_msg(f"[FORCE-EXIT-FAIL] #{tid} CRITICAL — could not sell {int(fill_shares)}sh, holding to resolution")
                         exit_price = current_bid
                 else:
                     await asyncio.sleep(PAPER_LATENCY)  # Cancel + sell latency
@@ -840,10 +903,23 @@ class BTCScalpBot:
                             try:
                                 args = OrderArgs(price=fill_price, size=int(fill_shares), side=SELL, token_id=token_id)
                                 signed = self.client.create_order(args)
-                                self.client.post_order(signed, OrderType.FOK)
+                                resp = self.client.post_order(signed, OrderType.FOK)
                                 exit_price = fill_price
-                            except:
-                                exit_price = fill_price
+                                log_msg(f"[SL-BE-SELL] #{tid} FOK sell placed @ ${fill_price:.2f}")
+                            except Exception as e:
+                                log_msg(f"[SL-BE-SELL-FAIL] #{tid} FOK failed: {str(e)[:60]} — retrying as FAK")
+                                # Retry with FAK at lower price
+                                try:
+                                    _bid = self.up_bid if direction == "UP" else self.down_bid
+                                    sell_p = snap_price(_bid - 0.01) if _bid > 0.01 else 0.01
+                                    args = OrderArgs(price=sell_p, size=int(fill_shares), side=SELL, token_id=token_id)
+                                    signed = self.client.create_order(args)
+                                    self.client.post_order(signed, OrderType.FAK)
+                                    exit_price = sell_p
+                                    log_msg(f"[SL-BE-FAK] #{tid} FAK retry @ ${sell_p:.2f}")
+                                except Exception as e2:
+                                    log_msg(f"[SL-BE-FAK-FAIL] #{tid} FAK also failed: {str(e2)[:60]}")
+                                    exit_price = fill_price
                         else:
                             exit_price = fill_price
                             taker_fee = calc_taker_fee(fill_price, fill_shares)
