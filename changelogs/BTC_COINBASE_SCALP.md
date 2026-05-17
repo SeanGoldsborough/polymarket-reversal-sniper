@@ -57,3 +57,11 @@
 - **V1, V2, V3 stopped** — final results: V1 -$26, V2 -$5, V3 +$11.
 - **REMINDER (V5)**: Option 3 volatility — track per-window reversal patterns across many
   windows to identify time-of-day trends.
+
+## 2026-05-17
+- **V4-LIVE: FIRST LIVE DEPLOYMENT** — V4 strategy with 10 shares, real money.
+  Based on 580 paper trades: 62% WR, +$225.67, $4.18/hr.
+- **V4-180: Paper test** — V4 with force-exit at T+180 instead of T+295.
+  Data shows 100% of BE bounces within 180s. Earlier exit should prevent
+  catastrophic force-exit losses that account for all V4 losses.
+- V4 original stopped after 580 trades of validation.
