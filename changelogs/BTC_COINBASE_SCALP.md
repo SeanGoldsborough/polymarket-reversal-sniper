@@ -93,6 +93,21 @@
   for settlement up to 3s. Added safe_sell() helper for all sell operations.
   MAX-HOLD sell cancels TP first, waits for shares to unlock, checks balance.
 
+## 2026-05-18
+- **Bug 3 REAL FIX** — Cancel verification was broken in production. Old code waited 100ms
+  and only checked `size_matched` — too fast for CLOB fill propagation. Cost $5.10 on
+  12:25AM trade (orphaned 10 DN shares held to worthless resolution). New code checks
+  order `status` field immediately after cancel: if status != cancelled/expired, treat as
+  filled and manage position. Wallet balance check as final safety net. No delays added.
+- **On-chain reconciliation** — CSV vs bot data revealed bot reported +$4.71 but wallet
+  shows -$12.16 total (-$2.88 post-restart at 9:45PM). 3 major losses identified:
+  - 12:25AM -$5.10: Bug 3 (orphaned position) — NOW FIXED
+  - 3:15AM -$3.36: Hold-until-BE force-exit at $0.20
+  - 5:15AM -$3.15: Hold-until-BE force-exit at $0.06
+- **Hold-until-BE analysis** — 35 SL-triggered trades: 32 recovered (91%), 3 force-exited.
+  Entry gap does NOT predict failure. Hold strategy nets -$7.67 vs -$7.00 for simple SL.
+  Under review.
+
 ### V4-LIVE-0.2 vs V4 Paper — Strategy Comparison
 
 | Feature | V4 Paper | V4-LIVE-0.2 |
