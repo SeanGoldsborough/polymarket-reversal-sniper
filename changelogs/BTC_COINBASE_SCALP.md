@@ -107,6 +107,13 @@
 - **Hold-until-BE analysis** — 35 SL-triggered trades: 32 recovered (91%), 3 force-exited.
   Entry gap does NOT predict failure. Hold strategy nets -$7.67 vs -$7.00 for simple SL.
   Under review.
+- **Dynamic SL deployed (9:58AM, commit 69271a1)** — Exit hold if bid drops >$0.05 below
+  entry. Intended to cut the rare $0.80-$1.00 cliff losses while keeping 91% BE recoveries.
+- **Dynamic SL REVERTED (11:20AM, commit 9b5553a)** — 80min live: 6 trades, 1W/4L/1F, bank
+  $57.15 → $50.85 (DD 23.6%). Dyn-SL fired on 3 normal hold-to-BE scenarios and sold into
+  thin liquidity at $0.07-$0.08 below entry, converting -$0.20 SL events into -$0.70 to
+  -$0.80 slippage losses. The thesis was wrong: when bid drops $0.05 fast, the book is
+  too thin for clean exit. Kept cancel-status case-sensitivity fix from same commit.
 
 ### V4-LIVE-0.2 vs V4 Paper — Strategy Comparison
 
