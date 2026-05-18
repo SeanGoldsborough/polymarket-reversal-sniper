@@ -1041,23 +1041,42 @@ class BTCScalpBot:
                     if tp_order_id:
                         try:
                             self.client.cancel_orders([tp_order_id])
-                            await asyncio.sleep(0.3)  # let shares unlock
                         except Exception as _e:
                             log_msg(f"[WARN] Cancel TP: {str(_e)[:60]}")
-                    try:
-                        params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
-                                                       signature_type=SIGNATURE_TYPE)
-                        self.client.update_balance_allowance(params)
-                    except Exception as _e:
-                        log_msg(f"[WARN] approve: {str(_e)[:60]}")
-                    try:
-                        args = OrderArgs(price=fill_price, size=int(fill_shares), side=SELL, token_id=token_id)
-                        signed = self.client.create_order(args)
-                        resp = self.client.post_order(signed, OrderType.GTC)
-                        be_order_id = resp.get("orderID", "")
-                        log_msg(f"[BE-MAKER] #{tid} GTC sell {int(fill_shares)}sh @ ${fill_price:.2f} order={be_order_id[:10]}...")
-                    except Exception as e:
-                        log_msg(f"[BE-MAKER-FAIL] #{tid} {str(e)[:60]}")
+
+                    # Poll balance until shares unlock from cancelled TP (up to 3s)
+                    available = 0
+                    for _wait_attempt in range(30):
+                        try:
+                            params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
+                                                           signature_type=SIGNATURE_TYPE)
+                            self.client.update_balance_allowance(params)
+                        except Exception:
+                            pass
+                        available = get_token_balance(self.client, token_id)
+                        if available >= fill_shares:
+                            break
+                        await asyncio.sleep(0.1)
+                    if available < fill_shares:
+                        log_msg(f"[BE-MAKER-WAIT] #{tid} Only {available:.1f}/{int(fill_shares)}sh unlocked after 3s — placing for available")
+
+                    # Place BE maker with one retry on failure (transient API errors)
+                    sell_shares = max(1, int(min(available, fill_shares)) if available >= 1 else int(fill_shares))
+                    for _be_attempt in range(2):
+                        try:
+                            args = OrderArgs(price=fill_price, size=sell_shares, side=SELL, token_id=token_id)
+                            signed = self.client.create_order(args)
+                            resp = self.client.post_order(signed, OrderType.GTC)
+                            be_order_id = resp.get("orderID", "")
+                            log_msg(f"[BE-MAKER] #{tid} GTC sell {sell_shares}sh @ ${fill_price:.2f} order={be_order_id[:10]}... (attempt {_be_attempt+1})")
+                            break
+                        except Exception as e:
+                            log_msg(f"[BE-MAKER-FAIL] #{tid} attempt {_be_attempt+1}: {str(e)[:80]}")
+                            if _be_attempt == 0:
+                                await asyncio.sleep(0.5)
+                                # Re-check balance — might have unlocked since
+                                available = get_token_balance(self.client, token_id)
+                                sell_shares = max(1, int(min(available, fill_shares)) if available >= 1 else int(fill_shares))
 
                 # ── Race loop: BE fill | $0.08 drop | Mode A CB | T+150 deadline ──
                 hedge_fired = False

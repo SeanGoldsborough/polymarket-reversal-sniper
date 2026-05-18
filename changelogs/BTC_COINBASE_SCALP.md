@@ -133,6 +133,14 @@
     estimated savings +$30.73 even with conservative spread assumptions.
   - Tradeoff: TP-BOUNCE (+$0.40 wins) goes to $0 because TP gets cancelled on SL trigger.
     Estimated cost: -$6 across 15 historical TP-BOUNCE trades. Net positive vs hedge gain.
+- **V4-LIVE-0.3.1 — Fix BE-MAKER place failure** — First live trade after 0.3 deploy hit
+  `not enough balance / allowance: balance: 0` when trying to place the BE GTC after
+  cancelling TP. Polymarket needs more than the 0.3s sleep to release the share lock
+  after a TP cancel. Fix: poll get_token_balance() up to 3s waiting for shares to
+  unlock (same pattern the TP-placement code already uses), then place BE maker with
+  one retry on failure. Without this fix, every SL-triggered trade falls through to
+  the hedge fallback instead of getting the free BE recovery — costing ~$0.90 per
+  trade that would have recovered to BE.
 
 ### V4-LIVE-0.2 vs V4 Paper — Strategy Comparison
 
