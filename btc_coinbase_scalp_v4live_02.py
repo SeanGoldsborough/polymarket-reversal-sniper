@@ -1037,6 +1037,7 @@ class BTCScalpBot:
 
                 # ── Cancel TP, place persistent maker GTC at entry (BE order) ──
                 be_order_id = None
+                tp_already_filled = False
                 if self.client and not PAPER_MODE:
                     if tp_order_id:
                         try:
@@ -1044,6 +1045,28 @@ class BTCScalpBot:
                         except Exception as _e:
                             log_msg(f"[WARN] Cancel TP: {str(_e)[:60]}")
 
+                        # CRITICAL: verify whether TP actually filled before cancel landed
+                        # (race condition where SL+TP-fill happen in same WS tick)
+                        try:
+                            order = self.client.get_order(tp_order_id)
+                            if order and float(order.get("size_matched", 0)) >= fill_shares:
+                                exit_price = tp_price
+                                exit_reason = "TP-BOUNCE"
+                                taker_fee = 0
+                                elapsed = time.time() - trade_start
+                                log_msg(f"[TP-RACE-WIN] #{tid} TP at ${tp_price:.2f} filled before cancel landed — exiting as TP-BOUNCE +${(tp_price-fill_price)*fill_shares:.2f}")
+                                self.be_triggered = None
+                                self.active_be_price = 0
+                                exited = True
+                                tp_already_filled = True
+                        except Exception as _e:
+                            log_msg(f"[WARN] TP race check: {str(_e)[:60]}")
+
+                if tp_already_filled:
+                    # TP succeeded mid-cancel — skip the entire BE+hedge flow
+                    break
+
+                if self.client and not PAPER_MODE:
                     # Poll balance until shares unlock from cancelled TP (up to 3s)
                     available = 0
                     for _wait_attempt in range(30):
@@ -1138,6 +1161,24 @@ class BTCScalpBot:
                         hedge_reason = "DEADLINE"
 
                     if hedge_reason and not hedge_fired:
+                        # CRITICAL: before hedging, verify we still hold our entry shares.
+                        # If BE maker filled OR TP filled mid-race, we no longer own the position
+                        # and a hedge buy would become an unintended directional bet.
+                        if self.client and not PAPER_MODE:
+                            current_balance = get_token_balance(self.client, token_id)
+                            if current_balance < 1:
+                                # Our shares are gone — BE maker or TP must have filled
+                                # Treat as SL-BE recovery (we got out at entry or better)
+                                exit_price = fill_price
+                                exit_reason = "SL-BE"
+                                taker_fee = 0
+                                elapsed = time.time() - trade_start
+                                log_msg(f"[BE-SILENT-FILL] #{tid} Shares gone before hedge ({hedge_reason}) — BE/TP filled, exiting as SL-BE after {elapsed:.1f}s")
+                                self.be_triggered = None
+                                self.active_be_price = 0
+                                exited = True
+                                break
+
                         hedge_cost_per_share = fill_price + opp_ask - 1.0
                         if opp_ask <= 0 or hedge_cost_per_share > MAX_HEDGE_COST:
                             log_msg(f"[HEDGE-SKIP] #{tid} {hedge_reason} | opp_ask=${opp_ask:.2f} hedge_cost=${hedge_cost_per_share:.2f}/sh > ${MAX_HEDGE_COST} — fallthrough to force-exit")

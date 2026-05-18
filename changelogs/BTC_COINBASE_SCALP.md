@@ -141,6 +141,17 @@
   one retry on failure. Without this fix, every SL-triggered trade falls through to
   the hedge fallback instead of getting the free BE recovery — costing ~$0.90 per
   trade that would have recovered to BE.
+- **V4-LIVE-0.3.2 — Fix TP-race + accidental directional hedge** — Polymarket on-chain
+  CSV revealed that trade #1's TP at $0.56 actually filled before the bot's cancel
+  command landed, but the bot didn't detect the fill and proceeded to hedge — turning a
+  clean +$4.80 win (recorded as -$0.90 hedge) into an unintended directional bet on
+  the opposite side that happened to win. On a reversing market this could equally
+  have produced -$5+ instead.
+  Two fixes:
+  1. After cancelling TP on SL trigger, call get_order(tp_order_id) — if size_matched
+     >= fill_shares, TP filled mid-cancel. Exit as TP-BOUNCE, skip BE-MAKER and hedge.
+  2. Before placing hedge buy, call get_token_balance() on our token. If 0, our
+     position already exited via BE-MAKER fill or TP. Exit as SL-BE, don't hedge.
 
 ### V4-LIVE-0.2 vs V4 Paper — Strategy Comparison
 
