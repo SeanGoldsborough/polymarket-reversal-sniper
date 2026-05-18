@@ -88,3 +88,30 @@
 - **V5 fixed** — taker_fee init, try/finally on in_trade, recording trades correctly.
   Paper fill logic relaxed (bid within $0.01 = fill).
 - Wallet: $66.65 → $70.68 (partial recovery from first trade BE exit)
+- **V4-LIVE-0.2 settlement fix** — TP placement now checks actual on-chain token
+  balance via get_token_balance() instead of assuming fill_shares available. Waits
+  for settlement up to 3s. Added safe_sell() helper for all sell operations.
+  MAX-HOLD sell cancels TP first, waits for shares to unlock, checks balance.
+
+### V4-LIVE-0.2 vs V4 Paper — Strategy Comparison
+
+| Feature | V4 Paper | V4-LIVE-0.2 |
+|---|---|---|
+| Mode | Paper (simulated) | LIVE (real money) |
+| Shares | 69 | 10 |
+| TP offset | +$0.04 | +$0.04 |
+| SL offset | -$0.02 | -$0.02 |
+| SL behavior | Hold until BE | Hold until BE |
+| Force-exit | T+295 (5s before end) | T+180 (120s before end) |
+| Fill detection | Simulated (ask <= entry) | Real API (get_order + partial fill detection) |
+| Token settlement | Instant (simulated) | 1-3s delay, checks actual balance |
+| TP placement | Instant | Retries every 100ms until settled, monitors price during wait |
+| Manual TP | N/A | If price hits TP during settlement, FOK sells immediately |
+| Pre-approval | N/A | Both tokens pre-approved at window start |
+| Sell verification | Simulated | Checks actual balance, cancels TP to free locked shares |
+| Sell retries | N/A | 3 attempts at progressively lower prices |
+| Balance safety | N/A | Wallet balance check after unfilled trades |
+| Orphan cleanup | N/A | Checks for orphaned orders on startup |
+| WS staleness | N/A | HTTP fallback if no WS update for 10s |
+| Error handling | except: pass | All errors logged with [WARN] |
+| TP re-verify | N/A | Re-places TP if cancelled by exchange |
