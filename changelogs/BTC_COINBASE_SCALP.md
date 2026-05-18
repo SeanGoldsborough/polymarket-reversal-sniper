@@ -114,6 +114,25 @@
   thin liquidity at $0.07-$0.08 below entry, converting -$0.20 SL events into -$0.70 to
   -$0.80 slippage losses. The thesis was wrong: when bid drops $0.05 fast, the book is
   too thin for clean exit. Kept cancel-status case-sensitivity fix from same commit.
+- **V4-LIVE-0.3 — Persistent BE maker + hedge mechanism** — Major rewrite of SL recovery path:
+  - Root cause found: 100% of force-exit trades had bid TOUCH entry during hold but failed
+    to fill. The cancel-TP → place-FOK round-trip (~200-350ms) was too slow to catch brief
+    bid touches at entry. Original V4 design assumed 100% recovery; live data shows ~87%.
+  - New flow: on SL trigger, cancel TP and place persistent GTC maker SELL at entry
+    (sits in queue, captures any future bid touch). No round-trip latency.
+  - Hedge fallback when BE maker won't fill:
+    - `CLIFF`: bid drops to entry - $0.08 (data: recovery rate 89% → 29% at this depth)
+    - `MODE-A`: BTC moves $50+ adverse from fill within 90s (catches trend-against-us early)
+    - `DEADLINE`: T+150 since fill with no BE recovery
+  - Hedge mechanism: buy opposite token at ask. UP+DOWN always sums to $1 at resolution,
+    so cost basis = entry + opp_ask, redemption guaranteed = $1. Net loss bounded to
+    ~$0.10-$0.20 per share (the spread/fee), vs $0.30-$0.50 from FAK ladder dump.
+  - Safety: hedge skipped if cost per share > $0.20 (opposite side too wide), falls
+    through to legacy force-exit FAK.
+  - Counterfactual on 14 historical force-exits: dump P&L -$47.73 → hedge P&L -$17.00,
+    estimated savings +$30.73 even with conservative spread assumptions.
+  - Tradeoff: TP-BOUNCE (+$0.40 wins) goes to $0 because TP gets cancelled on SL trigger.
+    Estimated cost: -$6 across 15 historical TP-BOUNCE trades. Net positive vs hedge gain.
 
 ### V4-LIVE-0.2 vs V4 Paper — Strategy Comparison
 

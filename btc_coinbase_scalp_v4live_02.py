@@ -100,6 +100,13 @@ ENTRY_WINDOW_SECONDS = 60   # Only trade in first 60 seconds of window
 CUTOFF_BEFORE_END = 20      # No new trades within 20s of window end
 FORCE_EXIT_BEFORE_END = 120 # Force exit at T+180 — exit while token still mid-range, not $0.01
 
+# BE-recovery + hedge mechanics (added 2026-05-18)
+POINT_OF_NO_RETURN = 0.08   # Hedge if bid drops this far below entry (data: recovery rate 89%->29% at this depth)
+MODE_A_THRESHOLD = 50.0     # CB-USD adverse move from fill triggers hedge (catches trend-against-us early)
+MODE_A_WINDOW = 90.0        # Seconds after fill within which Mode A trigger is valid
+HEDGE_DEADLINE = 150.0      # Seconds after fill: if BE recovery hasn't fired by now, hedge as fallback
+MAX_HEDGE_COST = 0.20       # Skip hedge if (entry + opp_ask - 1) > this — opposite side too expensive
+
 # Paper simulation
 PAPER_LATENCY = 0.050       # 50ms simulated execution latency (actual API benchmarked at 22-50ms)
 PAPER_TAKER_FEE_MULT = 0.022  # ~2.2% of min(price, 1-price) for taker orders
@@ -748,6 +755,10 @@ class BTCScalpBot:
         log_msg(f"[FILL] #{tid} {fill_shares:.0f}sh @ ${fill_price:.2f} in {fill_time:.1f}s | "
                 f"TP ${tp_price:.2f} | SL ${sl_price:.2f}")
 
+        # Capture fill moment for Mode A CB-divergence tracking + hedge deadline
+        fill_actual_time = time.time()
+        btc_at_fill = self.cb_price
+
         # ── STEP 3+4: Wait for settlement, place TP, monitor price simultaneously ──
         tp_order_id = None
         tp_shares = 0  # Actual shares we placed TP for
@@ -1016,120 +1027,156 @@ class BTCScalpBot:
             sl_hit = self.sl_triggered.is_set() or (current_bid <= sl_price and sl_price > 0.01)
             if sl_hit:
                 trigger_bid = current_bid
-                log_msg(f"[SL-TRIGGER] #{tid} Bid ${current_bid:.2f} <= SL ${sl_price:.2f} — holding for BE/TP, no time limit")
+                log_msg(f"[SL-TRIGGER] #{tid} Bid ${current_bid:.2f} <= SL ${sl_price:.2f} — switching to BE-maker mode")
 
-                # Activate BE event trigger
                 self.be_triggered = asyncio.Event()
                 self.active_be_price = fill_price
                 token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
-
-                # HOLD UNTIL BE OR TP — only exit at BE, TP, or force-exit before resolution
+                opp_token_id = self.mf.market["down"] if direction == "UP" else self.mf.market["up"]
                 sl_bounce_data = {"trigger_bid": trigger_bid}
 
-                while time.time() < window_end - FORCE_EXIT_BEFORE_END:
-                    try:
-                        await asyncio.wait_for(self.be_triggered.wait(), timeout=0.05)
-                    except asyncio.TimeoutError:
-                        # Check websocket staleness — fallback to HTTP if stale
-                        if self.poly_ws_last_update > 0 and time.time() - self.poly_ws_last_update > 10:
-                            log_msg(f"[WS-STALE] #{tid} No WS update for {time.time() - self.poly_ws_last_update:.0f}s — HTTP fallback")
-                            http_book = await get_book(trade_token)
-                            if http_book:
-                                _http_bid = http_book.get("bid", 0)
-                                if direction == "UP":
-                                    self.up_bid = _http_bid
-                                else:
-                                    self.down_bid = _http_bid
-                                if _http_bid >= fill_price:
-                                    self.be_triggered.set()
-                        pass
-
-                    # TP filled? (still on book)
-                    if self.client and not PAPER_MODE and tp_order_id:
+                # ── Cancel TP, place persistent maker GTC at entry (BE order) ──
+                be_order_id = None
+                if self.client and not PAPER_MODE:
+                    if tp_order_id:
                         try:
-                            order = self.client.get_order(tp_order_id)
+                            self.client.cancel_orders([tp_order_id])
+                            await asyncio.sleep(0.3)  # let shares unlock
+                        except Exception as _e:
+                            log_msg(f"[WARN] Cancel TP: {str(_e)[:60]}")
+                    try:
+                        params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
+                                                       signature_type=SIGNATURE_TYPE)
+                        self.client.update_balance_allowance(params)
+                    except Exception as _e:
+                        log_msg(f"[WARN] approve: {str(_e)[:60]}")
+                    try:
+                        args = OrderArgs(price=fill_price, size=int(fill_shares), side=SELL, token_id=token_id)
+                        signed = self.client.create_order(args)
+                        resp = self.client.post_order(signed, OrderType.GTC)
+                        be_order_id = resp.get("orderID", "")
+                        log_msg(f"[BE-MAKER] #{tid} GTC sell {int(fill_shares)}sh @ ${fill_price:.2f} order={be_order_id[:10]}...")
+                    except Exception as e:
+                        log_msg(f"[BE-MAKER-FAIL] #{tid} {str(e)[:60]}")
+
+                # ── Race loop: BE fill | $0.08 drop | Mode A CB | T+150 deadline ──
+                hedge_fired = False
+                while time.time() < window_end - FORCE_EXIT_BEFORE_END:
+                    await asyncio.sleep(0.5)  # poll every 500ms
+
+                    # WS staleness fallback
+                    if self.poly_ws_last_update > 0 and time.time() - self.poly_ws_last_update > 10:
+                        log_msg(f"[WS-STALE] #{tid} No WS update for {time.time() - self.poly_ws_last_update:.0f}s — HTTP fallback")
+                        http_book = await get_book(trade_token)
+                        if http_book:
+                            _http_bid = http_book.get("bid", 0)
+                            if direction == "UP":
+                                self.up_bid = _http_bid
+                            else:
+                                self.down_bid = _http_bid
+
+                    current_bid = self.up_bid if direction == "UP" else self.down_bid
+                    opp_ask = self.down_ask if direction == "UP" else self.up_ask
+                    time_since_fill = time.time() - fill_actual_time
+
+                    # 1. BE maker filled?
+                    if self.client and not PAPER_MODE and be_order_id:
+                        try:
+                            order = self.client.get_order(be_order_id)
                             if order and float(order.get("size_matched", 0)) >= fill_shares:
-                                exit_price = tp_price
-                                exit_reason = "TP-BOUNCE"
+                                exit_price = fill_price
+                                exit_reason = "SL-BE"
                                 taker_fee = 0
-                                log_msg(f"[TP-BOUNCE] #{tid} TP filled while holding!")
+                                elapsed = time.time() - trade_start
+                                log_msg(f"[BE-MAKER-FILLED] #{tid} GTC filled @ ${fill_price:.2f} after {elapsed:.1f}s")
                                 self.be_triggered = None
                                 self.active_be_price = 0
                                 exited = True
                                 break
                         except Exception as _e:
-
-                            log_msg(f"[WARN] {str(_e)[:60]}")
-                    else:
-                        _bid = self.up_bid if direction == "UP" else self.down_bid
-                        if _bid >= tp_price:
-                            exit_price = tp_price
-                            exit_reason = "TP-BOUNCE"
+                            log_msg(f"[WARN] BE poll: {str(_e)[:60]}")
+                    elif PAPER_MODE:
+                        # Paper: BE fills when bid >= entry
+                        if current_bid >= fill_price:
+                            exit_price = fill_price
+                            exit_reason = "SL-BE"
                             taker_fee = 0
-                            log_msg(f"[PAPER-TP-BOUNCE] #{tid} TP filled while holding! bid=${_bid:.2f}")
                             self.be_triggered = None
                             self.active_be_price = 0
                             exited = True
                             break
 
-                    # BE event?
-                    if self.be_triggered.is_set():
-                        if self.client and not PAPER_MODE:
-                            if tp_order_id:
-                                try:
-                                    self.client.cancel_orders([tp_order_id])
-                                except Exception as _e:
+                    # 2/3/4. Hedge conditions
+                    hedge_reason = None
+                    if current_bid > 0 and (fill_price - current_bid) >= POINT_OF_NO_RETURN:
+                        hedge_reason = "CLIFF"  # bid dropped past point of no return
+                    elif self.cb_price > 0 and btc_at_fill > 0 and time_since_fill <= MODE_A_WINDOW:
+                        btc_move = self.cb_price - btc_at_fill
+                        adverse = (btc_move <= -MODE_A_THRESHOLD) if direction == "UP" else (btc_move >= MODE_A_THRESHOLD)
+                        if adverse:
+                            hedge_reason = "MODE-A"
+                    if not hedge_reason and time_since_fill >= HEDGE_DEADLINE:
+                        hedge_reason = "DEADLINE"
 
-                                    log_msg(f"[WARN] {str(_e)[:60]}")
+                    if hedge_reason and not hedge_fired:
+                        hedge_cost_per_share = fill_price + opp_ask - 1.0
+                        if opp_ask <= 0 or hedge_cost_per_share > MAX_HEDGE_COST:
+                            log_msg(f"[HEDGE-SKIP] #{tid} {hedge_reason} | opp_ask=${opp_ask:.2f} hedge_cost=${hedge_cost_per_share:.2f}/sh > ${MAX_HEDGE_COST} — fallthrough to force-exit")
+                            hedge_fired = True  # don't re-evaluate
+                            continue
+
+                        # Cancel BE maker to free up nothing (BE is a sell, no impact on USDC) but keep clean state
+                        if self.client and not PAPER_MODE and be_order_id:
                             try:
-                                params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
-                                                               signature_type=SIGNATURE_TYPE)
-                                self.client.update_balance_allowance(params)
+                                self.client.cancel_orders([be_order_id])
                             except Exception as _e:
+                                log_msg(f"[WARN] Cancel BE: {str(_e)[:60]}")
 
-                                log_msg(f"[WARN] {str(_e)[:60]}")
-                            try:
-                                args = OrderArgs(price=fill_price, size=int(fill_shares), side=SELL, token_id=token_id)
-                                signed = self.client.create_order(args)
-                                resp = self.client.post_order(signed, OrderType.FOK)
-                                exit_price = fill_price
-                                log_msg(f"[SL-BE-SELL] #{tid} FOK sell placed @ ${fill_price:.2f}")
-                            except Exception as e:
-                                log_msg(f"[SL-BE-SELL-FAIL] #{tid} FOK failed: {str(e)[:60]} — retrying as FAK")
-                                # Retry with FAK at lower price
+                        # Buy hedge on opposite side
+                        try:
+                            hedge_p = snap_price(opp_ask)
+                            if self.client and not PAPER_MODE:
+                                params = BalanceAllowanceParams(asset_type="COLLATERAL", token_id="",
+                                                               signature_type=SIGNATURE_TYPE)
                                 try:
-                                    _bid = self.up_bid if direction == "UP" else self.down_bid
-                                    sell_p = snap_price(_bid - 0.01) if _bid > 0.01 else 0.01
-                                    args = OrderArgs(price=sell_p, size=int(fill_shares), side=SELL, token_id=token_id)
-                                    signed = self.client.create_order(args)
-                                    self.client.post_order(signed, OrderType.FAK)
-                                    exit_price = sell_p
-                                    log_msg(f"[SL-BE-FAK] #{tid} FAK retry @ ${sell_p:.2f}")
-                                except Exception as e2:
-                                    log_msg(f"[SL-BE-FAK-FAIL] #{tid} FAK also failed: {str(e2)[:60]}")
-                                    exit_price = fill_price
-                        else:
-                            exit_price = fill_price
-                            taker_fee = calc_taker_fee(fill_price, fill_shares)
-                        elapsed = time.time() - trade_start
-                        exit_reason = "SL-BE"
-                        log_msg(f"[SL-BE] #{tid} Price returned to BE @ ${fill_price:.2f} after {elapsed:.1f}s")
-                        self.be_triggered = None
-                        self.active_be_price = 0
-                        exited = True
-                        break
+                                    self.client.update_balance_allowance(params)
+                                except Exception:
+                                    pass
+                                args = OrderArgs(price=hedge_p, size=int(fill_shares), side=BUY, token_id=opp_token_id)
+                                signed = self.client.create_order(args)
+                                self.client.post_order(signed, OrderType.FOK)
+                                log_msg(f"[HEDGE-BUY] #{tid} {hedge_reason} | {int(fill_shares)}sh opp @ ${hedge_p:.2f} (opp_token={opp_token_id[:10]}...)")
+                            else:
+                                log_msg(f"[PAPER-HEDGE-BUY] #{tid} {hedge_reason} | {int(fill_shares)}sh opp @ ${hedge_p:.2f}")
+                            # Synthetic exit_price for P&L accounting: redemption $1 - hedge_p paid
+                            # Net per share = $1 - entry - hedge_p (negative = loss, mostly small)
+                            exit_price = round(1.0 - hedge_p, 4)
+                            taker_fee = calc_taker_fee(hedge_p, fill_shares)
+                            exit_reason = f"HEDGE-{hedge_reason}"
+                            expected_pnl = (1.0 - fill_price - hedge_p) * fill_shares - taker_fee
+                            log_msg(f"[HEDGE] #{tid} {hedge_reason} | entry=${fill_price:.2f} hedge=${hedge_p:.2f} expected P&L ${expected_pnl:+.2f}")
+                            self.be_triggered = None
+                            self.active_be_price = 0
+                            exited = True
+                            hedge_fired = True
+                            break
+                        except Exception as e:
+                            log_msg(f"[HEDGE-FAIL] #{tid} {hedge_reason} | {str(e)[:60]} — fallthrough to force-exit")
+                            hedge_fired = True  # don't retry
+                            continue
 
                 if not exited:
-                    # Force exit — window ending
+                    # Force exit — window ending (legacy fallback if hedge didn't fire)
                     _bid = self.up_bid if direction == "UP" else self.down_bid
                     log_msg(f"[FORCE-EXIT-V4] #{tid} Window ending, bid ${_bid:.2f}")
                     if self.client and not PAPER_MODE:
-                        if tp_order_id:
-                            try:
-                                self.client.cancel_orders([tp_order_id])
-                            except Exception as _e:
-
-                                log_msg(f"[WARN] {str(_e)[:60]}")
+                        # Cancel any outstanding orders (BE maker takes precedence here)
+                        for _oid in (be_order_id, tp_order_id):
+                            if _oid:
+                                try:
+                                    self.client.cancel_orders([_oid])
+                                except Exception as _e:
+                                    log_msg(f"[WARN] {str(_e)[:60]}")
                         try:
                             params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
                                                            signature_type=SIGNATURE_TYPE)
@@ -1232,7 +1279,7 @@ class BTCScalpBot:
                 self.tp_count += 1
             elif reason == "SL":
                 self.sl_count += 1
-            elif reason in ("TIMEOUT", "FORCE-EXIT", "MAX-HOLD", "RES-WIN", "RES-LOSS"):
+            elif reason in ("TIMEOUT", "FORCE-EXIT", "MAX-HOLD", "RES-WIN", "RES-LOSS") or reason.startswith("HEDGE-"):
                 self.timeout_count += 1
 
             if self.bankroll > self.peak:
