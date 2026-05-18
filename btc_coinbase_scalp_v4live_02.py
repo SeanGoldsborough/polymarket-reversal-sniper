@@ -99,6 +99,7 @@ MAX_ENTRY_PRICE = 0.85      # Don't buy above this
 ENTRY_WINDOW_SECONDS = 60   # Only trade in first 60 seconds of window
 CUTOFF_BEFORE_END = 20      # No new trades within 20s of window end
 FORCE_EXIT_BEFORE_END = 120 # Force exit at T+180 — exit while token still mid-range, not $0.01
+DYNAMIC_SL_DROP = 0.05      # Exit hold if price drops >$0.05 below entry (data: catches force-exits, keeps 91% of BE recoveries)
 
 # Paper simulation
 PAPER_LATENCY = 0.050       # 50ms simulated execution latency (actual API benchmarked at 22-50ms)
@@ -699,12 +700,13 @@ class BTCScalpBot:
                     if order:
                         final_matched = float(order.get("size_matched", 0))
                         status = order.get("status", "")
+                        status_lower = status.lower()
                         if final_matched > 0:
                             fill_price = float(order.get("price", entry_price))
                             fill_shares = final_matched
                             filled = True
                             log_msg(f"[LATE-FILL] #{tid} {final_matched:.0f}sh filled (status={status}) — managing position")
-                        elif status not in ("cancelled", "expired"):
+                        elif status_lower not in ("cancelled", "canceled", "expired"):
                             # Not cancelled and no size_matched yet — order may have just filled
                             fill_shares = SHARES_PER_TRADE
                             fill_price = entry_price
@@ -1071,6 +1073,27 @@ class BTCScalpBot:
                             exited = True
                             break
 
+                    # DYNAMIC SL: exit if price drops too far below entry
+                    _cur_bid = self.up_bid if direction == "UP" else self.down_bid
+                    if _cur_bid > 0 and (fill_price - _cur_bid) >= DYNAMIC_SL_DROP:
+                        log_msg(f"[DYN-SL] #{tid} Bid ${_cur_bid:.2f} is ${fill_price - _cur_bid:.2f} below entry ${fill_price:.2f} (limit ${DYNAMIC_SL_DROP}) — exiting")
+                        if self.client and not PAPER_MODE:
+                            if tp_order_id:
+                                try:
+                                    self.client.cancel_orders([tp_order_id])
+                                except Exception as _e:
+                                    log_msg(f"[WARN] {str(_e)[:60]}")
+                            sold, sell_price = await safe_sell(self.client, token_id, int(fill_shares), snap_price(_cur_bid - 0.01), OrderType.FOK, None, tid)
+                            exit_price = sell_price if sold else _cur_bid
+                        else:
+                            taker_fee = calc_taker_fee(_cur_bid, fill_shares)
+                            exit_price = _cur_bid
+                        exit_reason = "DYN-SL"
+                        self.be_triggered = None
+                        self.active_be_price = 0
+                        exited = True
+                        break
+
                     # BE event?
                     if self.be_triggered.is_set():
                         if self.client and not PAPER_MODE:
@@ -1231,7 +1254,7 @@ class BTCScalpBot:
                 self.tp_count += 1
             elif reason == "SL":
                 self.sl_count += 1
-            elif reason in ("TIMEOUT", "FORCE-EXIT", "MAX-HOLD", "RES-WIN", "RES-LOSS"):
+            elif reason in ("TIMEOUT", "FORCE-EXIT", "MAX-HOLD", "RES-WIN", "RES-LOSS", "DYN-SL"):
                 self.timeout_count += 1
 
             if self.bankroll > self.peak:
