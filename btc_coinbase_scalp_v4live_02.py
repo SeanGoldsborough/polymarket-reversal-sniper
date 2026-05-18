@@ -693,21 +693,29 @@ class BTCScalpBot:
                 except Exception as e:
                     log_msg(f"[CANCEL-ERR] #{tid} {str(e)[:60]}")
 
-                # CRITICAL: Check one more time if shares were filled before/during cancel
-                await asyncio.sleep(0.1)
+                # CRITICAL: Verify cancel succeeded — check order status immediately
                 try:
                     order = self.client.get_order(buy_order_id)
                     if order:
                         final_matched = float(order.get("size_matched", 0))
+                        status = order.get("status", "")
                         if final_matched > 0:
                             fill_price = float(order.get("price", entry_price))
                             fill_shares = final_matched
                             filled = True
-                            log_msg(f"[LATE-FILL] #{tid} {final_matched:.0f}sh filled after cancel attempt — managing position")
+                            log_msg(f"[LATE-FILL] #{tid} {final_matched:.0f}sh filled (status={status}) — managing position")
+                        elif status not in ("cancelled", "expired"):
+                            # Not cancelled and no size_matched yet — order may have just filled
+                            fill_shares = SHARES_PER_TRADE
+                            fill_price = entry_price
+                            filled = True
+                            log_msg(f"[LATE-FILL] #{tid} Cancel failed, status={status} — managing position")
+                        else:
+                            log_msg(f"[CANCEL-OK] #{tid} Confirmed cancelled (status={status}, matched={final_matched})")
                 except Exception as e:
                     log_msg(f"[LATE-FILL-CHECK-ERR] #{tid} {str(e)[:60]}")
 
-                # SAFETY: Verify wallet balance changed
+                # SAFETY: Wallet balance is truth — if USDC didn't return, order filled
                 if not filled:
                     try:
                         params = BalanceAllowanceParams(asset_type="COLLATERAL", token_id="", signature_type=2)
@@ -715,13 +723,11 @@ class BTCScalpBot:
                         current_bal = int(result.get("balance", "0")) / 1_000_000
                         expected_cost = SHARES_PER_TRADE * entry_price
                         if current_bal < self.bankroll - expected_cost * 0.5:
-                            log_msg(f"[WALLET-ALERT] #{tid} Balance ${current_bal:.2f} dropped from ${self.bankroll:.2f} — shares may have filled!")
-                            # Try to find and manage the position
+                            log_msg(f"[WALLET-ALERT] #{tid} Balance ${current_bal:.2f} vs expected ${self.bankroll:.2f} — order filled despite cancel!")
                             fill_shares = SHARES_PER_TRADE
                             fill_price = entry_price
                             filled = True
                     except Exception as _e:
-
                         log_msg(f"[WARN] {str(_e)[:60]}")
             else:
                 await asyncio.sleep(PAPER_LATENCY)
