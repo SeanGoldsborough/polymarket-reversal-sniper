@@ -138,6 +138,61 @@ def calc_taker_fee(price, shares):
     return round(min(price, 1.0 - price) * PAPER_TAKER_FEE_MULT * shares, 4)
 
 
+def get_token_balance(client, token_id):
+    """Get actual on-chain token balance. Returns shares count."""
+    try:
+        params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
+                                       signature_type=int(os.getenv("SIGNATURE_TYPE", "0")))
+        client.update_balance_allowance(params)
+        result = client.get_balance_allowance(params)
+        raw_balance = int(result.get("balance", "0"))
+        return raw_balance / 1_000_000  # Convert to shares
+    except:
+        return 0
+
+
+async def safe_sell(client, token_id, target_shares, price, order_type, tp_order_id=None, tid=0):
+    """Sell shares with balance check, TP cancel, and retry. Returns (sold, exit_price)."""
+    # Cancel any existing TP to free locked shares
+    if tp_order_id and tp_order_id != "MANUAL_FILLED":
+        try:
+            client.cancel_orders([tp_order_id])
+            await asyncio.sleep(0.3)  # Wait for shares to unlock
+        except:
+            pass
+
+    # Check actual available balance
+    available = get_token_balance(client, token_id)
+    sell_amount = max(1, int(min(available, target_shares)))
+    if available < 1:
+        log_msg(f"[SELL-WARN] #{tid} No balance available (target={target_shares}, balance={available:.1f})")
+        return False, price
+
+    # Try to sell with retries at progressively lower prices
+    for attempt in range(3):
+        try:
+            sell_p = snap_price(price - 0.01 * attempt)
+            if sell_p < 0.01:
+                sell_p = 0.01
+            # Re-approve before sell
+            try:
+                params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
+                                               signature_type=int(os.getenv("SIGNATURE_TYPE", "0")))
+                client.update_balance_allowance(params)
+            except:
+                pass
+            args = OrderArgs(price=sell_p, size=sell_amount, side=SELL, token_id=token_id)
+            signed = client.create_order(args)
+            client.post_order(signed, order_type)
+            log_msg(f"[SELL] #{tid} {sell_amount}sh @ ${sell_p:.2f} ({order_type}, attempt {attempt+1})")
+            return True, sell_p
+        except Exception as e:
+            log_msg(f"[SELL-FAIL] #{tid} Attempt {attempt+1}: {str(e)[:60]}")
+            await asyncio.sleep(0.2)
+    log_msg(f"[SELL-FAIL] #{tid} CRITICAL — could not sell after 3 attempts")
+    return False, price
+
+
 async def send_telegram(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -686,50 +741,67 @@ class BTCScalpBot:
         log_msg(f"[FILL] #{tid} {fill_shares:.0f}sh @ ${fill_price:.2f} in {fill_time:.1f}s | "
                 f"TP ${tp_price:.2f} | SL ${sl_price:.2f}")
 
-        # ── STEP 3+4: Place TP sell — retry quickly, start monitoring immediately ──
-        # Token was pre-approved at window start. Settlement takes 1-3s.
-        # We start monitoring price NOW and place TP in parallel.
+        # ── STEP 3+4: Wait for settlement, place TP, monitor price simultaneously ──
         tp_order_id = None
+        tp_shares = 0  # Actual shares we placed TP for
         trade_token = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
 
         if self.client and not PAPER_MODE:
-            # Try to place TP immediately (may fail if not settled yet)
-            for tp_attempt in range(20):  # Up to 2 seconds (20 x 0.1s)
-                try:
-                    # Re-approve on each attempt (fast, no-op if already approved)
-                    try:
-                        params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=trade_token,
-                                                       signature_type=SIGNATURE_TYPE)
-                        self.client.update_balance_allowance(params)
-                    except:
-                        pass
-                    args = OrderArgs(price=tp_price, size=int(fill_shares), side=SELL, token_id=trade_token)
-                    signed = self.client.create_order(args)
-                    resp = self.client.post_order(signed, OrderType.GTC)
-                    tp_order_id = resp.get("orderID", "")
-                    log_msg(f"[TP] #{tid} GTC sell {int(fill_shares)}sh @ ${tp_price:.2f} order={tp_order_id[:10]}... ({tp_attempt+1} attempts)")
-                    break
-                except Exception as e:
-                    if tp_attempt < 19:
-                        await asyncio.sleep(0.1)  # Fast retry — 100ms
-                    else:
-                        log_msg(f"[TP-FAIL] #{tid} Could not place after 2s: {str(e)[:60]}")
+            # Wait for tokens to settle, check balance, place TP for available shares
+            for tp_attempt in range(30):  # Up to 3 seconds (30 x 0.1s)
+                # Check actual token balance
+                available = get_token_balance(self.client, trade_token)
 
-                # While waiting for settlement, check if price already hit TP
-                _bid_now = self.up_bid if direction == "UP" else self.down_bid
-                if _bid_now >= tp_price:
-                    # Price hit TP but our order isn't on book yet — manual sell
-                    log_msg(f"[TP-MANUAL] #{tid} Price at ${_bid_now:.2f} >= TP ${tp_price:.2f} during placement — selling now")
+                if available >= 1:
+                    # Tokens settled — place TP for whatever we have
+                    tp_shares = int(available)
                     try:
-                        args = OrderArgs(price=tp_price, size=int(fill_shares), side=SELL, token_id=trade_token)
+                        args = OrderArgs(price=tp_price, size=tp_shares, side=SELL, token_id=trade_token)
+                        signed = self.client.create_order(args)
+                        resp = self.client.post_order(signed, OrderType.GTC)
+                        tp_order_id = resp.get("orderID", "")
+                        log_msg(f"[TP] #{tid} GTC sell {tp_shares}sh @ ${tp_price:.2f} order={tp_order_id[:10]}... "
+                                f"(settled in {(tp_attempt+1)*0.1:.1f}s, {tp_shares}/{int(fill_shares)} available)")
+                        break
+                    except Exception as e:
+                        log_msg(f"[TP-FAIL] #{tid} Balance={available:.0f} but place failed: {str(e)[:60]}")
+
+                # While waiting, check if price already hit TP
+                _bid_now = self.up_bid if direction == "UP" else self.down_bid
+                if _bid_now >= tp_price and available >= 1:
+                    tp_shares = int(available)
+                    try:
+                        args = OrderArgs(price=tp_price, size=tp_shares, side=SELL, token_id=trade_token)
                         signed = self.client.create_order(args)
                         self.client.post_order(signed, OrderType.FOK)
                         tp_order_id = "MANUAL_FILLED"
-                        log_msg(f"[TP-MANUAL] #{tid} Sold @ ${tp_price:.2f}")
-                    except:
-                        pass
-                    if tp_order_id == "MANUAL_FILLED":
+                        fill_shares = tp_shares
+                        log_msg(f"[TP-MANUAL] #{tid} Price ${_bid_now:.2f} >= TP — sold {tp_shares}sh @ ${tp_price:.2f}")
                         break
+                    except Exception as e:
+                        log_msg(f"[TP-MANUAL-FAIL] #{tid} {str(e)[:60]}")
+
+                await asyncio.sleep(0.1)
+
+            if not tp_order_id:
+                log_msg(f"[TP-FAIL] #{tid} CRITICAL — tokens not settled after 3s, balance={available:.1f}")
+                # Last resort: try one more time with whatever balance exists
+                available = get_token_balance(self.client, trade_token)
+                if available >= 1:
+                    tp_shares = int(available)
+                    try:
+                        args = OrderArgs(price=tp_price, size=tp_shares, side=SELL, token_id=trade_token)
+                        signed = self.client.create_order(args)
+                        resp = self.client.post_order(signed, OrderType.GTC)
+                        tp_order_id = resp.get("orderID", "")
+                        log_msg(f"[TP-LASTRESORT] #{tid} Placed for {tp_shares}sh")
+                    except Exception as e:
+                        log_msg(f"[TP-LASTRESORT-FAIL] #{tid} {str(e)[:60]}")
+
+            # Update fill_shares to actual shares we're managing
+            if tp_shares > 0 and tp_shares != int(fill_shares):
+                log_msg(f"[SHARES-ADJ] #{tid} Managing {tp_shares}sh (bought {int(fill_shares)}, {int(fill_shares)-tp_shares} not settled)")
+                fill_shares = tp_shares
         else:
             await asyncio.sleep(PAPER_LATENCY)
             log_msg(f"[PAPER-TP] #{tid} GTC sell {int(fill_shares)}sh @ ${tp_price:.2f}")
@@ -795,29 +867,42 @@ class BTCScalpBot:
             if hold_elapsed >= MAX_HOLD_SECONDS:
                 current_bid = self.up_bid if direction == "UP" else self.down_bid
                 log_msg(f"[MAX-HOLD] #{tid} {MAX_HOLD_SECONDS}s elapsed, TP not hit — exiting at market (bid ${current_bid:.2f})")
-                if tp_order_id and self.client and not PAPER_MODE:
-                    try:
-                        self.client.cancel_orders([tp_order_id])
-                    except Exception as _e:
-
-                        log_msg(f"[WARN] {str(_e)[:60]}")
                 if self.client and not PAPER_MODE:
-                    try:
-                        token_id = self.mf.market["up"] if direction == "UP" else self.mf.market["down"]
-                        params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
-                                                       signature_type=SIGNATURE_TYPE)
-                        self.client.update_balance_allowance(params)
-                    except Exception as _e:
+                    # Cancel TP first to free locked shares
+                    if tp_order_id:
+                        try:
+                            self.client.cancel_orders([tp_order_id])
+                            log_msg(f"[MAX-HOLD] #{tid} TP cancelled")
+                        except Exception as _e:
+                            log_msg(f"[WARN] Cancel TP: {str(_e)[:60]}")
 
-                        log_msg(f"[WARN] {str(_e)[:60]}")
-                    try:
-                        sell_p = snap_price(current_bid - 0.01)
-                        args = OrderArgs(price=sell_p, size=int(fill_shares), side=SELL, token_id=token_id)
-                        signed = self.client.create_order(args)
-                        self.client.post_order(signed, OrderType.FOK)
-                        exit_price = sell_p
-                    except Exception as e:
-                        log_msg(f"[MAX-HOLD] #{tid} Sell failed: {str(e)[:60]}")
+                    # Wait for shares to be freed after cancel
+                    await asyncio.sleep(0.5)
+
+                    # Check actual available balance and sell that
+                    available = get_token_balance(self.client, trade_token)
+                    sell_amount = int(available) if available >= 1 else int(fill_shares)
+                    log_msg(f"[MAX-HOLD] #{tid} Available balance: {available:.1f}sh, selling {sell_amount}sh")
+
+                    sold = False
+                    for sell_attempt in range(3):
+                        try:
+                            sell_p = snap_price(current_bid - 0.01 * (sell_attempt + 1))
+                            if sell_p < 0.01:
+                                sell_p = 0.01
+                            args = OrderArgs(price=sell_p, size=sell_amount, side=SELL, token_id=trade_token)
+                            signed = self.client.create_order(args)
+                            self.client.post_order(signed, OrderType.FAK)
+                            exit_price = sell_p
+                            sold = True
+                            log_msg(f"[MAX-HOLD] #{tid} Sold {sell_amount}sh @ ${sell_p:.2f} (attempt {sell_attempt+1})")
+                            break
+                        except Exception as e:
+                            log_msg(f"[MAX-HOLD] #{tid} Sell attempt {sell_attempt+1} failed: {str(e)[:60]}")
+                            current_bid = self.up_bid if direction == "UP" else self.down_bid
+                            await asyncio.sleep(0.2)
+                    if not sold:
+                        log_msg(f"[MAX-HOLD-FAIL] #{tid} CRITICAL — could not sell")
                         exit_price = current_bid
                 else:
                     await asyncio.sleep(PAPER_LATENCY)
