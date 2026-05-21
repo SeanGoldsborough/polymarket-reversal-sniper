@@ -1,21 +1,32 @@
 # Strategy Library
 
-Canonical reference for all validated profitable strategies for the Polymarket BTC 5-min binary market. Each strategy here has been backtested against 207 windows (~5.5 days, 6,503+ CB signals, 17,326 swing events) of tick-level data with bilateral order book + Coinbase BTC price aligned at sub-second resolution.
+Reference for backtested strategies on the Polymarket BTC 5-min binary market. Backtested against 207 windows (~5.5 days, 6,503+ CB signals, 17,326 swing events) of tick-level data with bilateral order book + Coinbase BTC price.
 
-**All P&L numbers below assume maker-bid entry (no taker fees) unless noted.**
+## ⚠️ Read this first: ceiling vs realistic
+
+The numbers in this document have **TWO different meanings** that get conflated easily:
+
+- **CEILING** = what the math says IF every assumption holds (100% maker fill, no queue losses, no adverse selection). This is what the backtest produces. **Not what live trading will produce.**
+- **REALISTIC** = ceiling discounted for execution headwinds (fill rate, queue position, adverse selection). **Educated estimate based on prior live observations, not validated.**
+
+The realistic numbers carry significant uncertainty — they could be higher or lower than estimated. Until we run a proper execution simulator (Phase 2), treat realistic as a range, not a point.
+
+**Anywhere the document says "will produce X" — read it as "ceiling is X; realistic likely lower, range stated."**
 
 ---
 
 ## Quick Reference
 
-| ID | Strategy | Trigger | Action | Hold style | Validated edge |
-|---|---|---|---|---|---|
-| S1 | CB-aligned hold (small) | CB ±$5-9 in 1s | Buy aligned | To window resolution | +$0.022/sh avg, 48-53% WR |
-| S2 | CB-fade hold (large) | CB ±$15+ in 1s | Buy opposite | To window resolution | +$0.05 to +$0.25/sh, 68-83% WR |
-| S3 | Swing capture | Local-low indicator | Buy near low, sell at next high | Seconds to minutes | +$0.009/sh, 63% WR, 17K events |
-| S4* | Conditional MM | Spread > $0.03 | Maker ladder both sides | While quoted | Not yet validated — proposed |
+| ID | Strategy | Trigger | Action | Ceiling $/day @ 10sh | Realistic $/day @ 10sh (estimated) | Confidence |
+|---|---|---|---|---:|---|---|
+| S1 | CB-aligned hold (small) | CB ±$5-9 in 1s | Buy aligned, hold to resolution | $241 | ~$70-170 | Medium — large n (4,662), but maker fill rate not measured |
+| S2 | CB-fade hold (large) | CB ±$15+ in 1s | Buy opposite, hold to resolution | $42 | ~$30-35 | Lower — better fill mechanics, but smaller n (164) |
+| S3 | Swing capture | Local-low indicator | Buy near low, sell at next high | $284 | ~$150-200 | Medium — uses generous 200ms reactive latency; real indicator-based detection untested |
+| S4* | Conditional MM | Spread > $0.03 | Maker ladder both sides | TBD | TBD | None — not yet backtested |
 
-\* S4 is the proposed hybrid that integrates with S1-S3 — see "Composite Strategy" section.
+\* S4 is proposed but not yet validated.
+
+**Combined realistic ceiling: ~$330/day at 10sh. Could be higher (~$500) or lower (~$150) depending on actual execution.**
 
 ---
 
@@ -25,6 +36,63 @@ Canonical reference for all validated profitable strategies for the Polymarket B
 - **Total ticks**: ~17.6M across 207 windows
 - **Format**: bilateral order book (up/down bid+ask+sizes) + Coinbase BTC price, ~286 ticks/sec
 - **Statistical bar**: Any claim of an edge requires n ≥ 100 and a stated confidence interval
+
+---
+
+## Execution headwinds (what reduces ceiling to realistic)
+
+The backtest assumes **idealized execution**. Live trading faces these headwinds, each of which reduces actual P&L:
+
+### 1. Maker fill rate (largest unknown)
+
+**Backtest assumption**: 100% of maker bid orders fill at the bid price.
+
+**Reality**: Maker orders only fill when a counterparty crosses to our price. Empirical reference from prior live bot: **~38% UNFILLED rate** (different strategy on same market). Real fill rate is somewhere between 50% and 80% for most strategies — we don't know exactly without testing.
+
+**Strategy-specific dynamics:**
+- **S1 (aligned)**: When we want to buy UP after a UP spike, sellers of UP are running away — they don't cross down to our bid. Likely the WORST fill rate.
+- **S2 (fade)**: We buy the OPPOSITE side that's getting dumped post-spike. Sellers ARE crossing our way. Likely the BEST fill rate.
+- **S3 (swing)**: Mixed — local-low buys happen at exhaustion; some fills come quickly, some never fill.
+
+### 2. Queue position (queue ahead of us at maker price level)
+
+**Backtest assumption**: When the bid touches our price level, we fill.
+
+**Reality**: There are other makers at the same price level, placed before us. They fill first. If only 5 shares get sold at our level before the bid moves, those go to the queue front. We sit unfilled.
+
+This is the largest reason past MM strategies (H2) lost 100% — couldn't compete on queue priority with fast bots.
+
+### 3. Adverse selection
+
+**Backtest assumption**: A fill at $X means we bought at $X and that's the cost basis.
+
+**Reality**: A maker fill at $X often happens precisely because the price was about to move past $X. Our $0.45 bid fills because the bid just dropped through $0.45 (someone sold AT $0.45 because the market is going lower). We bought near a local TOP.
+
+### 4. Settlement delay (Polymarket-specific)
+
+**Backtest assumption**: Token positions are available instantly after fill.
+
+**Reality**: ERC-1155 settlement on Polygon takes 1-3 seconds after a fill. We can't sell what we don't yet hold. This matters for S3's fast cycle especially.
+
+### 5. Latency
+
+**Backtest assumption**: 200ms reactive (used for S3); zero for S1/S2 (placed at signal time).
+
+**Reality**: 50-200ms order placement + 100-300ms WS-to-decision + variable fill time. Real round-trip is 500ms-2s depending on what we're doing.
+
+---
+
+## What we DON'T know yet
+
+These are open questions that Phase 2 (order execution module) is needed to answer:
+
+1. **Actual maker fill rate per strategy** — currently estimated, not measured
+2. **Actual queue position impact** — depends on competitor maker activity at each price level
+3. **Whether the adverse-selection cost is small or large** — could be $0.01 per share, could be $0.04
+4. **How partial fills affect strategies** — backtest treats fills as binary
+5. **How cancel-and-replace timing affects S3 and S4** — needs simulation
+
+Until Phase 2 is built and runs through replay data, **all "realistic" estimates in this document are educated guesses**, not validated numbers.
 
 ---
 
@@ -44,7 +112,7 @@ Coinbase BTC moves $5-9 in 1 second (per consecutive-CB-tick delta with ≤1.5s 
 
 Small CB moves precede modest Polymarket continuation. The market doesn't reverse hard. Maker entry avoids both taker fees and the bid-ask spread, leaving positive expectancy at modest WR.
 
-### Validated profitability
+### Backtested profitability (CEILING — 100% maker fill assumption)
 
 | Signal bucket | n | WR (P&L > 0) | $/share | Net at 10sh × n |
 |---|---:|---:|---:|---:|
@@ -54,13 +122,28 @@ Small CB moves precede modest Polymarket continuation. The market doesn't revers
 | $8-10 | 759 | 48% | +$0.030 | +$230 |
 | **Combined** | **4,662** | **~50%** | **~$0.028 avg** | **+$1,325** |
 
-Over the 5.5 day sample at 10sh: **~$241/day**. At 100sh: **~$2,410/day**.
+**CEILING over 5.5 days at 10sh: ~$241/day. At 100sh: ~$2,410/day.**
+
+### Realistic estimate (NOT validated — educated guess)
+
+S1 has structurally adverse fill dynamics: when we buy aligned after a CB spike, sellers of that side are running away, so our maker bid often doesn't get crossed. Estimated fill rate scenarios:
+
+| Fill rate scenario | Effective $/share | Daily at 10sh |
+|---|---:|---:|
+| Optimistic (70% fill) | +$0.020 | **~$169** |
+| Realistic (50% fill) | +$0.014 | **~$120** |
+| Pessimistic (30% fill) | +$0.008 | **~$72** |
+
+**Realistic range: ~$70-170/day at 10sh. Mid-estimate ~$120/day. This is a guess, not validated.**
+
+Falling back to TAKER on missed maker fills doesn't help — backtest shows taker S1 is essentially breakeven (~+$0.001/share avg). Better to accept missed fills than to convert to taker.
 
 ### Caveats
 
-- Maker fill is not guaranteed; may sit unfilled if bid moves away fast
+- Maker fill rate is the biggest unknown. Live testing required to confirm.
 - Ties up capital for full 5-min window
 - Per-trade P&L is modest; volume comes from frequency
+- Sellers running away post-spike is the structural problem
 
 ---
 
@@ -80,7 +163,7 @@ Coinbase BTC moves $15+ in 1 second.
 
 Large CB spikes ($15+ in 1 sec) typically mark the **tail of an exhausted move** rather than the start of new momentum. The "winning-looking" side immediately after the spike is mispriced — about to mean-revert. The opposite (cheap, "losing-looking") side captures the reversal.
 
-### Validated profitability
+### Backtested profitability (CEILING)
 
 | Signal bucket | n | WR (P&L > 0) | $/share | Net at 10sh × n |
 |---|---:|---:|---:|---:|
@@ -90,13 +173,26 @@ Large CB spikes ($15+ in 1 sec) typically mark the **tail of an exhausted move**
 
 95% CI on $20+ WR: 69-88% — even pessimistic bound is profitable.
 
-Over 5.5 days at 10sh: **~$42/day**. At 100sh: **~$420/day**. Rare events but high per-event P&L.
+**CEILING over 5.5 days at 10sh: ~$42/day. At 100sh: ~$420/day.**
+
+### Realistic estimate (NOT validated — educated guess)
+
+S2 has structurally favorable fill dynamics: we buy the OPPOSITE side that's being dumped post-spike, so sellers ARE crossing our bid. Estimated higher fill rate than S1.
+
+| Fill rate scenario | Effective $/share | Daily at 10sh |
+|---|---:|---:|
+| Optimistic (85% fill) | +$0.119 | **~$36** |
+| Realistic (75% fill) | +$0.105 | **~$32** |
+| Pessimistic (60% fill) | +$0.084 | **~$25** |
+
+**Realistic range: ~$25-36/day at 10sh. Mid-estimate ~$30/day. Sample size (n=164) is small; CI on WR is wide.**
 
 ### Caveats
 
-- Small sample (n=164 combined). Wider CI than S1
+- Small sample (n=164 combined). Wider CI than S1 — true edge could be smaller
 - Requires monitoring CB ticks for $15+ moves (rare)
 - $20+ signals are flash events — must be detected within 1-2 second window
+- Maker fill rate STILL unknown — estimate "70-85% likely" but not measured
 
 ---
 
@@ -142,17 +238,38 @@ LOCAL-HIGH INDICATOR (for sell side):
 
 Matches measured 1.8s average swing duration in the data. 72% of swings happen in <1s, but a 2s indicator window allows 1-2 ticks of confirmation that the low has actually happened (not just a flicker).
 
-### Validated profitability
+### Backtested profitability (using a fictional perfect-oracle latency model)
 
 | Setup | n | WR | Avg P&L/share | Total at 10sh | Per day at 10sh |
 |---|---:|---:|---:|---:|---:|
-| 200ms reactive (modeled) | 17,326 | 63% | +$0.0090 | +$1,560 | **~$284/day** |
-| 1500ms reactive (slow) | 17,326 | 56% | +$0.0037 | +$636 | ~$115/day |
-| Perfect oracle (ceiling) | 17,326 | 95% | +$0.050 | +$8,722 | ~$1,585/day (theoretical) |
+| **Perfect oracle (true ceiling, fictional)** | 17,326 | 95% | +$0.050 | +$8,722 | ~$1,585 |
+| 200ms reactive (modeled — UPPER bound for an actual indicator) | 17,326 | 63% | +$0.009 | +$1,560 | **~$284** |
+| 1500ms reactive (slow, modeled — LOWER bound for slow execution) | 17,326 | 56% | +$0.004 | +$636 | ~$115 |
 
-Hour-of-day breakdown — **every hour profitable**, best evening (20-22 ET), worst US market open (10 ET, 54% WR).
+**The 200ms model is what's been used as "ceiling" for S3, but it's still assuming the indicator perfectly identifies each low instantly.** Real indicator-based detection (sliding-window minimum) has 1-2 tick lag for confirmation.
 
-Realistic expectation when accounting for indicator lag + queue position: **55-58% WR, ~$0.005-$0.007/share, ~$150-$200/day at 10sh**.
+Hour-of-day breakdown — every hour produces positive P&L in the backtest, best evening (20-22 ET), worst US market open (10 ET, 54% WR).
+
+### Realistic estimate (NOT validated — educated guess)
+
+The actual indicator (2-second sliding-window low + $0.02 bounce confirmation) hasn't been run through the replay engine yet. Estimated discount factors:
+
+| Factor | Estimated discount |
+|---|---:|
+| Indicator detection lag | -10 to -20% |
+| Queue position on maker entry | -10 to -25% |
+| Bid-range filter ($0.30-$0.70) | reduces n, ~80% retained |
+| Cancel-on-CB-event | -2 to -5% |
+
+Combined realistic range:
+
+| Scenario | Effective $/share | Daily at 10sh |
+|---|---:|---:|
+| Optimistic | +$0.007 | **~$200** |
+| Realistic | +$0.005 | **~$150** |
+| Pessimistic | +$0.003 | **~$90** |
+
+**Realistic range: ~$90-200/day at 10sh. Mid-estimate ~$150/day. Still a guess until the actual indicator is tested.**
 
 ### Caveats
 
@@ -241,17 +358,19 @@ At 10sh × ~$0.50 = ~$5 per position. Bank of $35-50 supports 5-10 concurrent po
 - Use ~50% for active swing trading (S3) — typically 1-3 open at once
 - Use ~20% for S4 ladders when conditions warrant
 
-### Expected combined daily P&L
+### Combined daily P&L — ceiling vs realistic
 
-| Strategy | 10sh per signal | 100sh per signal |
-|---|---:|---:|
-| S1 (CB aligned $5-10) | ~$241/day | ~$2,410/day |
-| S2 (CB fade $15+) | ~$42/day | ~$420/day |
-| S3 (swing, realistic) | ~$150-200/day | ~$1,500-2,000/day |
-| S4 (MM, estimated) | TBD | TBD |
-| **Combined target** | **~$430-480/day** | **~$4,300-4,800/day** |
+| Strategy | CEILING @ 10sh | Realistic @ 10sh (est.) | CEILING @ 100sh | Realistic @ 100sh (est.) |
+|---|---:|---:|---:|---:|
+| S1 (CB aligned $5-10) | $241 | ~$70-170 | $2,410 | ~$700-1,700 |
+| S2 (CB fade $15+) | $42 | ~$25-36 | $420 | ~$250-360 |
+| S3 (swing, indicator-based) | $284 | ~$90-200 | $2,840 | ~$900-2,000 |
+| S4 (MM, conditional) | TBD | TBD | TBD | TBD |
+| **Combined** | **$567** | **~$185-406** | **$5,670** | **~$1,850-4,060** |
 
-Real-world execution discount: assume 50-70% of theoretical due to fills/queue/slippage. So **$215-340/day at 10sh, $2,150-3,400/day at 100sh**.
+**Combined realistic range at 10sh: $185-406/day. Mid-estimate ~$295/day.**
+
+**These are GUESSES.** Confidence: low until Phase 2 is built and runs a realistic execution simulation against the tick data.
 
 ---
 
@@ -286,4 +405,5 @@ Past mistake: claimed "$10+ has 58% continuation" based on n=19. At n=834 the tr
 
 | Date | Change |
 |---|---|
-| 2026-05-21 | Initial document. S1, S2, S3 validated; S4 proposed pending validation. |
+| 2026-05-21 | Initial document. S1, S2, S3 backtested; S4 proposed pending validation. |
+| 2026-05-21 | Updated to distinguish CEILING vs REALISTIC estimates throughout. Added Execution Headwinds section and "What we DON'T know yet" section. Backtest numbers are CEILINGS only. All realistic estimates explicitly labeled as educated guesses, not validated. |
