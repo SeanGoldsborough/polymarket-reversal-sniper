@@ -17,19 +17,29 @@ The realistic numbers carry significant uncertainty — they could be higher or 
 
 ## Quick Reference
 
-| ID | Strategy | Trigger | Action | Ceiling $/day @ 10sh | Realistic $/day @ 10sh (estimated) | Confidence |
+| ID | Strategy | Trigger | Entry | Measured $/day @ 10sh (paper engine) | Confidence | Status |
 |---|---|---|---|---:|---|---|
-| S1 | CB-aligned hold (small) | CB ±$5-9 in 1s | Buy aligned, hold to resolution | $241 | ~$70-170 | Medium — large n (4,662), but maker fill rate not measured |
-| S2 | CB-fade hold (large) | CB ±$15+ in 1s | Buy opposite, hold to resolution | $42 | ~$30-35 | Lower — better fill mechanics, but smaller n (164) |
-| S3 | Swing capture | Local-low indicator | Buy near low, sell at next high | $284 | ~$150-200 | Medium — uses generous 200ms reactive latency; real indicator-based detection untested |
-| S4* | Conditional MM | Spread > $0.03 | Maker ladder both sides | TBD | TBD | None — not yet backtested |
-| **S5** | **CB-aligned scalp (V4-LIVE legacy)** | **CB ±$5 in 1s** | **Buy aligned, TP +$0.04, SL -$0.02, hold-to-BE on SL** | **n/a — measured live** | **-$24 over 178 trades = ~-$60/day at 10sh** | **High — actual live execution data** |
+| S1 (maker) | CB-aligned hold (small) | CB ±$5-9 | Maker @ bid | **-$11** | Conservative lower bound | Marginal at best |
+| S1 (taker) | CB-aligned hold (small) | CB ±$5-9 | Taker @ ask | **+$377** | Engine reliable but CI on per-bucket WR includes zero | **No statistical proof of edge** |
+| S2 (maker) | CB-fade hold (large) | CB ±$15+ | Maker @ bid | **+$32** | Matches earlier estimate, small n (209 signals) | Promising |
+| S2 (taker) | CB-fade hold (large) | CB ±$15+ | Taker @ ask | **+$250** | Higher confidence — 77% WR, n=163 | **Strongest measured signal** |
+| S3 | Swing capture (reactive indicator) | Local-low + $0.02 bounce | Taker @ ask | **-$935** | Strategy logic flawed — confirmation eats swing | **BROKEN as written** |
+| S4 | Conditional MM | Spread > $0.03 | Maker ladders | TBD | Not yet validated | Proposed |
+| S5 | CB-aligned scalp (V4-LIVE legacy) | CB ±$5 | Maker + TP/SL | **-$60** (live measured) | Live trading data | **Documented loser — do not revive** |
 
-\* S4 is proposed but not yet validated.
+**⚠️ Statistical reality check (added after engine validation 2026-05-22):**
 
-**S5 is the original V4-LIVE bot strategy. It was deployed and LOST money in live testing.** Included here for reference and to avoid re-discovery. See S5 section below for the why.
+For S1 buckets at taker entry:
+- $5-6 (n=2,120, 53% WR): 95% CI on $/share = (-$0.008, +$0.032). **~12% probability the true edge is negative.**
+- $6-7 (n=1,123, 48% WR): 95% CI = (-$0.022, +$0.032). ~36% chance negative.
+- $7-8 (n=669, 48% WR): measured -$0.013/share. **Actively losing.**
+- $8-10 (n=758, 49% WR): 95% CI = (-$0.018, +$0.050). ~19% chance negative.
 
-**Combined realistic ceiling for S1-S4: ~$330/day at 10sh. Could be higher (~$500) or lower (~$150) depending on actual execution.**
+**None of the S1 buckets has a 95% CI that excludes zero.** The measured positive P&L is consistent with a small real edge OR no edge with random luck. We need 3-5× more data (~30-50 more days of recording) to confidently say S1 makes money.
+
+Live execution shaves ~$0.005-$0.015/share off the measured edge (slippage, latency, partial fills). For $5-6: measured +$0.012/share − $0.010 execution cost = +$0.002/share live, well within zero.
+
+**Practical implication: do not deploy S1 with confidence until more data confirms the edge.**
 
 ---
 
@@ -127,26 +137,64 @@ Small CB moves precede modest Polymarket continuation. The market doesn't revers
 
 **CEILING over 5.5 days at 10sh: ~$241/day. At 100sh: ~$2,410/day.**
 
-### Realistic estimate (NOT validated — educated guess)
+### Measured results — paper engine (2026-05-22)
 
-S1 has structurally adverse fill dynamics: when we buy aligned after a CB spike, sellers of that side are running away, so our maker bid often doesn't get crossed. Estimated fill rate scenarios:
+Ran S1 through PaperOrderEngine with conservative fill rule. 260 windows of data, 5,144 signals.
 
-| Fill rate scenario | Effective $/share | Daily at 10sh |
-|---|---:|---:|
-| Optimistic (70% fill) | +$0.020 | **~$169** |
-| Realistic (50% fill) | +$0.014 | **~$120** |
-| Pessimistic (30% fill) | +$0.008 | **~$72** |
+**At-bid entry (maker, $0 fee):**
 
-**Realistic range: ~$70-170/day at 10sh. Mid-estimate ~$120/day. This is a guess, not validated.**
+| Bucket | Signals | Filled | Fill % | WR | $/share | Net 10sh × n |
+|---|---:|---:|---:|---:|---:|---:|
+| $5-6 | 2,318 | 173 | 7% | 47% | +$0.027 | +$47 |
+| $6-7 | 1,232 | 102 | 8% | 44% | -$0.005 | -$5 |
+| $7-8 | 762 | 61 | 8% | 31% | -$0.053 | -$32 |
+| $8-10 | 832 | 76 | 9% | 38% | -$0.023 | -$17 |
+| **TOTAL** | 5,144 | 412 | **8%** | 42% | -$0.002 | **-$8 (~-$11/day at 10sh)** |
 
-Falling back to TAKER on missed maker fills doesn't help — backtest shows taker S1 is essentially breakeven (~+$0.001/share avg). Better to accept missed fills than to convert to taker.
+Conservative fill rule is too strict — only counts fills where bid moves strictly below our level. Real maker fill rate is higher but can't be measured without trade-event data.
+
+**Taker entry (cross to ask, +$0.012/share fee):**
+
+| Bucket | Signals | Filled | Fill % | WR | $/share | Net 10sh × n |
+|---|---:|---:|---:|---:|---:|---:|
+| $5-6 | 2,227 | 2,120 | 95% | 53% | +$0.012 | +$248 |
+| $6-7 | 1,175 | 1,123 | 96% | 48% | +$0.005 | +$56 |
+| $7-8 | 714 | 669 | 94% | 48% | -$0.013 | -$87 |
+| $8-10 | 795 | 758 | 95% | 49% | +$0.016 | +$123 |
+| **TOTAL** | 4,911 | 4,670 | 95% | 50% | +$0.007 | **+$340 (~+$377/day at 10sh)** |
+
+### Critical statistical caveat
+
+**None of these per-bucket measurements is statistically distinguishable from zero P&L.** 95% CIs on $/share for taker entry:
+
+| Bucket | Mean $/share | 95% CI | P(true edge < 0) |
+|---|---:|---:|---:|
+| $5-6 | +$0.012 | (-$0.008, +$0.032) | ~12% |
+| $6-7 | +$0.005 | (-$0.022, +$0.032) | ~36% |
+| $7-8 | -$0.013 | (-$0.049, +$0.023) | ~76% (measured losing) |
+| $8-10 | +$0.016 | (-$0.018, +$0.050) | ~19% |
+
+To statistically confirm $5-6 is profitable would need ~3-5× more data (~8,000-10,000 filled trades).
+
+### Live execution headwinds (estimated, not measured)
+
+Real-world execution shaves ~$0.005-$0.015/share off the measured edge:
+- Slippage on fast CB moves (ask moves up during our 80-100ms network latency)
+- Partial fills when ask_size < order_size
+- Variable spread regime — sometimes wider than the moments we sampled
+
+For $5-6: measured +$0.012/share − $0.010 typical execution cost = **+$0.002/share live**. Inside the noise of zero.
+
+### Verdict
+
+S1 measured numbers are consistent with either a small positive edge OR no edge plus random luck. **Do not deploy with confidence** until we have 3-5× more data, AND a queue-aware simulator that incorporates trade-event data (currently being captured).
 
 ### Caveats
 
-- Maker fill rate is the biggest unknown. Live testing required to confirm.
-- Ties up capital for full 5-min window
-- Per-trade P&L is modest; volume comes from frequency
-- Sellers running away post-spike is the structural problem
+- Maker fill rate measured at 8% (conservative bound). True value is between 8% and 95% (taker-fill bound). Engine can't distinguish without trade events.
+- Taker entry circumvents the maker fill question but adds taker fee cost.
+- $7-8 bucket actively loses money in BOTH entry modes — should probably be excluded.
+- All buckets need more data before live deployment.
 
 ---
 
@@ -178,24 +226,43 @@ Large CB spikes ($15+ in 1 sec) typically mark the **tail of an exhausted move**
 
 **CEILING over 5.5 days at 10sh: ~$42/day. At 100sh: ~$420/day.**
 
-### Realistic estimate (NOT validated — educated guess)
+### Measured results — paper engine (2026-05-22)
 
-S2 has structurally favorable fill dynamics: we buy the OPPOSITE side that's being dumped post-spike, so sellers ARE crossing our bid. Estimated higher fill rate than S1.
+260 windows of data.
 
-| Fill rate scenario | Effective $/share | Daily at 10sh |
-|---|---:|---:|
-| Optimistic (85% fill) | +$0.119 | **~$36** |
-| Realistic (75% fill) | +$0.105 | **~$32** |
-| Pessimistic (60% fill) | +$0.084 | **~$25** |
+**At-bid entry (maker, $0 fee):**
 
-**Realistic range: ~$25-36/day at 10sh. Mid-estimate ~$30/day. Sample size (n=164) is small; CI on WR is wide.**
+| Bucket | Signals | Filled | Fill % | WR | $/share | Net 10sh × n |
+|---|---:|---:|---:|---:|---:|---:|
+| $15-20 | 116 | 14 | 12% | 57% | +$0.077 | +$11 |
+| $20+ | 93 | 6 | 6% | 83% | +$0.303 | +$18 |
+| **TOTAL** | 209 | 20 | 10% | 65% | +$0.145 | **+$29 (~$32/day at 10sh)** |
+
+Matches the earlier "realistic estimate" of $25-36/day. Note: only 20 filled trades out of 209 signals — very small sample for the win rate. **The 65% WR has wide CI; could be 45-80%.**
+
+**Taker entry (cross to ask, +$0.012/share fee):**
+
+| Bucket | Signals | Filled | Fill % | WR | $/share | Net 10sh × n |
+|---|---:|---:|---:|---:|---:|---:|
+| $15-20 | 101 | 92 | 91% | 71% | +$0.056 | +$51 |
+| $20+ | 75 | 71 | 95% | 86% | +$0.246 | +$175 |
+| **TOTAL** | 176 | 163 | **93%** | **77%** | +$0.139 | **+$226 (~$250/day at 10sh)** |
+
+**Taker entry is dramatically better for S2** — 8× more fills with similar per-share P&L. The fade strategy specifically targets exhausted moves where sellers of the OPPOSITE side are dumping, so paying the spread to cross is well-rewarded.
+
+### Confidence — strongest signal we have
+
+n=163 with 77% WR and +$0.139/share is the STRONGEST measured signal in the library:
+- 95% CI on WR for $20+ bucket: 75-95% (even pessimistic bound is profitable)
+- Mean P&L well outside zero — high confidence the edge is real
+
+However: **only 0.4-0.6 signals per window** ($15+ events are rare). Volume is limited.
 
 ### Caveats
 
-- Small sample (n=164 combined). Wider CI than S1 — true edge could be smaller
-- Requires monitoring CB ticks for $15+ moves (rare)
-- $20+ signals are flash events — must be detected within 1-2 second window
-- Maker fill rate STILL unknown — estimate "70-85% likely" but not measured
+- $15+ signals are rare. Bot mostly idle.
+- Sample n=163 is medium — would benefit from another 10x data for tightest CIs
+- $20+ flash events require sub-second detection — latency-sensitive
 
 ---
 
@@ -253,26 +320,53 @@ Matches measured 1.8s average swing duration in the data. 72% of swings happen i
 
 Hour-of-day breakdown — every hour produces positive P&L in the backtest, best evening (20-22 ET), worst US market open (10 ET, 54% WR).
 
-### Realistic estimate (NOT validated — educated guess)
+### Measured results — paper engine (2026-05-22) — STRATEGY IS BROKEN
 
-The actual indicator (2-second sliding-window low + $0.02 bounce confirmation) hasn't been run through the replay engine yet. Estimated discount factors:
+Implemented the indicator as written (2-second sliding-window low + $0.02 bounce confirmation, $0.30-$0.70 safe zone, skip during CB events). Ran 30-window test with taker_ask entry.
 
-| Factor | Estimated discount |
+| Metric | Value |
 |---|---:|
-| Indicator detection lag | -10 to -20% |
-| Queue position on maker entry | -10 to -25% |
-| Bid-range filter ($0.30-$0.70) | reduces n, ~80% retained |
-| Cancel-on-CB-event | -2 to -5% |
+| Buy entries attempted | 10,614 |
+| Filled | 279 (3% — engine fill issue, see below) |
+| Round-trips completed | 257 |
+| WR (P&L > 0) | **18%** (46W/208L) |
+| Avg P&L per round-trip | **-$0.038/share** |
+| Total at 10sh × n | **-$97** |
+| Per-day at 10sh | **~-$935** |
 
-Combined realistic range:
+### Why it fails — the indicator's confirmation cost eats the swing
 
-| Scenario | Effective $/share | Daily at 10sh |
-|---|---:|---:|
-| Optimistic | +$0.007 | **~$200** |
-| Realistic | +$0.005 | **~$150** |
-| Pessimistic | +$0.003 | **~$90** |
+```
+ENTRY:  bid > min_in_last_2s + $0.02  (we wait $0.02 of confirmation)
+EXIT:   bid < max_in_last_2s - $0.02  (we exit $0.02 down from high)
 
-**Realistic range: ~$90-200/day at 10sh. Mid-estimate ~$150/day. Still a guess until the actual indicator is tested.**
+For a $0.04 swing (typical amplitude):
+  Buy:  low + $0.02 (already $0.02 into the bounce)
+  Sell: high - $0.02 (already $0.02 down from peak)
+  Net captured: (high - $0.02) - (low + $0.02) = (high - low) - $0.04 = $0
+
+We capture ZERO when swings are exactly $0.04 — then we LOSE fees on top.
+```
+
+The original $284/day "ceiling" assumed a PERFECT ORACLE — knew the exact low/high in advance. A real indicator can't do that without confirmation, and confirmation costs ~$0.04 per round-trip in this market.
+
+### Three possible fixes (untested)
+
+1. **Lower confirmation threshold to $0.01 each side** — captures $0.02 vs $0.04 confirmation cost. Might break even but won't have edge unless swings >$0.04 are common.
+2. **Target only larger swings ($0.06+ amplitude)** — fewer trades, but each captures real edge after the $0.04 confirmation cost. Probably the right approach.
+3. **Switch to passive maker ladders (S4 concept)** — pre-placed orders at fixed levels capture swings without confirmation cost. The library's $284 ceiling implicitly required this approach all along.
+
+### Verdict
+
+**S3 as a reactive indicator-based strategy doesn't work.** The +$284/day ceiling was an artifact of perfect-oracle assumptions. Any reactive strategy will pay $0.02 confirmation cost per side, eating the typical swing.
+
+**To make swing capture profitable, we need the passive maker-ladder design (S4).** Reactive S3 should be retired or redesigned with bigger amplitude targets.
+
+### Note on the 3% engine fill rate
+
+This is partly an engine limitation: when ask_size = 0 in the recorder data (common when only the bid was updated), engine's taker FAK refuses to fill. Real FAK orders would fill against the actual book depth regardless of size displayed in last tick. Once trade-event data is incorporated, this artifact resolves.
+
+But even fixing fill rate to 100% wouldn't save S3 — the 18% WR on the trades that DID complete shows the strategy logic itself is unprofitable.
 
 ### Caveats
 
@@ -441,19 +535,27 @@ At 10sh × ~$0.50 = ~$5 per position. Bank of $35-50 supports 5-10 concurrent po
 - Use ~50% for active swing trading (S3) — typically 1-3 open at once
 - Use ~20% for S4 ladders when conditions warrant
 
-### Combined daily P&L — ceiling vs realistic
+### Combined daily P&L — MEASURED (paper engine) vs estimated
 
-| Strategy | CEILING @ 10sh | Realistic @ 10sh (est.) | CEILING @ 100sh | Realistic @ 100sh (est.) |
-|---|---:|---:|---:|---:|
-| S1 (CB aligned $5-10) | $241 | ~$70-170 | $2,410 | ~$700-1,700 |
-| S2 (CB fade $15+) | $42 | ~$25-36 | $420 | ~$250-360 |
-| S3 (swing, indicator-based) | $284 | ~$90-200 | $2,840 | ~$900-2,000 |
-| S4 (MM, conditional) | TBD | TBD | TBD | TBD |
-| **Combined** | **$567** | **~$185-406** | **$5,670** | **~$1,850-4,060** |
+| Strategy | Measured (paper engine) @ 10sh | Status | Net at 100sh |
+|---|---:|---|---:|
+| S1 maker (at_bid) | **-$11/day** | Marginal — CI includes positive AND negative | -$110/day |
+| S1 taker (cross to ask) | **+$377/day** | Per-bucket CI all include zero — needs more data | +$3,770/day |
+| S2 maker (at_bid) | **+$32/day** | Matches earlier estimates, small n | +$320/day |
+| S2 taker (cross to ask) | **+$250/day** | Strongest measured signal — high confidence | +$2,500/day |
+| S3 (reactive indicator) | **-$935/day** | Strategy broken — confirmation eats swing | -$9,350/day |
+| S4 (conditional MM) | TBD | Not yet validated | TBD |
 
-**Combined realistic range at 10sh: $185-406/day. Mid-estimate ~$295/day.**
+**Naive sum (S1 taker + S2 taker): +$627/day at 10sh measured.**
 
-**These are GUESSES.** Confidence: low until Phase 2 is built and runs a realistic execution simulation against the tick data.
+But this is FUDGE because:
+1. S1 buckets aren't statistically distinguishable from zero — could be smaller
+2. Live execution headwinds shave another $0.005-$0.015/share
+3. Capital constraints — at 10sh × ~$0.50 entry = ~$5/trade, we can't have 5,000+ open positions
+4. The engine fill simulation has known limitations (assumes 100% taker fill, no slippage)
+
+**Honest realistic combined estimate at 10sh: $0-300/day**, with significant chance it could be negative.
+**Honest realistic combined estimate at 100sh: $0-3,000/day**, same uncertainty band.
 
 ---
 
@@ -490,3 +592,5 @@ Past mistake: claimed "$10+ has 58% continuation" based on n=19. At n=834 the tr
 |---|---|
 | 2026-05-21 | Initial document. S1, S2, S3 backtested; S4 proposed pending validation. |
 | 2026-05-21 | Updated to distinguish CEILING vs REALISTIC estimates throughout. Added Execution Headwinds section and "What we DON'T know yet" section. Backtest numbers are CEILINGS only. All realistic estimates explicitly labeled as educated guesses, not validated. |
+| 2026-05-21 | Added S5 (V4-LIVE legacy scalp) with documented live losses. |
+| 2026-05-22 | **Major update — measured all strategies via PaperOrderEngine.** Key findings: (1) S1 taker entry beats maker entry, contradicting earlier guidance. (2) None of S1 buckets statistically excludes zero — need ~3-5× more data for confidence. (3) S2 is the strongest measured signal (+$250/day taker). (4) S3 reactive indicator is broken — confirmation cost eats the swing. (5) Added explicit statistical confidence intervals and "P(true edge < 0)" probabilities for each S1 bucket. |
