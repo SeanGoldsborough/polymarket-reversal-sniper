@@ -148,30 +148,54 @@ SETTLEMENT_DELAY_MS = 1500
 
 class PaperOrderEngine(OrderEngine):
     """
-    Simulates fills against a replayed book.
+    Simulates fills against a replayed book WITH REALISTIC LATENCY.
 
     Call .update_book(state) on every tick from the replay engine. The engine
-    will check all open orders for fills using a conservative rule:
+    will check all open orders for fills.
+
+    Realistic taker behavior (FOK/FAK):
+      - When place_order is called, the order is PENDING until latency_ms has passed
+        in replay time. The order doesn't try to fill immediately.
+      - After latency_ms elapses, engine attempts fill against the CURRENT (post-latency)
+        ask/bid:
+          - If post-latency ask <= order.price: fill at post-latency ask
+            (this is "price improvement" — we pay the actual best ask, not our limit)
+          - If post-latency ask > order.price: FOK/FAK rejects (no match)
+      - This matches Polymarket's real FAK behavior: recorded ask is stale by the
+        time our order arrives; if the real ask has moved above our limit, the
+        order rejects.
+
+    Realistic maker behavior (GTC):
       - Maker BUY at $X fills when current_bid drops to $X or below
-        (i.e. the bid book has moved through our level — sellers crossed it)
       - Maker SELL at $X fills when current_ask rises to $X or above
-        (i.e. the ask book moved through our level — buyers crossed it)
-      - Partial fills based on size at our level at the moment of fill
-      - Taker FOK: fills entire size at current ask (BUY) or bid (SELL) if size available
-      - Taker FAK: fills what's available, cancels remainder
+      - (Future: with trade-event data, use volume-based queue advancement)
+      - No fee, full fill at limit price
+
+    Configuration:
+      - taker_latency_ms: simulated network latency for taker orders (default 150ms,
+        matches typical Ireland → US-East round trip + processing)
+      - maker_latency_ms: simulated latency for maker order placement (default 100ms,
+        but doesn't affect fill mechanics since maker orders just sit on book)
     """
 
-    def __init__(self, starting_usdc: float = 100.0, verbose: bool = False):
+    def __init__(self, starting_usdc: float = 100.0, verbose: bool = False,
+                 taker_latency_ms: int = 150, maker_latency_ms: int = 100):
         self.usdc = starting_usdc
         self.positions: Dict[str, float] = {}  # token_id -> shares held
         self.pending_settlement: List[Fill] = []  # buys waiting to settle
         self.open_orders: Dict[str, Order] = {}
+        self.pending_taker_orders: List[Order] = []  # taker orders awaiting latency window
         self._fill_callbacks: List[Callable[[Fill], None]] = []
         self._last_state: Optional[BookState] = None
         self.verbose = verbose
-        self.realized_pnl = 0.0  # sum of all fill cash flows (entries are negative, exits positive)
+        self.realized_pnl = 0.0  # sum of all fill cash flows
         self.total_fills = 0
         self.total_fees = 0.0
+        self.taker_latency_ms = taker_latency_ms
+        self.maker_latency_ms = maker_latency_ms
+        # Tracking for rejection diagnostics
+        self.taker_rejections = 0
+        self.taker_attempts = 0
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -181,7 +205,6 @@ class PaperOrderEngine(OrderEngine):
             raise RuntimeError("place_order called before update_book — engine has no market state")
 
         s = self._last_state
-        # Compute mid at placement for adverse-selection later
         if token_label == "UP":
             bid, ask = s.up_bid, s.up_ask
         else:
@@ -201,21 +224,17 @@ class PaperOrderEngine(OrderEngine):
         )
 
         if order_type in (OrderType.FOK, OrderType.FAK):
-            # Taker — try to fill immediately
-            self._try_taker_fill(order)
-            if order.status == OrderStatus.OPEN:
-                # FOK that couldn't fully fill is rejected
-                order.status = OrderStatus.REJECTED
+            # Taker — DON'T try to fill immediately. Queue for latency window.
+            # Engine will process when update_book sees a state with elapsed_ms
+            # >= placed_at_ms + taker_latency_ms.
+            self.taker_attempts += 1
+            self.pending_taker_orders.append(order)
+            order.status = OrderStatus.OPEN  # transient
             return order
 
-        # GTC: store and check for fill on next book update
+        # GTC (maker): goes on book; we don't simulate placement latency for fill
+        # mechanics because the order just sits there awaiting fills.
         self._record_queue_position(order)
-        # Check fill against CURRENT state in case our price already crosses
-        if self._would_fill_immediately(order):
-            self._fill_gtc_to_size(order, order.size, self._last_state)
-            if order.filled_size == order.size:
-                order.status = OrderStatus.FILLED
-                return order
         self.open_orders[order.id] = order
         return order
 
@@ -251,7 +270,15 @@ class PaperOrderEngine(OrderEngine):
         """Called on every tick from the replay engine."""
         self._last_state = state
         self._settle_pending()
-        # Check each open order for fills against this state
+        # Process pending taker orders whose latency window has elapsed
+        still_pending = []
+        for order in self.pending_taker_orders:
+            if state.elapsed_ms - order.placed_at_ms >= self.taker_latency_ms:
+                self._try_taker_fill_with_latency(order, state)
+            else:
+                still_pending.append(order)
+        self.pending_taker_orders = still_pending
+        # Check each open maker order for fills against this state
         for order_id in list(self.open_orders.keys()):
             order = self.open_orders.get(order_id)
             if not order:
@@ -389,8 +416,111 @@ class PaperOrderEngine(OrderEngine):
         if self.verbose:
             print(f"  [FILL] {order.side.value} {fill_size}sh {order.token_label} @ ${order.price:.3f} (order {order.id})")
 
+    def _try_taker_fill_with_latency(self, order: Order, state: BookState):
+        """
+        Process a taker order whose latency window has elapsed.
+        State is the CURRENT (post-latency) book — the order arrives "now" and
+        attempts to match against this state.
+
+        Polymarket behavior modeled:
+          - If current ask <= our limit price: fill at the CURRENT ask (price
+            improvement — we pay the actual best available, not our limit)
+          - If current ask > our limit price: FAK/FOK rejects (no match)
+        """
+        if order.side == Side.BUY:
+            cur_ask = state.up_ask if order.token_label == "UP" else state.down_ask
+            cur_ask_size = state.up_ask_size if order.token_label == "UP" else state.down_ask_size
+            if cur_ask <= 0 or cur_ask >= 1.0:
+                order.status = OrderStatus.REJECTED
+                self.taker_rejections += 1
+                return
+            if cur_ask > order.price:
+                # Real ask moved above our limit during latency — FAK rejects
+                order.status = OrderStatus.REJECTED
+                self.taker_rejections += 1
+                if self.verbose:
+                    print(f"  [TAKER-REJECT] {order.id} bid ${order.price:.2f} but real ask ${cur_ask:.2f}")
+                return
+            # Determine fill size
+            available = cur_ask_size if cur_ask_size > 0 else order.size  # assume size if WS missing
+            if order.order_type == OrderType.FOK and available < order.size:
+                # Strict FOK — needs full size
+                order.status = OrderStatus.REJECTED
+                self.taker_rejections += 1
+                return
+            fill_size = min(available, order.size)
+            if fill_size <= 0:
+                order.status = OrderStatus.REJECTED
+                self.taker_rejections += 1
+                return
+            # Fill at the ACTUAL ask, not our limit (price improvement)
+            fill_price = cur_ask
+            fee = taker_fee(fill_price, fill_size)
+            mid_at_fill = (state.up_bid + state.up_ask) / 2 if order.token_label == "UP" else \
+                          (state.down_bid + state.down_ask) / 2
+            fill = Fill(
+                order_id=order.id, token_id=order.token_id, token_label=order.token_label,
+                side=order.side, size=fill_size, price=fill_price, fee=fee, ts_ms=state.elapsed_ms,
+                mid_at_fill=mid_at_fill,
+            )
+            order.filled_size = fill_size
+            order.fill_avg_price = fill_price
+            order.total_fees = fee
+            order.mid_at_fill = mid_at_fill
+            order.fill_first_at_ms = state.elapsed_ms
+            order.status = OrderStatus.FILLED if fill_size >= order.size - 0.01 else OrderStatus.PARTIAL
+            self.usdc -= fill_size * fill_price + fee
+            self.pending_settlement.append(fill)
+            self.total_fills += 1
+            self.total_fees += fee
+            self._emit_fill(fill)
+        else:  # SELL
+            cur_bid = state.up_bid if order.token_label == "UP" else state.down_bid
+            cur_bid_size = state.up_bid_size if order.token_label == "UP" else state.down_bid_size
+            if cur_bid <= 0:
+                order.status = OrderStatus.REJECTED
+                self.taker_rejections += 1
+                return
+            if cur_bid < order.price:
+                # Real bid moved below our minimum — FAK rejects
+                order.status = OrderStatus.REJECTED
+                self.taker_rejections += 1
+                return
+            self._settle_pending()
+            held = self.positions.get(order.token_id, 0.0)
+            if held < order.size and order.order_type == OrderType.FOK:
+                order.status = OrderStatus.REJECTED
+                self.taker_rejections += 1
+                return
+            available = cur_bid_size if cur_bid_size > 0 else order.size
+            fill_size = min(available, order.size, held)
+            if fill_size <= 0:
+                order.status = OrderStatus.REJECTED
+                self.taker_rejections += 1
+                return
+            fill_price = cur_bid
+            fee = taker_fee(fill_price, fill_size)
+            mid_at_fill = (state.up_bid + state.up_ask) / 2 if order.token_label == "UP" else \
+                          (state.down_bid + state.down_ask) / 2
+            fill = Fill(
+                order_id=order.id, token_id=order.token_id, token_label=order.token_label,
+                side=order.side, size=fill_size, price=fill_price, fee=fee, ts_ms=state.elapsed_ms,
+                mid_at_fill=mid_at_fill,
+            )
+            order.filled_size = fill_size
+            order.fill_avg_price = fill_price
+            order.total_fees = fee
+            order.status = OrderStatus.FILLED if fill_size >= order.size - 0.01 else OrderStatus.PARTIAL
+            self.usdc += fill_size * fill_price - fee
+            self.positions[order.token_id] = held - fill_size
+            self.total_fills += 1
+            self.total_fees += fee
+            self._emit_fill(fill)
+
     def _try_taker_fill(self, order: Order):
-        """For FOK/FAK orders, try to fill immediately against current book."""
+        """LEGACY: instantaneous taker fill (no latency). Kept for back-compat with smoke test.
+        Production should use _try_taker_fill_with_latency via the pending_taker_orders queue.
+        """
         s = self._last_state
         if order.side == Side.BUY:
             ask = s.up_ask if order.token_label == "UP" else s.down_ask
