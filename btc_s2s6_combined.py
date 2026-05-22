@@ -185,10 +185,19 @@ class S2S6Bot:
 
     def place_taker_buy(self, token_id: str, ask_price: float, shares: int, strategy: str) -> dict:
         """
-        Place a taker FAK buy. Polymarket FAK requires a matching ask to exist at
-        our bid price OR LOWER. The recorded ask is from the last WS tick and may
-        be stale by the time our order arrives. We escalate price across attempts
-        to guarantee a fill.
+        Polymarket "market order" equivalent — single FAK with price improvement.
+
+        Polymarket gives price improvement: if we bid $0.99 and the best ask is $0.74,
+        we fill at $0.74 (not $0.99). So we bid HIGH ENOUGH to ensure we match any
+        reasonable ask, then we get charged the actual best-ask price.
+
+        Safety cap: bid at recorded_ask + $0.05 (max $0.98). This:
+          - Captures normal latency-induced ask movement (~$0.01-$0.03)
+          - Protects against catastrophic moves: if real ask jumped >$0.05 above
+            recorded, FAK rejects and we miss the trade (instead of paying way too much)
+          - With price improvement, we pay the actual best ask, NOT our $0.05-above bid
+
+        Single API call. No escalation. No arbitrary markup ladder.
         """
         self.trade_id += 1
         tid = self.trade_id
@@ -199,38 +208,40 @@ class S2S6Bot:
             log_msg(f"[NO-CLIENT] {strategy} #{tid} would buy {shares}sh @ ${ask_price:.2f}")
             return result
 
-        # Escalating markup over recorded ask: try at, then +$0.02, then +$0.05
-        for attempt, markup in enumerate([0.0, 0.02, 0.05]):
-            bid_price = snap_price(min(ask_price + markup, 0.98))
+        # "Market order" — bid up to $0.05 above recorded ask to allow for ask movement
+        # during network latency. Polymarket fills at actual best ask (price improvement).
+        bid_price = snap_price(min(ask_price + 0.05, 0.98))
+        try:
+            args = OrderArgs(price=bid_price, size=shares, side=BUY, token_id=token_id)
+            signed = self.client.create_order(args)
+            resp = self.client.post_order(signed, OrderType.FAK)
+            order_id = resp.get("orderID", "")
+            time.sleep(0.3)
             try:
-                args = OrderArgs(price=bid_price, size=shares, side=BUY, token_id=token_id)
-                signed = self.client.create_order(args)
-                resp = self.client.post_order(signed, OrderType.FAK)
-                order_id = resp.get("orderID", "")
-                time.sleep(0.3)
-                try:
-                    order = self.client.get_order(order_id)
-                    if order:
-                        matched = float(order.get("size_matched", 0))
-                        if matched > 0:
-                            result["filled_size"] = matched
-                            result["fill_price"] = float(order.get("price", bid_price))
-                            result["fee"] = calc_taker_fee(result["fill_price"], matched)
-                            log_msg(f"[{strategy}] #{tid} BOUGHT {matched:.0f}sh @ "
-                                    f"${result['fill_price']:.2f} (bid ${bid_price:.2f}, "
-                                    f"fee ${result['fee']:.3f}, attempt {attempt+1})")
-                            return result
-                except Exception:
-                    pass
-            except Exception as e:
-                err = str(e)[:120]
-                if "no orders found to match" in err:
-                    log_msg(f"[{strategy}] #{tid} FAK at ${bid_price:.2f} — no match, escalating")
-                    continue
-                else:
-                    log_msg(f"[{strategy}-FAIL] #{tid} attempt {attempt+1}: {err}")
-                    break
-        log_msg(f"[{strategy}-FAIL] #{tid} all 3 attempts exhausted (last +$0.05 above recorded ask)")
+                order = self.client.get_order(order_id)
+                if order:
+                    matched = float(order.get("size_matched", 0))
+                    if matched > 0:
+                        result["filled_size"] = matched
+                        # fill_price returned by API is the actual fill price (price improvement)
+                        result["fill_price"] = float(order.get("price", bid_price))
+                        result["fee"] = calc_taker_fee(result["fill_price"], matched)
+                        log_msg(f"[{strategy}] #{tid} BOUGHT {matched:.0f}sh @ "
+                                f"${result['fill_price']:.2f} (bid cap ${bid_price:.2f}, "
+                                f"fee ${result['fee']:.3f})")
+                        return result
+                    else:
+                        log_msg(f"[{strategy}-NOFILL] #{tid} FAK at ${bid_price:.2f} — "
+                                f"no match (real ask > ${bid_price:.2f})")
+            except Exception:
+                pass
+        except Exception as e:
+            err = str(e)[:120]
+            if "no orders found to match" in err:
+                log_msg(f"[{strategy}-NOFILL] #{tid} FAK at ${bid_price:.2f} — no match "
+                        f"(real ask jumped > ${bid_price:.2f} during latency)")
+            else:
+                log_msg(f"[{strategy}-FAIL] #{tid} {err}")
         return result
 
     def record_trade(self, trade: dict, exit_price: float = 0, reason: str = ""):

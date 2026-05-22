@@ -176,6 +176,28 @@
   this by relying on 5-min directional predictability. Data validates S6 (75% WR).**
   Mantra may need updating but per user preference is not edited without explicit say.
 
+### Live run learnings (2026-05-22 first session)
+- **9 trades, 6W/3L (67% WR), net -$6.57** — below the 75% backtest WR
+- R:R was 1:3.5 (avg win $1.46, avg loss $5.11). Break-even WR ~78%, we measured 67%.
+- Live entry prices were systematically worse than backtest assumed:
+  - FAK orders at recorded ask kept rejecting because ask moved up during latency
+  - First patch (escalation $0.02 → $0.05) made losses bigger when we paid the higher level
+  - Some wins at $0.98 entry were tiny ($0.14) while losses were full ($5)
+- **Lessons codified**: paper engine has fidelity issues (didn't catch the FAK
+  rejection problem), code changes were pushed live without paper testing
+  (rule now: never again), R:R asymmetry is brutal at high entry prices
+
+### 2026-05-22 — Replaced escalation with "market order" approach
+- **Before**: escalating bid $0.00 → +$0.02 → +$0.05 markups, 3 attempts per trade
+- **After**: single FAK at recorded_ask + $0.05 (capped at $0.98)
+- **Why**: Polymarket gives price improvement — bidding higher just sets a cap; we still
+  pay the actual best ask. So $0.05 markup acts as a slippage tolerance, not a markup
+  paid. 1 API call instead of 3, no arbitrary markup ladder.
+- **Source**: Confirmed via Polymarket docs: "if you submit a buy order at $0.55 and it
+  matches with a sell order at $0.52, you'll pay the lower price of $0.52"
+- **Status**: Code change made, bot STOPPED, NOT redeployed. Will validate in paper
+  before any future live deploy.
+
 ### V4-LIVE-0.2 vs V4 Paper — Strategy Comparison
 
 | Feature | V4 Paper | V4-LIVE-0.2 |
