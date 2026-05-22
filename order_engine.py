@@ -72,6 +72,9 @@ class Order:
     # Paper-only metadata:
     queue_position: float = 0.0  # estimated size ahead of us when placed
     last_seen_size_at_price: float = 0.0  # bid/ask size at our price, latest observation
+    mid_at_placement: float = 0.0       # midpoint of our side at order placement
+    mid_at_fill: float = 0.0            # midpoint at first fill (for adverse-selection)
+    fill_first_at_ms: int = 0           # first fill timestamp
 
 
 @dataclass
@@ -84,6 +87,10 @@ class Fill:
     price: float
     fee: float
     ts_ms: int
+    mid_at_fill: float = 0.0      # for adverse-selection measurement
+    # adverse_cost at fill = (our fill price - mid_at_fill) for BUY, (mid_at_fill - fill price) for SELL
+    # Positive = we paid worse than fair value
+    # Computed externally; not stored here directly.
 
 
 def taker_fee(price: float, size: float) -> float:
@@ -173,6 +180,14 @@ class PaperOrderEngine(OrderEngine):
         if self._last_state is None:
             raise RuntimeError("place_order called before update_book — engine has no market state")
 
+        s = self._last_state
+        # Compute mid at placement for adverse-selection later
+        if token_label == "UP":
+            bid, ask = s.up_bid, s.up_ask
+        else:
+            bid, ask = s.down_bid, s.down_ask
+        mid_at_placement = (bid + ask) / 2 if (bid > 0 and ask > 0) else 0.0
+
         order = Order(
             id=str(uuid.uuid4())[:8],
             token_id=token_id,
@@ -181,7 +196,8 @@ class PaperOrderEngine(OrderEngine):
             price=price,
             size=size,
             order_type=order_type,
-            placed_at_ms=self._last_state.elapsed_ms,
+            placed_at_ms=s.elapsed_ms,
+            mid_at_placement=mid_at_placement,
         )
 
         if order_type in (OrderType.FOK, OrderType.FAK):
@@ -296,13 +312,17 @@ class PaperOrderEngine(OrderEngine):
     def _check_gtc_for_fill(self, order: Order, state: BookState):
         """
         Conservative GTC fill rule:
-          - Maker BUY at $X fills when the bid drops to $X or below (book moved through us)
-          - Maker SELL at $X fills when the ask rises to $X or above
+          - Maker BUY at $X fills when the bid drops STRICTLY BELOW $X (book moved through us).
+            We don't fill just because bid == our price — that means we joined the queue at
+            that level. We fill only when the book has clearly moved past our level, indicating
+            our queue position has been consumed.
+          - Maker SELL at $X fills when the ask rises STRICTLY ABOVE $X.
         Partial fill if available size is smaller than our remaining size.
         """
         if order.side == Side.BUY:
             cur_bid = state.up_bid if order.token_label == "UP" else state.down_bid
-            if cur_bid > 0 and cur_bid <= order.price:
+            # Skip until bid has moved STRICTLY below our level (book moved through us)
+            if cur_bid > 0 and cur_bid < order.price:
                 # Fill triggered
                 remaining = order.size - order.filled_size
                 # Conservative: assume we can fill our remaining size (less queue position)
@@ -318,7 +338,8 @@ class PaperOrderEngine(OrderEngine):
                     order.status = OrderStatus.PARTIAL
         else:  # SELL
             cur_ask = state.up_ask if order.token_label == "UP" else state.down_ask
-            if cur_ask > 0 and cur_ask >= order.price:
+            # Strictly above — book must have moved through our sell level
+            if cur_ask > 0 and cur_ask > order.price:
                 remaining = order.size - order.filled_size
                 fill_size = max(0.0, remaining - order.queue_position * 0.5)
                 if fill_size <= 0.01:
@@ -333,6 +354,13 @@ class PaperOrderEngine(OrderEngine):
 
     def _fill_gtc_to_size(self, order: Order, fill_size: float, state: BookState):
         """Apply a fill of `fill_size` to a maker order at order.price (no fee)."""
+        # Compute mid at fill for adverse-selection measurement
+        if order.token_label == "UP":
+            bid, ask = state.up_bid, state.up_ask
+        else:
+            bid, ask = state.down_bid, state.down_ask
+        mid_at_fill = (bid + ask) / 2 if (bid > 0 and ask > 0) else 0.0
+
         fill = Fill(
             order_id=order.id,
             token_id=order.token_id,
@@ -342,7 +370,12 @@ class PaperOrderEngine(OrderEngine):
             price=order.price,
             fee=0.0,  # maker = no fee
             ts_ms=state.elapsed_ms,
+            mid_at_fill=mid_at_fill,
         )
+        if order.filled_size == 0:
+            # First fill — capture for adverse selection tracking
+            order.mid_at_fill = mid_at_fill
+            order.fill_first_at_ms = state.elapsed_ms
         order.filled_size += fill_size
         order.fill_avg_price = order.price  # all fills at our limit
         if order.side == Side.BUY:
@@ -417,21 +450,203 @@ class PaperOrderEngine(OrderEngine):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Live implementation stub (not built yet)
+# Live implementation (wraps py_clob_client_v2)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LiveOrderEngine(OrderEngine):
-    """Not implemented yet. Will wrap py_clob_client_v2 calls."""
+    """
+    Wraps py_clob_client_v2.ClobClient to expose the same interface as PaperOrderEngine.
 
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError("LiveOrderEngine not built yet — see TODO in Phase 2")
+    Strategy code can switch between paper and live by swapping which engine class
+    is instantiated — no other code changes needed.
 
-    def place_order(self, *a, **kw): raise NotImplementedError()
-    def cancel(self, *a, **kw): raise NotImplementedError()
-    def cancel_all(self, *a, **kw): raise NotImplementedError()
-    def get_open_orders(self, *a, **kw): raise NotImplementedError()
-    def get_position(self, *a, **kw): raise NotImplementedError()
-    def get_usdc_balance(self, *a, **kw): raise NotImplementedError()
+    Fill detection: polls get_order(order_id) after placement. For taker FOK/FAK,
+    fills are reported immediately. For maker GTC, the engine returns OPEN and
+    the strategy or a poll loop should check periodically (or use WS user channel
+    in a future enhancement).
+    """
+
+    def __init__(self, clob_client, signature_type: int = 2, default_token_label_map=None):
+        """
+        clob_client: an authenticated ClobClient instance
+        signature_type: Polymarket signature type for balance/approval calls (typically 2)
+        default_token_label_map: optional dict {token_id: "UP" or "DN"} for fill enrichment
+        """
+        self.client = clob_client
+        self.signature_type = signature_type
+        self.token_label_map = default_token_label_map or {}
+        self._fill_callbacks: List[Callable[[Fill], None]] = []
+        # Local cache of orders we placed (for cancel + status tracking)
+        self._our_orders: Dict[str, Order] = {}
+
+    def place_order(self, token_id: str, token_label: str, side: Side,
+                    price: float, size: float, order_type: OrderType) -> Order:
+        # Lazy import to avoid hard dependency at module level
+        try:
+            from py_clob_client_v2.clob_types import OrderArgs, OrderType as ClobOrderType, BalanceAllowanceParams
+            from py_clob_client_v2.order_builder.constants import BUY, SELL
+        except ImportError as e:
+            raise RuntimeError(f"py_clob_client_v2 not available: {e}")
+
+        # Map our enums to Polymarket SDK
+        clob_side = BUY if side == Side.BUY else SELL
+        type_map = {
+            OrderType.GTC: ClobOrderType.GTC,
+            OrderType.FOK: ClobOrderType.FOK,
+            OrderType.FAK: ClobOrderType.FAK,
+        }
+        clob_type = type_map.get(order_type, ClobOrderType.GTC)
+
+        # Snap price to 2 decimals (Polymarket tick size)
+        snapped = round(round(price * 100) / 100, 2)
+
+        order = Order(
+            id="",
+            token_id=token_id,
+            token_label=token_label,
+            side=side,
+            price=snapped,
+            size=size,
+            order_type=order_type,
+            placed_at_ms=int(__import__("time").time() * 1000),
+        )
+
+        try:
+            args = OrderArgs(price=snapped, size=int(size), side=clob_side, token_id=token_id)
+            signed = self.client.create_order(args)
+            resp = self.client.post_order(signed, clob_type)
+            order_id = resp.get("orderID", "")
+            order.id = order_id
+            # For takers, check immediate fill
+            if order_type in (OrderType.FOK, OrderType.FAK):
+                # Brief settle, then check
+                import time as _t
+                _t.sleep(0.25)
+                self._refresh_from_api(order)
+                if order.filled_size >= order.size - 0.01:
+                    order.status = OrderStatus.FILLED
+                elif order.filled_size > 0:
+                    order.status = OrderStatus.PARTIAL
+                else:
+                    # Polymarket may report null status if filled+settled fast
+                    order.status = OrderStatus.REJECTED if order_type == OrderType.FOK else OrderStatus.CANCELLED
+            else:
+                order.status = OrderStatus.OPEN
+                self._our_orders[order_id] = order
+        except Exception as e:
+            order.status = OrderStatus.REJECTED
+            order.fill_avg_price = 0
+            # propagate-ish: caller can inspect status
+            raise
+
+        return order
+
+    def _refresh_from_api(self, order: Order) -> None:
+        """Query the API for current status of `order` and update fields in place."""
+        if not order.id:
+            return
+        try:
+            api_order = self.client.get_order(order.id)
+        except Exception:
+            return
+        if not api_order:
+            return
+        matched = float(api_order.get("size_matched", 0))
+        if matched > order.filled_size:
+            # New fills since last check — emit event
+            new_size = matched - order.filled_size
+            fill = Fill(
+                order_id=order.id,
+                token_id=order.token_id,
+                token_label=order.token_label,
+                side=order.side,
+                size=new_size,
+                price=float(api_order.get("price", order.price)),
+                fee=0.0,  # Polymarket reports fees separately; not always available
+                ts_ms=int(__import__("time").time() * 1000),
+            )
+            order.filled_size = matched
+            order.fill_avg_price = float(api_order.get("price", order.price))
+            if order.filled_size == 0:
+                pass
+            elif order.filled_size >= order.size - 0.01:
+                order.status = OrderStatus.FILLED
+            else:
+                order.status = OrderStatus.PARTIAL
+            self._emit_fill(fill)
+
+    def cancel(self, order_id: str) -> bool:
+        try:
+            self.client.cancel_orders([order_id])
+            if order_id in self._our_orders:
+                o = self._our_orders[order_id]
+                # Re-check status — cancel might have raced with a fill
+                self._refresh_from_api(o)
+                if o.status != OrderStatus.FILLED:
+                    o.status = OrderStatus.CANCELLED
+                del self._our_orders[order_id]
+            return True
+        except Exception:
+            return False
+
+    def cancel_all(self) -> int:
+        n = 0
+        for oid in list(self._our_orders.keys()):
+            if self.cancel(oid):
+                n += 1
+        return n
+
+    def get_open_orders(self) -> List[Order]:
+        # Refresh local cache from API
+        try:
+            from py_clob_client_v2.clob_types import OpenOrderParams
+            api_orders = self.client.get_open_orders(OpenOrderParams()) or []
+        except Exception:
+            return list(self._our_orders.values())
+        # Update local cache from API truth
+        api_ids = {o.get("id", ""): o for o in api_orders}
+        # Drop locally-tracked orders that no longer exist remotely
+        for oid in list(self._our_orders.keys()):
+            if oid not in api_ids:
+                self._refresh_from_api(self._our_orders[oid])
+                del self._our_orders[oid]
+        return list(self._our_orders.values())
+
+    def get_position(self, token_id: str) -> float:
+        try:
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams
+            params = BalanceAllowanceParams(asset_type="CONDITIONAL", token_id=token_id,
+                                            signature_type=self.signature_type)
+            self.client.update_balance_allowance(params)
+            result = self.client.get_balance_allowance(params)
+            return int(result.get("balance", "0")) / 1_000_000
+        except Exception:
+            return 0.0
+
+    def get_usdc_balance(self) -> float:
+        try:
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams
+            params = BalanceAllowanceParams(asset_type="COLLATERAL", token_id="",
+                                            signature_type=self.signature_type)
+            self.client.update_balance_allowance(params)
+            result = self.client.get_balance_allowance(params)
+            return int(result.get("balance", "0")) / 1_000_000
+        except Exception:
+            return 0.0
+
+    def poll_fills(self) -> int:
+        """
+        Iterate all our open orders, refresh from API. Fires fill callbacks for any new fills.
+        Returns the number of newly-detected fill events.
+        Call this periodically (e.g., every 100-500ms) for makers awaiting fills.
+        """
+        before = sum(o.filled_size for o in self._our_orders.values())
+        for o in list(self._our_orders.values()):
+            self._refresh_from_api(o)
+            if o.status == OrderStatus.FILLED:
+                del self._our_orders[o.id]
+        after = sum(o.filled_size for o in self._our_orders.values())
+        return 1 if after != before else 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -184,7 +184,12 @@ class S2S6Bot:
                 pass
 
     def place_taker_buy(self, token_id: str, ask_price: float, shares: int, strategy: str) -> dict:
-        """Place a taker FAK buy at the ask. Returns dict with success + fill info."""
+        """
+        Place a taker FAK buy. Polymarket FAK requires a matching ask to exist at
+        our bid price OR LOWER. The recorded ask is from the last WS tick and may
+        be stale by the time our order arrives. We escalate price across attempts
+        to guarantee a fill.
+        """
         self.trade_id += 1
         tid = self.trade_id
         result = {"tid": tid, "strategy": strategy, "token_id": token_id,
@@ -193,26 +198,39 @@ class S2S6Bot:
         if not self.client:
             log_msg(f"[NO-CLIENT] {strategy} #{tid} would buy {shares}sh @ ${ask_price:.2f}")
             return result
-        try:
-            args = OrderArgs(price=snap_price(ask_price), size=shares, side=BUY, token_id=token_id)
-            signed = self.client.create_order(args)
-            resp = self.client.post_order(signed, OrderType.FAK)
-            order_id = resp.get("orderID", "")
-            # Check actual fill (FAK fills what's available)
-            time.sleep(0.3)  # let settle
+
+        # Escalating markup over recorded ask: try at, then +$0.02, then +$0.05
+        for attempt, markup in enumerate([0.0, 0.02, 0.05]):
+            bid_price = snap_price(min(ask_price + markup, 0.98))
             try:
-                order = self.client.get_order(order_id)
-                if order:
-                    matched = float(order.get("size_matched", 0))
-                    result["filled_size"] = matched
-                    result["fill_price"] = float(order.get("price", ask_price))
-                    result["fee"] = calc_taker_fee(result["fill_price"], matched)
-                    log_msg(f"[{strategy}] #{tid} BOUGHT {matched:.0f}sh @ ${result['fill_price']:.2f} "
-                            f"(fee ${result['fee']:.3f})")
-            except Exception:
-                pass
-        except Exception as e:
-            log_msg(f"[{strategy}-FAIL] #{tid} {str(e)[:100]}")
+                args = OrderArgs(price=bid_price, size=shares, side=BUY, token_id=token_id)
+                signed = self.client.create_order(args)
+                resp = self.client.post_order(signed, OrderType.FAK)
+                order_id = resp.get("orderID", "")
+                time.sleep(0.3)
+                try:
+                    order = self.client.get_order(order_id)
+                    if order:
+                        matched = float(order.get("size_matched", 0))
+                        if matched > 0:
+                            result["filled_size"] = matched
+                            result["fill_price"] = float(order.get("price", bid_price))
+                            result["fee"] = calc_taker_fee(result["fill_price"], matched)
+                            log_msg(f"[{strategy}] #{tid} BOUGHT {matched:.0f}sh @ "
+                                    f"${result['fill_price']:.2f} (bid ${bid_price:.2f}, "
+                                    f"fee ${result['fee']:.3f}, attempt {attempt+1})")
+                            return result
+                except Exception:
+                    pass
+            except Exception as e:
+                err = str(e)[:120]
+                if "no orders found to match" in err:
+                    log_msg(f"[{strategy}] #{tid} FAK at ${bid_price:.2f} — no match, escalating")
+                    continue
+                else:
+                    log_msg(f"[{strategy}-FAIL] #{tid} attempt {attempt+1}: {err}")
+                    break
+        log_msg(f"[{strategy}-FAIL] #{tid} all 3 attempts exhausted (last +$0.05 above recorded ask)")
         return result
 
     def record_trade(self, trade: dict, exit_price: float = 0, reason: str = ""):
