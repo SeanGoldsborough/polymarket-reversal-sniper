@@ -24,7 +24,8 @@ The realistic numbers carry significant uncertainty — they could be higher or 
 | S2 (maker) | CB-fade hold (large) | CB ±$15+ | Maker @ bid | **+$32** | Matches earlier estimate, small n (209 signals) | Promising |
 | S2 (taker) | CB-fade hold (large) | CB ±$15+ | Taker @ ask | **+$250** | Higher confidence — 77% WR, n=163 | **Strongest measured signal** |
 | S3 | Swing capture (reactive indicator) | Local-low + $0.02 bounce | Taker @ ask | **-$935** | Strategy logic flawed — confirmation eats swing | **BROKEN as written** |
-| S4 | Conditional MM | Spread > $0.03 | Maker ladders | TBD | Not yet validated | Proposed |
+| S3-v2 | Swing capture ($0.06+ amplitude filter) | Local-low + $0.03 bounce, range ≥$0.06 | Taker @ ask | **-$418** | Amplitude filter helps selection but doesn't fix confirmation cost | Still broken |
+| S4 | Conditional MM | Spread > $0.03 | Maker ladders | **-$514** | Engine measures worst-case adverse selection only | **Unknown — needs trade-event data to measure fairly** |
 | S5 | CB-aligned scalp (V4-LIVE legacy) | CB ±$5 | Maker + TP/SL | **-$60** (live measured) | Live trading data | **Documented loser — do not revive** |
 
 **⚠️ Statistical reality check (added after engine validation 2026-05-22):**
@@ -350,11 +351,18 @@ We capture ZERO when swings are exactly $0.04 — then we LOSE fees on top.
 
 The original $284/day "ceiling" assumed a PERFECT ORACLE — knew the exact low/high in advance. A real indicator can't do that without confirmation, and confirmation costs ~$0.04 per round-trip in this market.
 
-### Three possible fixes (untested)
+### Three possible fixes — TESTED
 
 1. **Lower confirmation threshold to $0.01 each side** — captures $0.02 vs $0.04 confirmation cost. Might break even but won't have edge unless swings >$0.04 are common.
-2. **Target only larger swings ($0.06+ amplitude)** — fewer trades, but each captures real edge after the $0.04 confirmation cost. Probably the right approach.
-3. **Switch to passive maker ladders (S4 concept)** — pre-placed orders at fixed levels capture swings without confirmation cost. The library's $284 ceiling implicitly required this approach all along.
+
+2. **Target only larger swings ($0.06+ amplitude) with $0.03 confirmation** — tested 2026-05-22 on 50 windows:
+   - 3,751 entries attempted, 257 filled (7%)
+   - **26% WR, -$0.031/share avg = -$418/day at 10sh**
+   - Still losing. The amplitude filter helps trade selection but the confirmation cost remains.
+
+3. **Switch to passive maker ladders (S4 concept)** — tested as S4 separately, also showed losses under conservative-fill rule. Real fills with trade-event data may improve this; until then, unknown.
+
+**Verdict: NO reactive variant of S3 measured as profitable.** The fundamental issue is confirmation cost on each side.
 
 ### Verdict
 
@@ -416,7 +424,40 @@ Wait for fills. Cancel and re-place when:
 - Adverse selection still possible (price might move through our level before we cancel)
 - Inventory accumulation if we get filled on only one side
 
-**Status: needs validation via the replay engine and order execution module before any live deploy.**
+### Measured results — paper engine (2026-05-22)
+
+Tested with `spread_threshold ∈ {$0.03, $0.05}`, both losing money.
+
+| Config | Quotes | Buy fills | Cycles | WR | $/cycle | Per-day @ 10sh |
+|---|---:|---:|---:|---:|---:|---:|
+| Threshold $0.03 | 5,976 | 134 | 134 | 49% | -$0.067 | **-$514** |
+| Threshold $0.05 | 2,807 | 51 | 51 | 40% | -$0.102 | -$301 |
+
+Higher selectivity is WORSE per-cycle. That's a red flag.
+
+### Why the engine measurement may understate true S4
+
+The conservative fill rule **only counts fills where the bid moves STRICTLY THROUGH our level**. By definition, these are adverse-selection fills:
+- Bid drops through our buy → side is weakening → we bought into weakness
+- 100% of our measured fills are this adverse kind
+
+In reality, maker fills also occur when bid stays at our level and a casual seller crosses — these are NEUTRAL fills with mixed P&L. Our engine can't simulate these without trade-event data.
+
+So the engine's -$514/day for S4 is the **worst-case lower bound**. True S4 P&L could be:
+- Negative (if adverse selection dominates)
+- Near zero (if neutral fills offset adverse ones)
+- Slightly positive (if neutral fills happen often enough)
+
+**We don't know which without trade-event simulation.**
+
+### Path forward
+
+Cannot deploy S4 with confidence based on current measurement. Need:
+1. Trade-event data (currently accumulating, ~53 windows captured)
+2. Queue-advancing simulator that distinguishes adverse vs neutral fills
+3. Then re-measure S4 with both fill types modeled
+
+Estimated timeline: ~1-2 more days of capture + 4-6 hours of simulator work.
 
 ---
 
@@ -594,3 +635,4 @@ Past mistake: claimed "$10+ has 58% continuation" based on n=19. At n=834 the tr
 | 2026-05-21 | Updated to distinguish CEILING vs REALISTIC estimates throughout. Added Execution Headwinds section and "What we DON'T know yet" section. Backtest numbers are CEILINGS only. All realistic estimates explicitly labeled as educated guesses, not validated. |
 | 2026-05-21 | Added S5 (V4-LIVE legacy scalp) with documented live losses. |
 | 2026-05-22 | **Major update — measured all strategies via PaperOrderEngine.** Key findings: (1) S1 taker entry beats maker entry, contradicting earlier guidance. (2) None of S1 buckets statistically excludes zero — need ~3-5× more data for confidence. (3) S2 is the strongest measured signal (+$250/day taker). (4) S3 reactive indicator is broken — confirmation cost eats the swing. (5) Added explicit statistical confidence intervals and "P(true edge < 0)" probabilities for each S1 bucket. |
+| 2026-05-22 | Added S3-v2 ($0.06+ amplitude filter) and S4 measurement results. S3-v2 still loses (-$418/day) — amplitude filter helps selection but confirmation cost remains. S4 measures -$514/day but this is worst-case adverse selection only; true S4 unknown until trade-event simulation. |
