@@ -23,10 +23,13 @@ The realistic numbers carry significant uncertainty — they could be higher or 
 | S2 | CB-fade hold (large) | CB ±$15+ in 1s | Buy opposite, hold to resolution | $42 | ~$30-35 | Lower — better fill mechanics, but smaller n (164) |
 | S3 | Swing capture | Local-low indicator | Buy near low, sell at next high | $284 | ~$150-200 | Medium — uses generous 200ms reactive latency; real indicator-based detection untested |
 | S4* | Conditional MM | Spread > $0.03 | Maker ladder both sides | TBD | TBD | None — not yet backtested |
+| **S5** | **CB-aligned scalp (V4-LIVE legacy)** | **CB ±$5 in 1s** | **Buy aligned, TP +$0.04, SL -$0.02, hold-to-BE on SL** | **n/a — measured live** | **-$24 over 178 trades = ~-$60/day at 10sh** | **High — actual live execution data** |
 
 \* S4 is proposed but not yet validated.
 
-**Combined realistic ceiling: ~$330/day at 10sh. Could be higher (~$500) or lower (~$150) depending on actual execution.**
+**S5 is the original V4-LIVE bot strategy. It was deployed and LOST money in live testing.** Included here for reference and to avoid re-discovery. See S5 section below for the why.
+
+**Combined realistic ceiling for S1-S4: ~$330/day at 10sh. Could be higher (~$500) or lower (~$150) depending on actual execution.**
 
 ---
 
@@ -320,6 +323,86 @@ Wait for fills. Cancel and re-place when:
 - Inventory accumulation if we get filled on only one side
 
 **Status: needs validation via the replay engine and order execution module before any live deploy.**
+
+---
+
+## S5: CB-aligned scalp with TP/SL (V4-LIVE legacy)
+
+⚠️ **This strategy LOST money in live testing.** Documented here so we don't accidentally re-implement it without remembering the history.
+
+### When to fire
+
+Coinbase BTC moves $5+ in 1 second.
+
+### Action
+
+1. Buy the side aligned with CB direction (same as S1)
+2. Place a maker GTC BUY at the current ask (taker entry path) or bid (maker path)
+3. After fill, place a maker GTC SELL at `entry + $0.04` (TP)
+4. If bid drops to `entry - $0.02` (SL), enter "hold-until-BE" mode:
+   - Cancel TP
+   - Wait for bid to recover to entry
+   - Sell at entry for $0 P&L
+5. At T+180 (120s before window end), force-exit if still holding
+
+### Why it was tried
+
+This was the V4-LIVE bot's design from May 2026. The thinking was: short-term Polymarket bid reacts to CB moves with ~$0.04 amplitude within seconds. TP captures the reaction. SL caps downside. If SL triggers but recovers to BE, we lose nothing.
+
+### Actual live performance (from `/home/ubuntu/polymarket-bot/logs/btc_scalp_v4live_02_trades.jsonl`)
+
+| Outcome | Count | Total P&L | Avg/trade |
+|---|---:|---:|---:|
+| TP | 12 | +$4.80 | +$0.40 |
+| TP-BOUNCE | 16 | +$6.36 | +$0.40 |
+| MAX-HOLD | 15 | +$17.82 | +$1.19 |
+| SL-BE | 58 | -$0.30 | -$0.005 |
+| FORCE-EXIT | 16 | **-$55.53** | -$3.47 |
+| DYN-SL (reverted) | 5 | -$5.60 | -$1.12 |
+| UNFILLED | 71 | $0 | — |
+| BUY-FAIL | 9 | $0 | — |
+| **TOTAL** | **202** | **-$32.45** | -$0.16 |
+
+Win rate (P&L > 0): **22%** (TP + TP-BOUNCE + MAX-HOLD = 43 of 202 signals were positive).
+Per-day rate: approximately **-$60/day at 10sh** based on the live sample.
+
+### Why it lost money
+
+**The force-exit category killed it.** 16 trades × -$3.47 avg = -$55.53 in losses concentrated in 8% of trades. Every other outcome bucket was net positive or near-zero, but the catastrophic-loss tail dwarfed the cumulative wins.
+
+Root cause analysis from the trade post-mortem:
+1. **The $0.04 TP captures only a fraction of the actual bid swing.** When the swing IS big, our TP fires fast and caps gains at +$0.40 per 10sh. When the swing is small, no TP fires and we hit SL.
+2. **SL+hold-to-BE works most of the time (91% of SL triggers recover to BE),** but the 9% that don't recover crash to $0.05-$0.20 and we force-exit at fire-sale prices.
+3. **FAK slippage on force-exit.** The bot's force-exit logic walks the book down 3 times (-$0.01, -$0.02, -$0.03) trying to find liquidity. Each retry compounds slippage. A -$0.20 expected SL becomes a -$0.40+ realized loss.
+
+### Patches that didn't save it
+
+Multiple iterations were deployed live to address the losses:
+- **V4-LIVE-0.2.1**: cancel-status case fix
+- **V4-LIVE-0.3**: persistent BE-maker (avoid round-trip latency on BE recovery) + CLIFF/MODE-A/DEADLINE hedge fallback
+- **V4-LIVE-0.3.1**: balance-poll after TP cancel
+- **V4-LIVE-0.3.2**: TP-race detection (catch TP fills that happened before our cancel landed)
+
+After all patches, the bot still lost roughly the same per-day rate. The structural problem was the strategy's exposure to FORCE-EXIT, not the execution polish.
+
+### Why we don't use it now
+
+The lesson from S5's live performance led to:
+- **S1** (CB-aligned HOLD-to-resolution) — no TP, no SL, no force-exit; rely on resolution mechanics
+- **S2** (CB-fade HOLD on large signals)
+- **S3** (swing capture as a separate always-on layer)
+
+These strategies don't have the force-exit problem because they're designed around hold-to-resolution.
+
+### Could a fixed version of S5 work?
+
+Possibly. The hedge mechanism added in V4-LIVE-0.3 (cancel-and-buy-opposite when CLIFF/MODE-A/DEADLINE triggers) reduces force-exit damage from -$3.40 to roughly -$1.00 per losing trade. With that bound:
+- 16 force-exits × -$1.00 = -$16 instead of -$55
+- Combined with other categories: roughly -$0 to +$15 daily
+
+That's not a winner but it's a small loss vs the existing -$60/day. Still inferior to S1.
+
+**Verdict: not recommended for revival** unless we discover a way to materially reduce force-exit frequency itself (not just bound the loss).
 
 ---
 
