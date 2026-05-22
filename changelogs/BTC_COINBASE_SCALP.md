@@ -153,6 +153,29 @@
   2. Before placing hedge buy, call get_token_balance() on our token. If 0, our
      position already exited via BE-MAKER fill or TP. Exit as SL-BE, don't hedge.
 
+## 2026-05-22 — New strategy bot: BTC-S2-S6 (combined fade + momentum)
+- **NEW FILE**: `btc_s2s6_combined.py` — clean fresh bot implementing the validated
+  S2 + S6 combined strategy from STRATEGY_LIBRARY.md
+- **Strategies**:
+  - **S2 (fade large instant moves)**: when CB BTC moves ≥$15 between consecutive ticks
+    (within 1.5s), buy the OPPOSITE side at the ask (taker FAK). Hold to resolution.
+  - **S6 (momentum continuation)**: track BTC price from window start (P0). When
+    |current - P0| ≥ $30, buy the WINNING side at the ask (taker FAK). Hold to resolution.
+  - Both can fire same window — 77% same direction (constructive double-up), 23% opposite
+    (effective hedge).
+- **Per-trade size**: 7 shares (smaller than v4-live's 10 for de-risked pilot)
+- **No TP, no SL, no hedge** — pure hold-to-resolution via OpenClaw/cast redemption cron
+- **Logging**: `logs/btc_s2s6_trades.jsonl` per-trade records
+- **Tmux session**: `btcS2S6`
+- **Paper-engine validated performance (2026-05-22, 277 windows)**:
+  - S6 solo: +$221/day at 10sh, 75% WR (n=231)
+  - S2 solo: +$100/day at 10sh, 77% WR (n=163)
+  - Combined: +$322/day at 10sh
+  - At 7sh: estimated ~$225/day before execution headwinds
+- **The mantra noted "edge is short-term reaction, not 5-min direction" — S6 contradicts
+  this by relying on 5-min directional predictability. Data validates S6 (75% WR).**
+  Mantra may need updating but per user preference is not edited without explicit say.
+
 ### V4-LIVE-0.2 vs V4 Paper — Strategy Comparison
 
 | Feature | V4 Paper | V4-LIVE-0.2 |
