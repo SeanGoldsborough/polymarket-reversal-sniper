@@ -153,8 +153,15 @@ class S2FadeStrategy(Strategy):
 
     def _place_entry(self, state: BookState, token_id: str, label: str,
                      bid: float, ask: float):
+        # entry_mode:
+        #   "taker_ask"    — FAK at exact ask (legacy; rejects when ask moves)
+        #   "taker_market" — FAK at ask+$0.05 capped (S7 production)
+        #   else (maker)   — GTC join at bid
         if self.entry_mode == "taker_ask":
             price = ask
+            otype = OrderType.FAK
+        elif self.entry_mode == "taker_market":
+            price = round(min(ask + 0.05, 0.98) * 100) / 100
             otype = OrderType.FAK
         else:
             price = bid
@@ -224,8 +231,15 @@ class S6MomentumStrategy(Strategy):
 
     def _place_entry(self, state: BookState, token_id: str, label: str,
                      bid: float, ask: float):
+        # entry_mode:
+        #   "taker_ask"    — FAK at exact ask (legacy; rejects when ask moves)
+        #   "taker_market" — FAK at ask+$0.05 capped (S7 production)
+        #   else (maker)   — GTC join at bid
         if self.entry_mode == "taker_ask":
             price = ask
+            otype = OrderType.FAK
+        elif self.entry_mode == "taker_market":
+            price = round(min(ask + 0.05, 0.98) * 100) / 100
             otype = OrderType.FAK
         else:
             price = bid
@@ -293,8 +307,15 @@ class S1AlignedHoldStrategy(Strategy):
 
     def _place_entry(self, state: BookState, token_id: str, label: str,
                      bid: float, ask: float):
+        # entry_mode:
+        #   "taker_ask"    — FAK at exact ask (legacy; rejects when ask moves)
+        #   "taker_market" — FAK at ask+$0.05 capped (S7 production)
+        #   else (maker)   — GTC join at bid
         if self.entry_mode == "taker_ask":
             price = ask
+            otype = OrderType.FAK
+        elif self.entry_mode == "taker_market":
+            price = round(min(ask + 0.05, 0.98) * 100) / 100
             otype = OrderType.FAK
         else:
             price = bid
@@ -316,6 +337,24 @@ class S1AlignedHoldStrategy(Strategy):
                 self._held.append(tr)
         except Exception:
             pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S7: Production S2 fade with $18 threshold + price-improvement market FAK
+# ─────────────────────────────────────────────────────────────────────────────
+
+class S7FadeStrategy(S2FadeStrategy):
+    """S2 fade tuned to the validated S7 production config:
+        - threshold: $18 CB move (vs S2 default $15) for stronger WR margin
+        - entry_mode: taker_market (FAK at ask+$0.05 cap; price improvement)
+        - shares: 7 (current live size)
+    """
+    name = "S7-FADE"
+
+    def __init__(self, engine: OrderEngine, shares: int = 7,
+                 threshold: float = 18.0, max_gap_ms: int = 1500):
+        super().__init__(engine, threshold=threshold, max_gap_ms=max_gap_ms,
+                         shares=shares, entry_mode="taker_market")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -379,13 +418,19 @@ class StrategyRunner:
     def add_strategy(self, strategy: Strategy):
         self.strategies.append(strategy)
 
-    def run_tick_files(self, tick_files, market_lookup=None):
+    def run_tick_files(self, tick_files, market_lookup=None, trades_dir=None):
         """
         market_lookup: optional callable (window_start_ts) -> {"up": token_id, "down": token_id}.
         If None, uses placeholder labels (paper-only mode).
+        trades_dir: optional Path to trades_<window>.csv files. When provided AND
+                    engine.use_trade_events is True, uses replay_with_trades for
+                    honest maker queue advancement.
         """
         from replay_engine import ReplayEngine
+        from pathlib import Path
         replay = ReplayEngine()
+        use_trades = (trades_dir is not None
+                      and getattr(self.engine, "use_trade_events", False))
         for f in tick_files:
             # Window-start placeholder market — strategies need up/down token ids to differentiate
             window_ts = 0
@@ -398,22 +443,33 @@ class StrategyRunner:
                 "down": f"{f.stem}_DN",
             }
             # Notify strategies of window start
-            first_state = None
-            for tick in replay.iter_ticks(f):
-                if first_state is None:
-                    first_state = tick
+            first_state = {"s": None, "last": None}
+
+            def _on_tick(tick):
+                if first_state["s"] is None:
+                    first_state["s"] = tick
                     for s in self.strategies:
                         s.on_window_start(tick, market)
-                # Drive engine + strategies
+                first_state["last"] = tick
                 if hasattr(self.engine, "update_book"):
                     self.engine.update_book(tick)
                 for s in self.strategies:
                     s.on_tick(tick)
+
+            def _on_trade(trade):
+                if hasattr(self.engine, "on_trade"):
+                    self.engine.on_trade(trade)
+
+            if use_trades:
+                replay.replay_with_trades(f, _on_tick, _on_trade, Path(trades_dir))
+            else:
+                for tick in replay.iter_ticks(f):
+                    _on_tick(tick)
+
             # Window end
-            if first_state is not None:
-                last_state = tick  # final tick from the loop
+            if first_state["last"] is not None:
                 for s in self.strategies:
-                    s.on_window_end(last_state)
+                    s.on_window_end(first_state["last"])
 
     def report(self):
         from statistics import mean
