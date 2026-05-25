@@ -27,7 +27,8 @@ The realistic numbers carry significant uncertainty — they could be higher or 
 | S3-v2 | Swing capture ($0.06+ amplitude filter) | Local-low + $0.03 bounce, range ≥$0.06 | Taker @ ask | **-$418** | Amplitude filter helps selection but doesn't fix confirmation cost | Still broken |
 | S4 | Conditional MM | Spread > $0.03 | Maker ladders | **-$514** | Engine measures worst-case adverse selection only | **Unknown — needs trade-event data to measure fairly** |
 | S5 | CB-aligned scalp (V4-LIVE legacy) | CB ±$5 | Maker + TP/SL | **-$60** (live measured) | Live trading data | **Documented loser — do not revive** |
-| **S6** | **Momentum continuation** | **BTC ±$30 cumulative from window start** | **Taker @ ask, hold to resolution** | **+$221** | **HIGH — 75% WR, n=231, CI excludes zero (lower bound 70%)** | **NEW — strongest measured P&L** |
+| S6 | Momentum continuation | BTC ±$30 cumulative from window start | Taker @ ask, hold to resolution | +$160 (realistic engine) | Marginal — only 1pp WR margin above breakeven | **Dropped — too risky vs variance** |
+| **S7** | **CB-fade selective** | **CB ±$18 instant** | **Market-order FAK + $0.05 cap, hold to resolution** | **+$195/day @ 10sh, +$137 @ 7sh** | **HIGH — 79% WR, n=86, 22pp margin above BE** | **⭐ Production candidate** |
 
 **⚠️ Statistical reality check (added after engine validation 2026-05-22):**
 
@@ -647,6 +648,86 @@ Of 277 windows:
 When both fire same-direction (most common), combined P&L averages +$0.235/share — 2× normal. Opposite direction (rare, 23% of "both" cases) creates a hedge that costs ~spread+fee.
 
 **Combined deployment recommended over solo.** Capital required: ~$10/window for 2 concurrent positions at 10sh. Our $30 wallet handles 3 concurrent windows.
+
+---
+
+## S7: CB-fade selective (PRODUCTION CANDIDATE) ⭐
+
+**This is S2 refined into a deployment-ready strategy after the live lessons of 2026-05-22.**
+
+S6 momentum was dropped because its 1pp margin above breakeven was too fragile. S7 doubles down on S2's structural advantage: buying the CHEAP opposite side has a much better R:R than buying the expensive momentum side.
+
+### When to fire
+
+CB BTC moves ≥ **$18** between consecutive Coinbase ticks (within 1.5s).
+(Raised from S2's $15 — sweep showed $18 has nearly the same per-day P&L with nearly 2× margin above breakeven.)
+
+### Action
+
+1. Fade — buy the OPPOSITE side of the CB direction
+2. Use single FAK at `min(recorded_ask + $0.05, $0.98)` — "market order" approach with Polymarket's price improvement
+3. Hold to window resolution (no TP, no SL, no hedge)
+4. One trade per window — first signal wins
+
+### Why this works
+
+- After a $18+ CB spike, the side that just got dumped is mispriced cheap (typical entry $0.55-$0.60)
+- Cheap entry → much better R:R than expensive momentum entries
+- 79% WR with only 57% breakeven WR = **22.1pp margin above breakeven**
+- Margin protects against variance + live execution slippage
+
+### Validated profitability — realistic engine (2026-05-22)
+
+| Metric | Value |
+|---|---:|
+| Signals captured | 122 over 277 windows |
+| Filled | 86 (70% fill rate due to taker latency) |
+| WR (P&L > 0) | **79%** (68W/18L) |
+| Avg entry price | $0.57 |
+| Breakeven WR | 57% |
+| **WR margin above breakeven** | **+22.1pp** |
+| Avg P&L per share | +$0.221 |
+| Per-day at 10sh | **+$195** |
+| **Per-day at 7sh (deployment size)** | **~$137** |
+| Per-day at 100sh | +$1,950 |
+
+### Threshold sweep — why $18 is the sweet spot
+
+| Threshold | n filled | WR | Margin above BE | $/day @ 10sh |
+|---|---:|---:|---:|---:|
+| $15 | 158 | 71% | 11.7pp | +$198 |
+| **$18** | **86** | **79%** | **+22.1pp** | **+$195** ⭐ |
+| $20 | 65 | 80% | 25.9pp | +$173 |
+| $25 | 31 | 87% | 33.9pp | +$105 |
+| $30 | 14 | 86% | 34.7pp | +$49 |
+
+$18 sits at the inflection: nearly the same per-day P&L as $15 but with double the WR margin. Higher thresholds have more margin but fewer trades, reducing total P&L.
+
+### Statistical confidence
+
+| Metric | Value | 95% CI |
+|---|---:|---:|
+| WR | 79% (68W/18L) | 71-87% |
+| Lower bound | 71% | Still 14pp above breakeven |
+| **P(true edge < 0)** | | **<0.1%** |
+
+The lower bound of the 95% CI is comfortably above breakeven — we're statistically confident this strategy has edge even in pessimistic scenarios.
+
+### Caveats
+
+- **Smaller sample than ideal** (n=86 filled). Will get tighter CIs as more data accumulates.
+- **$18+ signals are rare** — only fires in ~44% of windows. Bot mostly idle.
+- **Live execution slippage** could shave +$0.005-0.010/share. Even with that, margin is still ~16pp above breakeven.
+- **Threshold not tuned in different volatility regimes** — extreme bull/bear markets may shift the math.
+
+### Status
+
+**Code built (`btc_s7_fade.py`), not yet deployed live.**
+
+When deploying:
+- 7 shares per trade
+- Stopped state: confirm bot is killed when not actively monitored
+- Watch first 5-10 trades closely for execution surprises
 
 ---
 

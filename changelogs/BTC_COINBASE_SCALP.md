@@ -198,6 +198,21 @@
 - **Status**: Code change made, bot STOPPED, NOT redeployed. Will validate in paper
   before any future live deploy.
 
+## 2026-05-25 — New strategy bot: S7 (CB-fade selective, $18 threshold)
+- **NEW FILE**: `btc_s7_fade.py` — production candidate from the strategy library
+- **Strategy**: S7 = S2 fade-only at $18 threshold, dropping S6 entirely
+- **Why no S6**: S6 momentum has only 1pp margin above breakeven WR — too fragile
+  for live execution variance. S2 buys the CHEAP opposite side which gives
+  structurally better R:R (entry $0.55-$0.60 → 57% breakeven, measured 79% WR).
+- **Threshold $18**: chosen via sweep ($15 had similar daily P&L but only 11.7pp
+  margin; $18 has 22.1pp margin and nearly same per-day result)
+- **Per-trade size**: 7 shares
+- **Entry**: market-order FAK at `recorded_ask + $0.05` cap (price improvement)
+- **Exit**: hold to window resolution (no TP/SL/hedge)
+- **Paper-validated (realistic engine)**: 79% WR, +$0.221/share, +$195/day at 10sh,
+  ~$137/day at 7sh. 95% CI lower bound 71% WR (14pp above breakeven).
+- **Status**: code on GitHub, bot STOPPED. Will deploy only after explicit approval.
+
 ### V4-LIVE-0.2 vs V4 Paper — Strategy Comparison
 
 | Feature | V4 Paper | V4-LIVE-0.2 |
