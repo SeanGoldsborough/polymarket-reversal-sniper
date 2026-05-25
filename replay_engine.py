@@ -52,6 +52,51 @@ class Signal:
     state: BookState         # market state at signal moment
 
 
+@dataclass
+class TradeEvent:
+    """A last_trade_price event from Polymarket market WS.
+
+    Polymarket emits this for every maker/taker match. The `side` field is the
+    taker side: side='BUY' means a taker bought from a maker ask, side='SELL'
+    means a taker sold into a maker bid. This is the data needed for honest
+    maker queue advancement in simulation.
+    """
+    elapsed_ms: int           # ms since window start
+    asset_id: str             # the token traded
+    side: str                 # "BUY" or "SELL" — taker side
+    size: float               # shares traded
+    price: float              # price at which trade occurred
+    fee_rate_bps: int = 0
+    timestamp_ms: int = 0
+
+
+def load_trade_events(window_start: int, trades_dir: Path = None) -> list:
+    """Load trade events for a given window. Returns sorted-by-elapsed_ms list."""
+    if trades_dir is None:
+        trades_dir = Path("/home/ubuntu/reports/trades")
+    fpath = trades_dir / f"trades_{window_start}.csv"
+    if not fpath.exists():
+        return []
+    out = []
+    with open(fpath) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                out.append(TradeEvent(
+                    elapsed_ms=int(row["elapsed_ms"]),
+                    asset_id=row["asset_id"],
+                    side=row["side"],
+                    size=float(row["size"]),
+                    price=float(row["price"]),
+                    fee_rate_bps=int(row.get("fee_rate_bps", 0) or 0),
+                    timestamp_ms=int(row.get("timestamp_ms", 0) or 0),
+                ))
+            except (KeyError, ValueError):
+                continue
+    out.sort(key=lambda t: t.elapsed_ms)
+    return out
+
+
 class ReplayEngine:
     """Stream ticks from CSV files. Maintains current state. No strategy logic."""
 
@@ -103,6 +148,55 @@ class ReplayEngine:
             callback(tick)
             n += 1
         return n
+
+    def replay_with_trades(self,
+                           tick_file: Path,
+                           on_tick: Callable[[BookState], None],
+                           on_trade: Callable[[TradeEvent], None],
+                           trades_dir: Path = None) -> tuple:
+        """
+        Replay both book updates AND trade events, interleaved in elapsed_ms order.
+
+        Used for honest maker queue simulation:
+        - Each tick updates the book state
+        - Each trade event advances queue positions for makers at the trade price level
+
+        If the corresponding trades_<window>.csv doesn't exist, falls back to
+        ticks-only behavior (same as replay()).
+        """
+        # Derive window-start from filename: ticks_<ts>.csv → <ts>
+        window_start = None
+        try:
+            window_start = int(Path(tick_file).stem.split("_")[1])
+        except Exception:
+            pass
+
+        trades = []
+        if window_start is not None:
+            trades = load_trade_events(window_start, trades_dir)
+
+        # Two-pointer merge of ticks and trades by elapsed_ms
+        tick_iter = self.iter_ticks(tick_file)
+        next_tick = next(tick_iter, None)
+        trade_idx = 0
+
+        ticks_processed = 0
+        trades_processed = 0
+
+        while next_tick is not None or trade_idx < len(trades):
+            tick_ms = next_tick.elapsed_ms if next_tick else float('inf')
+            trade_ms = trades[trade_idx].elapsed_ms if trade_idx < len(trades) else float('inf')
+
+            if tick_ms <= trade_ms:
+                on_tick(next_tick)
+                ticks_processed += 1
+                next_tick = next(tick_iter, None)
+            else:
+                on_trade(trades[trade_idx])
+                trades_processed += 1
+                trade_idx += 1
+
+        return ticks_processed, trades_processed
 
     def replay_dir(self, dir_path: Path, callback: Callable[[BookState], None],
                    on_window_start: Optional[Callable[[Path], None]] = None,

@@ -32,7 +32,7 @@ from enum import Enum
 from typing import Callable, List, Optional, Dict
 from abc import ABC, abstractmethod
 
-from replay_engine import BookState
+from replay_engine import BookState, TradeEvent
 
 
 class OrderType(Enum):
@@ -71,6 +71,7 @@ class Order:
     total_fees: float = 0.0
     # Paper-only metadata:
     queue_position: float = 0.0  # estimated size ahead of us when placed
+    volume_consumed_at_level: float = 0.0  # cumulative trade volume seen at our price level
     last_seen_size_at_price: float = 0.0  # bid/ask size at our price, latest observation
     mid_at_placement: float = 0.0       # midpoint of our side at order placement
     mid_at_fill: float = 0.0            # midpoint at first fill (for adverse-selection)
@@ -179,7 +180,8 @@ class PaperOrderEngine(OrderEngine):
     """
 
     def __init__(self, starting_usdc: float = 100.0, verbose: bool = False,
-                 taker_latency_ms: int = 150, maker_latency_ms: int = 100):
+                 taker_latency_ms: int = 150, maker_latency_ms: int = 100,
+                 use_trade_events: bool = False):
         self.usdc = starting_usdc
         self.positions: Dict[str, float] = {}  # token_id -> shares held
         self.pending_settlement: List[Fill] = []  # buys waiting to settle
@@ -193,6 +195,10 @@ class PaperOrderEngine(OrderEngine):
         self.total_fees = 0.0
         self.taker_latency_ms = taker_latency_ms
         self.maker_latency_ms = maker_latency_ms
+        # When True, maker GTC orders ONLY fill via on_trade (honest queue advancement).
+        # When False, fall back to the legacy "book moved strictly through our level" rule.
+        # Use True when feeding trade events; otherwise the legacy approximation is used.
+        self.use_trade_events = use_trade_events
         # Tracking for rejection diagnostics
         self.taker_rejections = 0
         self.taker_attempts = 0
@@ -279,11 +285,71 @@ class PaperOrderEngine(OrderEngine):
                 still_pending.append(order)
         self.pending_taker_orders = still_pending
         # Check each open maker order for fills against this state
+        # (Skipped when trade events drive maker fills — on_trade is authoritative)
+        if not self.use_trade_events:
+            for order_id in list(self.open_orders.keys()):
+                order = self.open_orders.get(order_id)
+                if not order:
+                    continue
+                self._check_gtc_for_fill(order, state)
+
+    def on_trade(self, trade: TradeEvent):
+        """
+        Called on every trade event from the replay engine. Advances queue
+        position on resting maker orders at the matched price level.
+
+        A trade at price P with side=SELL means: a taker sold into maker bids
+        at P, consuming bid volume at that price. Resting maker BUYs at P
+        have their queue advanced by trade.size.
+
+        Symmetrically, a trade with side=BUY at P consumes maker ask volume,
+        so resting maker SELLs at P advance.
+
+        Once volume_consumed_at_level >= queue_position, the order fills (at
+        our limit price, since by definition the book is at our level).
+        """
+        if self._last_state is None:
+            return
         for order_id in list(self.open_orders.keys()):
             order = self.open_orders.get(order_id)
             if not order:
                 continue
-            self._check_gtc_for_fill(order, state)
+            # Trade must be on the same token (asset_id)
+            if trade.asset_id != order.token_id:
+                continue
+            # Match trade side to order side (opposing flow consumes our queue)
+            if order.side == Side.BUY and trade.side != "SELL":
+                continue
+            if order.side == Side.SELL and trade.side != "BUY":
+                continue
+            # Trade must be at our exact price level
+            if abs(trade.price - order.price) > 0.005:
+                continue
+            order.volume_consumed_at_level += trade.size
+            self._try_fill_maker_from_queue(order, trade)
+
+    def _try_fill_maker_from_queue(self, order: Order, trade: TradeEvent):
+        """If trade volume has consumed enough to reach our queue position, fill us."""
+        if self._last_state is None:
+            return
+        if order.volume_consumed_at_level < order.queue_position:
+            return  # still behind in the queue
+        # We're filling: the portion above our queue position is ours
+        excess = order.volume_consumed_at_level - order.queue_position
+        remaining = order.size - order.filled_size
+        if excess <= 0.01 or remaining <= 0.01:
+            return
+        fill_size = min(excess, remaining)
+        # Subtract the amount we've already taken from the excess so each trade
+        # event only contributes its share once
+        order.queue_position += fill_size  # absorb this fill from the queue counter
+        self._fill_gtc_to_size(order, fill_size, self._last_state)
+        if order.filled_size >= order.size - 0.01:
+            order.status = OrderStatus.FILLED
+            if order.id in self.open_orders:
+                del self.open_orders[order.id]
+        else:
+            order.status = OrderStatus.PARTIAL
 
     # ── Internal fill mechanics ─────────────────────────────────────────
 
