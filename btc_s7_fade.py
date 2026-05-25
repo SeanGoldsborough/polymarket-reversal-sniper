@@ -58,6 +58,8 @@ from py_clob_client_v2.client import ClobClient
 from py_clob_client_v2.clob_types import OrderArgs, OrderType, BalanceAllowanceParams
 from py_clob_client_v2.order_builder.constants import BUY
 
+from order_engine import LiveOrderEngine, Side, OrderType as EngineOrderType, OrderStatus
+
 # ── Config ─────────────────────────────────────────────
 SHARES_PER_TRADE = 7
 S7_THRESHOLD = 18.0           # CB move threshold (raised from S2's $15 for more margin)
@@ -121,15 +123,18 @@ async def get_market_for_window(window_start: int):
 class S7Bot:
     def __init__(self):
         self.client = None
+        self.engine = None
         if PRIVATE_KEY:
             self.client = ClobClient(CLOB_HOST, chain_id=CHAIN_ID, key=PRIVATE_KEY,
                                      signature_type=SIGNATURE_TYPE, funder=FUNDER_ADDRESS)
             try:
                 self.client.set_api_creds(self.client.create_or_derive_api_key())
+                self.engine = LiveOrderEngine(self.client, signature_type=SIGNATURE_TYPE)
                 log_msg(f"[CLOB] Auth OK — LIVE execution ready")
             except Exception as e:
                 log_msg(f"[CLOB] Auth failed: {e}")
                 self.client = None
+                self.engine = None
         self.up_bid = 0.0
         self.up_ask = 0.0
         self.down_bid = 0.0
@@ -165,44 +170,43 @@ class S7Bot:
             except Exception:
                 pass
 
-    def place_market_order(self, token_id: str, ask_price: float, shares: int) -> dict:
+    def place_market_order(self, token_id: str, ask_price: float, shares: int,
+                           token_label: str = "") -> dict:
         """
         Single FAK with price-improvement (Polymarket "market order" equivalent).
         Bids up to $ask + $0.05 to absorb latency-induced ask movement. Polymarket
         fills at actual best ask (not our limit). If real ask jumped > $0.05 during
         latency, FAK rejects — safer than escalation chains.
+
+        Delegates to LiveOrderEngine so paper-mode bots can use the identical call
+        path with PaperOrderEngine instead.
         """
         self.trade_id += 1
         tid = self.trade_id
         result = {"tid": tid, "token_id": token_id, "ask": ask_price, "shares": shares,
                   "filled_size": 0, "fill_price": 0, "fee": 0,
                   "time_ms": int(time.time() * 1000)}
-        if not self.client:
+        if not self.engine:
             log_msg(f"[NO-CLIENT] #{tid} would buy {shares}sh @ ~${ask_price:.2f}")
             return result
 
         bid_price = snap_price(min(ask_price + FAK_PRICE_CAP_MARKUP, 0.98))
         try:
-            args = OrderArgs(price=bid_price, size=shares, side=BUY, token_id=token_id)
-            signed = self.client.create_order(args)
-            resp = self.client.post_order(signed, OrderType.FAK)
-            order_id = resp.get("orderID", "")
-            time.sleep(0.3)
-            try:
-                order = self.client.get_order(order_id)
-                if order:
-                    matched = float(order.get("size_matched", 0))
-                    if matched > 0:
-                        result["filled_size"] = matched
-                        result["fill_price"] = float(order.get("price", bid_price))
-                        result["fee"] = calc_taker_fee(result["fill_price"], matched)
-                        log_msg(f"[S7-FADE] #{tid} BOUGHT {matched:.0f}sh @ ${result['fill_price']:.2f} "
-                                f"(cap ${bid_price:.2f}, fee ${result['fee']:.3f})")
-                        return result
-                    else:
-                        log_msg(f"[S7-NOFILL] #{tid} FAK at ${bid_price:.2f} — no match")
-            except Exception:
-                pass
+            order = self.engine.place_order(
+                token_id=token_id, token_label=token_label,
+                side=Side.BUY, price=bid_price, size=shares,
+                order_type=EngineOrderType.FAK,
+            )
+            if order.filled_size > 0:
+                result["filled_size"] = order.filled_size
+                result["fill_price"] = order.fill_avg_price
+                result["fee"] = calc_taker_fee(result["fill_price"], order.filled_size)
+                log_msg(f"[S7-FADE] #{tid} BOUGHT {order.filled_size:.0f}sh @ "
+                        f"${result['fill_price']:.2f} (cap ${bid_price:.2f}, "
+                        f"fee ${result['fee']:.3f})")
+            else:
+                log_msg(f"[S7-NOFILL] #{tid} FAK at ${bid_price:.2f} — no match "
+                        f"(status={order.status.name})")
         except Exception as e:
             err = str(e)[:120]
             if "no orders found to match" in err:
@@ -284,7 +288,8 @@ async def run_window(bot: S7Bot, window_start: int):
                                     log_msg(f"[S7-SIGNAL] CB {'UP' if move > 0 else 'DN'} "
                                             f"${move:+.2f} | FADE {fade_label} @ ${fade_ask:.2f}")
                                     trade = bot.place_market_order(fade_token, fade_ask,
-                                                                   SHARES_PER_TRADE)
+                                                                   SHARES_PER_TRADE,
+                                                                   token_label=fade_label)
                                     if trade["filled_size"] > 0:
                                         held_trade = trade
                                         held_direction = fade_label
