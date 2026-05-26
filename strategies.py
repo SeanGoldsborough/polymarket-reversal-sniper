@@ -16,6 +16,7 @@ Concrete strategies implemented:
   - CombinedS2S6Strategy: composes S2 + S6 (matches the live bot)
 """
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
@@ -23,6 +24,17 @@ from collections import deque
 
 from replay_engine import BookState
 from order_engine import OrderEngine, Side, OrderType, Order, OrderStatus
+
+
+def dynamic_size(base_shares: int, limit_price: float, min_notional_target: float) -> int:
+    """When min_notional_target > 0, scale shares up so size*limit_price >= target.
+    Otherwise return base_shares. Used to bypass Polymarket's $1 min order rule on
+    cheap-fade entries (e.g., a $0.10 fade with 6 shares = $0.60 < $1 → reject;
+    scale to 12 shares = $1.20 → fills)."""
+    if min_notional_target <= 0 or limit_price <= 0:
+        return base_shares
+    need = math.ceil(min_notional_target / limit_price)
+    return max(base_shares, need)
 
 
 @dataclass
@@ -113,13 +125,16 @@ class S2FadeStrategy(Strategy):
 
     def __init__(self, engine: OrderEngine, threshold: float = 15.0,
                  max_gap_ms: int = 1500, shares: int = 7,
-                 entry_mode: str = "taker_ask"):
+                 entry_mode: str = "taker_ask",
+                 min_notional_target: float = 0.0):
         super().__init__(engine, threshold=threshold, max_gap_ms=max_gap_ms,
-                         shares=shares, entry_mode=entry_mode)
+                         shares=shares, entry_mode=entry_mode,
+                         min_notional_target=min_notional_target)
         self.threshold = threshold
         self.max_gap_ms = max_gap_ms
         self.shares = shares
         self.entry_mode = entry_mode
+        self.min_notional_target = min_notional_target
 
     def _reset_window_state(self):
         super()._reset_window_state()
@@ -166,10 +181,11 @@ class S2FadeStrategy(Strategy):
         else:
             price = bid
             otype = OrderType.GTC
+        size = dynamic_size(self.shares, price, getattr(self, "min_notional_target", 0.0))
         try:
             order = self.engine.place_order(
                 token_id=token_id, token_label=label,
-                side=Side.BUY, price=price, size=self.shares,
+                side=Side.BUY, price=price, size=size,
                 order_type=otype,
             )
             if order.filled_size > 0 or order.status == OrderStatus.OPEN:
@@ -244,10 +260,11 @@ class S6MomentumStrategy(Strategy):
         else:
             price = bid
             otype = OrderType.GTC
+        size = dynamic_size(self.shares, price, getattr(self, "min_notional_target", 0.0))
         try:
             order = self.engine.place_order(
                 token_id=token_id, token_label=label,
-                side=Side.BUY, price=price, size=self.shares,
+                side=Side.BUY, price=price, size=size,
                 order_type=otype,
             )
             if order.filled_size > 0 or order.status == OrderStatus.OPEN:
@@ -320,10 +337,11 @@ class S1AlignedHoldStrategy(Strategy):
         else:
             price = bid
             otype = OrderType.GTC
+        size = dynamic_size(self.shares, price, getattr(self, "min_notional_target", 0.0))
         try:
             order = self.engine.place_order(
                 token_id=token_id, token_label=label,
-                side=Side.BUY, price=price, size=self.shares,
+                side=Side.BUY, price=price, size=size,
                 order_type=otype,
             )
             if order.filled_size > 0 or order.status == OrderStatus.OPEN:
@@ -347,14 +365,17 @@ class S7FadeStrategy(S2FadeStrategy):
     """S2 fade tuned to the validated S7 production config:
         - threshold: $18 CB move (vs S2 default $15) for stronger WR margin
         - entry_mode: taker_market (FAK at ask+$0.05 cap; price improvement)
-        - shares: 7 (current live size)
+        - shares: 6 (current live size)
+        - min_notional_target: $1.20 (Option B dynamic shares to bypass $1 reject)
     """
     name = "S7-FADE"
 
-    def __init__(self, engine: OrderEngine, shares: int = 7,
-                 threshold: float = 18.0, max_gap_ms: int = 1500):
+    def __init__(self, engine: OrderEngine, shares: int = 6,
+                 threshold: float = 18.0, max_gap_ms: int = 1500,
+                 min_notional_target: float = 1.20):
         super().__init__(engine, threshold=threshold, max_gap_ms=max_gap_ms,
-                         shares=shares, entry_mode="taker_market")
+                         shares=shares, entry_mode="taker_market",
+                         min_notional_target=min_notional_target)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -61,10 +61,13 @@ from py_clob_client_v2.order_builder.constants import BUY
 from order_engine import LiveOrderEngine, Side, OrderType as EngineOrderType, OrderStatus
 
 # ── Config ─────────────────────────────────────────────
-SHARES_PER_TRADE = 7
+import math
+
+SHARES_PER_TRADE = 6
 S7_THRESHOLD = 18.0           # CB move threshold (raised from S2's $15 for more margin)
 MAX_GAP_MS = 1500             # Max ms between consecutive CB ticks
 FAK_PRICE_CAP_MARKUP = 0.05   # "Market order" — bid up to $0.05 above recorded ask
+MIN_NOTIONAL_TARGET = 1.20    # Scale shares up so notional >= $1.20 (Polymarket $1 min + cushion)
 
 CLOB_HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
@@ -191,10 +194,19 @@ class S7Bot:
             return result
 
         bid_price = snap_price(min(ask_price + FAK_PRICE_CAP_MARKUP, 0.98))
+        # Option B: scale shares up to meet Polymarket's $1 min order notional.
+        # Cheap-fade entries (e.g., $0.10) at the base 6 shares = $0.60 → rejected.
+        # Scale: shares = max(SHARES_PER_TRADE, ceil(MIN_NOTIONAL_TARGET / bid_price))
+        scaled_shares = max(shares, math.ceil(MIN_NOTIONAL_TARGET / bid_price)) if bid_price > 0 else shares
+        if scaled_shares != shares:
+            log_msg(f"[S7-SCALE] #{tid} bid ${bid_price:.2f} too cheap for {shares}sh "
+                    f"(notional ${shares * bid_price:.2f}) — scaling to {scaled_shares}sh "
+                    f"(notional ${scaled_shares * bid_price:.2f})")
+        result["shares"] = scaled_shares
         try:
             order = self.engine.place_order(
                 token_id=token_id, token_label=token_label,
-                side=Side.BUY, price=bid_price, size=shares,
+                side=Side.BUY, price=bid_price, size=scaled_shares,
                 order_type=EngineOrderType.FAK,
             )
             if order.filled_size > 0:
@@ -392,8 +404,9 @@ async def run_window(bot: S7Bot, window_start: int):
 
 async def main():
     log_msg(f"=== {BOT_NAME} starting ===")
-    log_msg(f"=== S7 = S2 fade-only at $18 threshold, 7sh per trade ===")
-    log_msg(f"=== Paper-validated: 79% WR, +$0.221/share, ~$137/day @ 7sh ===")
+    log_msg(f"=== S7 = S2 fade-only at $18 threshold, base {SHARES_PER_TRADE}sh per trade ===")
+    log_msg(f"=== Option B: scales shares up to keep notional >= ${MIN_NOTIONAL_TARGET:.2f} (Polymarket $1 min) ===")
+    log_msg(f"=== Paper-validated: 70% WR (CI [54-83%]), +$0.20/share, ~$27/day ===")
     bot = S7Bot()
     bot.bankroll_start = bot.get_balance()
     log_msg(f"[WALLET] Balance: ${bot.bankroll_start:.2f}")

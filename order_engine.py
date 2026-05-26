@@ -181,7 +181,7 @@ class PaperOrderEngine(OrderEngine):
 
     def __init__(self, starting_usdc: float = 100.0, verbose: bool = False,
                  taker_latency_ms: int = 150, maker_latency_ms: int = 100,
-                 use_trade_events: bool = False):
+                 use_trade_events: bool = False, min_notional_usdc: float = 1.0):
         self.usdc = starting_usdc
         self.positions: Dict[str, float] = {}  # token_id -> shares held
         self.pending_settlement: List[Fill] = []  # buys waiting to settle
@@ -199,9 +199,13 @@ class PaperOrderEngine(OrderEngine):
         # When False, fall back to the legacy "book moved strictly through our level" rule.
         # Use True when feeding trade events; otherwise the legacy approximation is used.
         self.use_trade_events = use_trade_events
+        # Polymarket rejects BUY orders below this notional with "min size: $1"
+        # (discovered live 2026-05-25). Set to 0 to disable the check.
+        self.min_notional_usdc = min_notional_usdc
         # Tracking for rejection diagnostics
         self.taker_rejections = 0
         self.taker_attempts = 0
+        self.min_notional_rejections = 0
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -228,6 +232,19 @@ class PaperOrderEngine(OrderEngine):
             placed_at_ms=s.elapsed_ms,
             mid_at_placement=mid_at_placement,
         )
+
+        # Polymarket min-notional check on BUY orders (live observation 2026-05-25)
+        if side == Side.BUY and self.min_notional_usdc > 0:
+            notional = size * price
+            if notional < self.min_notional_usdc:
+                order.status = OrderStatus.REJECTED
+                self.min_notional_rejections += 1
+                if order_type in (OrderType.FOK, OrderType.FAK):
+                    self.taker_attempts += 1
+                if self.verbose:
+                    print(f"  [MIN-NOTIONAL-REJECT] {order.id} {size}sh @ ${price:.3f} = "
+                          f"${notional:.2f} < ${self.min_notional_usdc:.2f}")
+                return order
 
         if order_type in (OrderType.FOK, OrderType.FAK):
             # Taker — DON'T try to fill immediately. Queue for latency window.
