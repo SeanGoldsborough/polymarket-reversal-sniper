@@ -69,6 +69,7 @@ MAX_GAP_MS = 1500             # Max ms between consecutive CB ticks
 FAK_PRICE_CAP_MARKUP = 0.05   # "Market order" — bid up to $0.05 above recorded ask
 MIN_NOTIONAL_TARGET = 1.20    # Scale shares up so notional >= $1.20 (Polymarket $1 min + cushion)
 MAX_FADE_ASK = 0.60           # Skip signals where fade ask > this — expensive fades are EV-negative at 54% WR CI lower bound
+MIN_FADE_ASK = 0.10           # Skip super-cheap fades — proven 0/5 death zone in history (CB moves big enough to push fade <$0.10 don't revert)
 
 CLOB_HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
@@ -100,6 +101,40 @@ def calc_taker_fee(price: float, shares: float) -> float:
     # Crypto feeRate = 0.07. Was 0.022 × min(p,1-p) — wrong twice (rate AND shape).
     # Verified against docs 2026-05-26.
     return 0.07 * price * (1 - price) * shares
+
+
+async def fetch_resolution(window_start: int, max_wait_s: int = 30):
+    """Poll gamma-api with closed=true until Polymarket settles this market.
+    Returns True if UP won, False if DN won, None on timeout."""
+    slug = f"btc-updown-5m-{window_start}"
+    url = f"https://gamma-api.polymarket.com/markets?slug={slug}&closed=true"
+    deadline = time.time() + max_wait_s
+    while time.time() < deadline:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, headers={"User-Agent": "Mozilla/5.0"},
+                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        if data:
+                            m = data[0]
+                            outcomes_raw = m.get("outcomes", "[]")
+                            outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+                            prices_raw = m.get("outcomePrices", "[]")
+                            prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+                            if prices and len(prices) >= 2:
+                                up_idx = 0 if outcomes[0] == "Up" else 1
+                                up_price = float(prices[up_idx])
+                                dn_price = float(prices[1 - up_idx])
+                                if up_price == 1.0 and dn_price == 0.0:
+                                    return True
+                                if up_price == 0.0 and dn_price == 1.0:
+                                    return False
+                                # else: not settled yet, wait
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+    return None
 
 
 async def get_market_for_window(window_start: int):
@@ -374,6 +409,16 @@ async def run_window(bot: S7Bot, window_start: int):
                                                 f"${fade_ask:.2f} > cap ${MAX_FADE_ASK:.2f}")
                                         bot.fired_this_window = True
                                         continue
+                                    # Floor — skip the proven death zone (0/5 historical).
+                                    # When CB moves big enough to push fade below $0.10,
+                                    # the move is trend confirmation, NOT exhaustion.
+                                    if fade_ask < MIN_FADE_ASK:
+                                        log_msg(f"[S7-SKIP] CB {'UP' if move > 0 else 'DN'} "
+                                                f"${move:+.2f} | fade {fade_label} ask "
+                                                f"${fade_ask:.2f} < floor ${MIN_FADE_ASK:.2f} "
+                                                f"(death zone)")
+                                        bot.fired_this_window = True
+                                        continue
                                     # NEW: capture the precise ms when our code decided
                                     signal_at_ms = int(time.time() * 1000)
                                     log_msg(f"[S7-SIGNAL] CB {'UP' if move > 0 else 'DN'} "
@@ -471,18 +516,28 @@ async def run_window(bot: S7Bot, window_start: int):
         except Exception: pass
 
     if held_trade:
-        final_bid = bot.up_bid if held_direction == "UP" else bot.down_bid
-        if final_bid >= 0.95:
-            expected_redemption = 1.00
-        elif final_bid <= 0.05:
-            expected_redemption = 0.00
+        # Wait for Polymarket's actual settlement before computing P&L. Replaces
+        # the old final_bid heuristic that overstated/understated by treating
+        # bid as redemption. Real settlement is always $1 or $0.
+        up_won = await fetch_resolution(window_start)
+        if up_won is None:
+            # Settlement didn't arrive within 30s — fall back to bid heuristic
+            final_bid = bot.up_bid if held_direction == "UP" else bot.down_bid
+            if final_bid >= 0.95:
+                expected_redemption = 1.00
+            elif final_bid <= 0.05:
+                expected_redemption = 0.00
+            else:
+                expected_redemption = final_bid
+            reason = f"HOLD-RESOLUTION-FALLBACK ({held_direction}, final_bid=${final_bid:.2f})"
         else:
-            expected_redemption = final_bid
-        bot.record_trade(held_trade, expected_redemption, held_direction,
-                         f"HOLD-RESOLUTION ({held_direction}, final_bid=${final_bid:.2f})")
+            we_won = (held_direction == "UP" and up_won) or (held_direction == "DN" and not up_won)
+            expected_redemption = 1.00 if we_won else 0.00
+            reason = f"HOLD-RESOLUTION ({held_direction}, up_won={up_won})"
+        bot.record_trade(held_trade, expected_redemption, held_direction, reason)
         pnl = (expected_redemption - held_trade["fill_price"]) * held_trade["filled_size"] - held_trade["fee"]
         log_msg(f"[RESOLVE] #{held_trade['tid']} {held_direction} | "
-                f"entry ${held_trade['fill_price']:.2f} → expected ${expected_redemption:.2f} | "
+                f"entry ${held_trade['fill_price']:.2f} → exit ${expected_redemption:.2f} | "
                 f"P&L ${pnl:+.2f}")
     else:
         log_msg(f"[WINDOW-END] No S7 trigger this window")
