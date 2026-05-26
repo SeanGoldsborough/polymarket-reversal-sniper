@@ -68,6 +68,7 @@ S7_THRESHOLD = 18.0           # CB move threshold (raised from S2's $15 for more
 MAX_GAP_MS = 1500             # Max ms between consecutive CB ticks
 FAK_PRICE_CAP_MARKUP = 0.05   # "Market order" — bid up to $0.05 above recorded ask
 MIN_NOTIONAL_TARGET = 1.20    # Scale shares up so notional >= $1.20 (Polymarket $1 min + cushion)
+MAX_FADE_ASK = 0.60           # Skip signals where fade ask > this — expensive fades are EV-negative at 54% WR CI lower bound
 
 CLOB_HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
@@ -95,8 +96,9 @@ def snap_price(p: float) -> float:
 
 
 def calc_taker_fee(price: float, shares: float) -> float:
-    """Polymarket crypto taker fee (verified 2026-05-25): 0.07 × p × (1-p) × shares.
-    Replaces the old min(p, 1-p) × 0.022 approximation which understated fees by ~2-3x."""
+    # Crypto taker fee per Polymarket docs: fee = feeRate × p × (1-p) × shares (parabolic).
+    # Crypto feeRate = 0.07. Was 0.022 × min(p,1-p) — wrong twice (rate AND shape).
+    # Verified against docs 2026-05-26.
     return 0.07 * price * (1 - price) * shares
 
 
@@ -176,7 +178,7 @@ class S7Bot:
                 pass
 
     def place_market_order(self, token_id: str, ask_price: float, shares: int,
-                           token_label: str = "") -> dict:
+                           token_label: str = "", signal_at_ms: int = 0) -> dict:
         """
         Single FAK with price-improvement (Polymarket "market order" equivalent).
         Bids up to $ask + $0.05 to absorb latency-induced ask movement. Polymarket
@@ -185,12 +187,25 @@ class S7Bot:
 
         Delegates to LiveOrderEngine so paper-mode bots can use the identical call
         path with PaperOrderEngine instead.
+
+        Timing instrumentation (added 2026-05-26):
+          signal_at_ms     — when our code decided to act (caller-provided)
+          placed_at_ms     — local time JUST before SDK place_order call
+          response_at_ms   — local time IMMEDIATELY after SDK returns
+          latency_ms       — response_at_ms - placed_at_ms (signing + net + match)
+          signal_to_placed_ms — placed_at_ms - signal_at_ms (our decision overhead)
+        These flow into the trade record written to btc_s7_trades.jsonl.
         """
         self.trade_id += 1
         tid = self.trade_id
         result = {"tid": tid, "token_id": token_id, "ask": ask_price, "shares": shares,
                   "filled_size": 0, "fill_price": 0, "fee": 0,
-                  "time_ms": int(time.time() * 1000)}
+                  "time_ms": int(time.time() * 1000),
+                  # NEW: timing fields (always present; 0 means "not measured")
+                  "signal_at_ms": signal_at_ms,
+                  "placed_at_ms": 0, "response_at_ms": 0,
+                  "latency_ms": 0, "signal_to_placed_ms": 0,
+                  "outcome": "no_client"}
         if not self.engine:
             log_msg(f"[NO-CLIENT] #{tid} would buy {shares}sh @ ~${ask_price:.2f}")
             return result
@@ -205,28 +220,51 @@ class S7Bot:
                     f"(notional ${shares * bid_price:.2f}) — scaling to {scaled_shares}sh "
                     f"(notional ${scaled_shares * bid_price:.2f})")
         result["shares"] = scaled_shares
+        # NEW: capture placement timestamp immediately before the SDK call.
+        placed_at_ms = int(time.time() * 1000)
+        result["placed_at_ms"] = placed_at_ms
+        if signal_at_ms:
+            result["signal_to_placed_ms"] = placed_at_ms - signal_at_ms
         try:
             order = self.engine.place_order(
                 token_id=token_id, token_label=token_label,
                 side=Side.BUY, price=bid_price, size=scaled_shares,
                 order_type=EngineOrderType.FAK,
             )
+            # NEW: capture response timestamp the instant the SDK returns
+            response_at_ms = int(time.time() * 1000)
+            result["response_at_ms"] = response_at_ms
+            result["latency_ms"] = response_at_ms - placed_at_ms
             if order.filled_size > 0:
                 result["filled_size"] = order.filled_size
                 result["fill_price"] = order.fill_avg_price
                 result["fee"] = calc_taker_fee(result["fill_price"], order.filled_size)
+                result["outcome"] = "filled"
                 log_msg(f"[S7-FADE] #{tid} BOUGHT {order.filled_size:.0f}sh @ "
                         f"${result['fill_price']:.2f} (cap ${bid_price:.2f}, "
-                        f"fee ${result['fee']:.3f})")
+                        f"fee ${result['fee']:.3f}) "
+                        f"latency={result['latency_ms']}ms "
+                        f"sig_to_place={result['signal_to_placed_ms']}ms")
             else:
+                result["outcome"] = f"nofill_{order.status.name}"
                 log_msg(f"[S7-NOFILL] #{tid} FAK at ${bid_price:.2f} — no match "
-                        f"(status={order.status.name})")
+                        f"(status={order.status.name}) latency={result['latency_ms']}ms")
         except Exception as e:
+            # NEW: capture response_at_ms even on exception so we know how long the SDK took to throw
+            response_at_ms = int(time.time() * 1000)
+            result["response_at_ms"] = response_at_ms
+            result["latency_ms"] = response_at_ms - placed_at_ms
             err = str(e)[:120]
             if "no orders found to match" in err:
-                log_msg(f"[S7-NOFILL] #{tid} real ask jumped > ${bid_price:.2f} during latency")
+                result["outcome"] = "rejected_no_match"
+                log_msg(f"[S7-NOFILL] #{tid} real ask jumped > ${bid_price:.2f} during latency "
+                        f"({result['latency_ms']}ms)")
+            elif "min size" in err or "invalid amount" in err:
+                result["outcome"] = "rejected_min_notional"
+                log_msg(f"[S7-FAIL] #{tid} {err} ({result['latency_ms']}ms)")
             else:
-                log_msg(f"[S7-FAIL] #{tid} {err}")
+                result["outcome"] = "exception"
+                log_msg(f"[S7-FAIL] #{tid} {err} ({result['latency_ms']}ms)")
         return result
 
     def record_trade(self, trade: dict, exit_price: float, direction: str, reason: str):
@@ -237,6 +275,34 @@ class S7Bot:
             "exit_price": exit_price, "reason": reason,
             "expected_pnl": (exit_price - trade["fill_price"]) * trade["filled_size"] - trade["fee"],
             "time": datetime.now(timezone.utc).isoformat(),
+            # NEW: timing instrumentation
+            "signal_at_ms": trade.get("signal_at_ms", 0),
+            "placed_at_ms": trade.get("placed_at_ms", 0),
+            "response_at_ms": trade.get("response_at_ms", 0),
+            "latency_ms": trade.get("latency_ms", 0),
+            "signal_to_placed_ms": trade.get("signal_to_placed_ms", 0),
+            "outcome": trade.get("outcome", ""),
+        }
+        self.log_file.write(json.dumps(rec) + "\n")
+        self.log_file.flush()
+
+    def record_attempt(self, trade: dict, direction: str, reason: str):
+        """Write a record for an attempt that DIDN'T result in a held position
+        (rejections, no-fills, min-notional skips). Lets us measure full latency
+        distribution including unfilled paths."""
+        rec = {
+            "tid": trade["tid"], "strategy": "S7-FADE", "direction": direction,
+            "token_id": trade["token_id"], "shares": trade["shares"],
+            "fill_price": 0, "fee": 0,
+            "exit_price": 0, "reason": reason,
+            "expected_pnl": 0,
+            "time": datetime.now(timezone.utc).isoformat(),
+            "signal_at_ms": trade.get("signal_at_ms", 0),
+            "placed_at_ms": trade.get("placed_at_ms", 0),
+            "response_at_ms": trade.get("response_at_ms", 0),
+            "latency_ms": trade.get("latency_ms", 0),
+            "signal_to_placed_ms": trade.get("signal_to_placed_ms", 0),
+            "outcome": trade.get("outcome", ""),
         }
         self.log_file.write(json.dumps(rec) + "\n")
         self.log_file.flush()
@@ -299,14 +365,32 @@ async def run_window(bot: S7Bot, window_start: int):
                                     fade_ask = bot.up_ask
                                     fade_label = "UP"
                                 if fade_ask > 0 and fade_ask < 1:
+                                    # Cap entry to keep EV positive at the 54% CI lower bound.
+                                    # Paper-validated: dropping fade>$0.60 doubles worst-case
+                                    # EV ($23 → $40/day) with no loss in observed P&L.
+                                    if fade_ask > MAX_FADE_ASK:
+                                        log_msg(f"[S7-SKIP] CB {'UP' if move > 0 else 'DN'} "
+                                                f"${move:+.2f} | fade {fade_label} ask "
+                                                f"${fade_ask:.2f} > cap ${MAX_FADE_ASK:.2f}")
+                                        bot.fired_this_window = True
+                                        continue
+                                    # NEW: capture the precise ms when our code decided
+                                    signal_at_ms = int(time.time() * 1000)
                                     log_msg(f"[S7-SIGNAL] CB {'UP' if move > 0 else 'DN'} "
-                                            f"${move:+.2f} | FADE {fade_label} @ ${fade_ask:.2f}")
+                                            f"${move:+.2f} | FADE {fade_label} @ ${fade_ask:.2f} "
+                                            f"@ {signal_at_ms}ms")
                                     trade = bot.place_market_order(fade_token, fade_ask,
                                                                    SHARES_PER_TRADE,
-                                                                   token_label=fade_label)
+                                                                   token_label=fade_label,
+                                                                   signal_at_ms=signal_at_ms)
                                     if trade["filled_size"] > 0:
                                         held_trade = trade
                                         held_direction = fade_label
+                                    else:
+                                        # NEW: log unfilled/rejected attempts so we capture
+                                        # latency distribution across ALL paths
+                                        bot.record_attempt(trade, fade_label,
+                                                           f"NOFILL ({trade.get('outcome', '')})")
                                     bot.fired_this_window = True
 
                         bot.prev_cb_price = new_price
