@@ -95,8 +95,13 @@ class Fill:
 
 
 def taker_fee(price: float, size: float) -> float:
-    """Polymarket taker fee: 2.2% of min(price, 1-price) per share."""
-    return 0.022 * min(price, 1 - price) * size
+    """Polymarket taker fee for crypto: 0.07 × p × (1-p) × shares.
+
+    Verified against the docs 2026-05-25 — the formula is the parabolic p×(1-p),
+    NOT the V-shaped min(p, 1-p). Crypto feeRate is 0.07. Prior simulator used
+    0.022 × min(...) which UNDERSTATED fees by ~2-3x for cheap-fade entries.
+    """
+    return 0.07 * price * (1 - price) * size
 
 
 # ─────────────────────────────────────────────────────────────────────────────

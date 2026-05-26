@@ -95,7 +95,9 @@ def snap_price(p: float) -> float:
 
 
 def calc_taker_fee(price: float, shares: float) -> float:
-    return 0.022 * min(price, 1 - price) * shares
+    """Polymarket crypto taker fee (verified 2026-05-25): 0.07 × p × (1-p) × shares.
+    Replaces the old min(p, 1-p) × 0.022 approximation which understated fees by ~2-3x."""
+    return 0.07 * price * (1 - price) * shares
 
 
 async def get_market_for_window(window_start: int):
