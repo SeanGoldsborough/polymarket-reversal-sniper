@@ -760,7 +760,18 @@ class LiveOrderEngine(OrderEngine):
         return order
 
     def _refresh_from_api(self, order: Order) -> None:
-        """Query the API for current status of `order` and update fields in place."""
+        """Query the API for current status of `order` and update fields in place.
+
+        IMPORTANT: api_order.get("price") returns the LIMIT price of the order,
+        NOT the average fill price. For FAK BUYs especially, the real fill is
+        often well below the limit (price improvement). To get the actual fill
+        price, we query the trades endpoint filtered to this order_id and
+        compute the size-weighted average fill price.
+
+        Discovered 2026-05-26 when a trade at limit $0.06 actually filled at
+        $0.01 — bot was logging $0.06 fill_price (the limit), causing P&L logs
+        to overstate losses by ~6x.
+        """
         if not order.id:
             return
         try:
@@ -771,7 +782,25 @@ class LiveOrderEngine(OrderEngine):
             return
         matched = float(api_order.get("size_matched", 0))
         if matched > order.filled_size:
-            # New fills since last check — emit event
+            # Query trades to get the REAL fill price (api_order.price is the limit)
+            actual_fill_price = float(api_order.get("price", order.price))  # fallback
+            try:
+                trades = self.client.get_trades() or []
+                our_trades = [
+                    t for t in trades
+                    if str(t.get("taker_order_id", "")).lower() == order.id.lower()
+                ]
+                if our_trades:
+                    total_size = sum(float(t.get("size", 0)) for t in our_trades)
+                    total_cost = sum(
+                        float(t.get("size", 0)) * float(t.get("price", 0))
+                        for t in our_trades
+                    )
+                    if total_size > 0:
+                        actual_fill_price = total_cost / total_size
+            except Exception:
+                pass  # fall back to limit price
+
             new_size = matched - order.filled_size
             fill = Fill(
                 order_id=order.id,
@@ -779,12 +808,12 @@ class LiveOrderEngine(OrderEngine):
                 token_label=order.token_label,
                 side=order.side,
                 size=new_size,
-                price=float(api_order.get("price", order.price)),
+                price=actual_fill_price,
                 fee=0.0,  # Polymarket reports fees separately; not always available
                 ts_ms=int(__import__("time").time() * 1000),
             )
             order.filled_size = matched
-            order.fill_avg_price = float(api_order.get("price", order.price))
+            order.fill_avg_price = actual_fill_price
             if order.filled_size == 0:
                 pass
             elif order.filled_size >= order.size - 0.01:
