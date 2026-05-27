@@ -24,7 +24,7 @@ def analyze_dir(tick_dir: Path, threshold: float = 5.0,
                 tp_window_sec: float = 60.0,
                 max_files: int = None):
     engine = ReplayEngine()
-    files = sorted(tick_dir.glob("ticks_*.csv"))
+    files = sorted(tick_dir.glob("ticks_*.csv*"))
     if max_files:
         files = files[:max_files]
 

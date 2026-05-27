@@ -26,7 +26,7 @@ def main():
     resolutions_path = "/home/ubuntu/reports/resolutions.json"
     with open(resolutions_path) as f:
         resolutions = {int(k): v for k, v in json.load(f).items()}
-    files = sorted(tick_dir.glob("ticks_*.csv"))
+    files = sorted(tick_dir.glob("ticks_*.csv*"))
     print(f"WR by fade-entry bucket — {len(files)} windows")
 
     engine = PaperOrderEngine(starting_usdc=10000, taker_latency_ms=150,

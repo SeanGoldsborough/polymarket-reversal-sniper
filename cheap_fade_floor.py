@@ -29,7 +29,7 @@ def main():
     tick_dir = Path("/home/ubuntu/reports/ticks")
     with open("/home/ubuntu/reports/resolutions.json") as f:
         resolutions = {int(k): v for k, v in json.load(f).items()}
-    files = sorted(tick_dir.glob("ticks_*.csv"))
+    files = sorted(tick_dir.glob("ticks_*.csv*"))
     print(f"Cheap-fade floor analysis on {len(files)} windows")
 
     # Run a permissive backtest (no cap) so we capture every cheap fade

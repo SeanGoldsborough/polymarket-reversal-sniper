@@ -21,7 +21,7 @@ from order_engine import PaperOrderEngine, Side, OrderType, OrderStatus, Fill
 def run(tick_dir: Path, max_files=None, shares_per_trade=10,
         s6_threshold=30.0, entry_mode="taker_ask"):
     engine = ReplayEngine()
-    files = sorted(tick_dir.glob("ticks_*.csv"))
+    files = sorted(tick_dir.glob("ticks_*.csv*"))
     if max_files:
         files = files[:max_files]
 

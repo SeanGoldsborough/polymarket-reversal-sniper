@@ -23,7 +23,7 @@ def main():
     tick_dir = Path(args.ticks)
     trade_dir = Path(args.trades)
     # Only validate windows that have BOTH tick + trade CSVs (matches phase35 set)
-    files = sorted(tick_dir.glob("ticks_*.csv"))
+    files = sorted(tick_dir.glob("ticks_*.csv*"))
     files = [f for f in files
              if (trade_dir / f"trades_{int(f.stem.split('_')[1])}.csv").exists()]
     files = files[:args.max_files]

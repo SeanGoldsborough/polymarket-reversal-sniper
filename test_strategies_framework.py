@@ -14,7 +14,7 @@ from strategies import CombinedS2S6Strategy, S2FadeStrategy, S6MomentumStrategy,
 
 def main():
     tick_dir = Path("/home/ubuntu/reports/ticks")
-    files = sorted(tick_dir.glob("ticks_*.csv"))[:30]
+    files = sorted(tick_dir.glob("ticks_*.csv*"))[:30]
     if not files:
         print("No tick files found")
         return

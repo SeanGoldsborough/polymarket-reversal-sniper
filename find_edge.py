@@ -17,7 +17,7 @@ from order_engine import PaperOrderEngine, Side, OrderType
 
 def run_s2_at_threshold(tick_dir, threshold, max_files=None, shares=10):
     engine = ReplayEngine()
-    files = sorted(tick_dir.glob("ticks_*.csv"))
+    files = sorted(tick_dir.glob("ticks_*.csv*"))
     if max_files:
         files = files[:max_files]
 

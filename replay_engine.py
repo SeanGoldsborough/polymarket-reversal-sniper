@@ -12,9 +12,18 @@ The engine is deterministic — same input file produces same callback sequence.
 """
 
 import csv
+import gzip
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, Optional
+
+
+def _open_tick_file(path):
+    """Open a tick CSV — transparently handles .csv.gz."""
+    path = Path(path)
+    if str(path).endswith(".gz"):
+        return gzip.open(path, "rt")
+    return open(path)
 
 
 @dataclass
@@ -76,9 +85,14 @@ def load_trade_events(window_start: int, trades_dir: Path = None) -> list:
         trades_dir = Path("/home/ubuntu/reports/trades")
     fpath = trades_dir / f"trades_{window_start}.csv"
     if not fpath.exists():
-        return []
+        # Try .gz variant
+        gz = trades_dir / f"trades_{window_start}.csv.gz"
+        if gz.exists():
+            fpath = gz
+        else:
+            return []
     out = []
-    with open(fpath) as f:
+    with _open_tick_file(fpath) as f:
         reader = csv.DictReader(f)
         for row in reader:
             try:
@@ -117,7 +131,7 @@ class ReplayEngine:
         - New (May 13+): includes up_bid_size etc.
         """
         self.current_file = Path(tick_file)
-        with open(tick_file) as f:
+        with _open_tick_file(tick_file) as f:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
@@ -202,7 +216,9 @@ class ReplayEngine:
                    on_window_start: Optional[Callable[[Path], None]] = None,
                    on_window_end: Optional[Callable[[Path, int], None]] = None) -> int:
         """Replay all tick files in chronological order. Optional hooks for window boundaries."""
-        files = sorted(Path(dir_path).glob("ticks_*.csv"))
+        # Match both .csv and .csv.gz
+        files = sorted(list(Path(dir_path).glob("ticks_*.csv")) +
+                       list(Path(dir_path).glob("ticks_*.csv.gz")))
         total = 0
         for f in files:
             if on_window_start:

@@ -53,7 +53,7 @@ def main():
     with open(args.resolutions) as f:
         resolutions = {int(k): v for k, v in json.load(f).items()}
 
-    files = sorted(Path(args.ticks).glob("ticks_*.csv"))
+    files = sorted(Path(args.ticks).glob("ticks_*.csv*"))
     days = len(files) * 5 / 60 / 24
     print(f"Capping fade entries to <= ${args.cap:.2f} over {len(files)} windows ({days:.1f} days)")
 

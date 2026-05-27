@@ -22,7 +22,7 @@ def snap_price(p):
 
 def run_s2_threshold(tick_dir, trades_dir, threshold, mode, max_files=None, shares=10):
     engine = ReplayEngine()
-    files = sorted(Path(tick_dir).glob("ticks_*.csv"))
+    files = sorted(Path(tick_dir).glob("ticks_*.csv*"))
     # In maker mode we can only validate windows that have a matching trade CSV.
     # Filter FIRST so --max-files counts trade-eligible windows, not skipped ones.
     if mode == "maker":

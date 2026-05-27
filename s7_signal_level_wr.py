@@ -42,7 +42,7 @@ def main():
     ap.add_argument("--max-files", type=int, default=None)
     args = ap.parse_args()
 
-    files = sorted(Path(args.ticks).glob("ticks_*.csv"))
+    files = sorted(Path(args.ticks).glob("ticks_*.csv*"))
     if args.max_files:
         files = files[:args.max_files]
     print(f"Signal-level WR: threshold=${args.threshold:.0f}, {len(files)} windows")

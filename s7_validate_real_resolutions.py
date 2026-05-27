@@ -37,7 +37,7 @@ def main():
     with open(args.resolutions) as f:
         resolutions = {int(k): v for k, v in json.load(f).items()}
 
-    files = sorted(Path(args.ticks).glob("ticks_*.csv"))
+    files = sorted(Path(args.ticks).glob("ticks_*.csv*"))
     if args.max_files:
         files = files[:args.max_files]
     print(f"S7 validation w/ REAL Polymarket resolutions on {len(files)} windows")
