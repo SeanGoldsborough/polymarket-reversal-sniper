@@ -365,143 +365,156 @@ async def run_window(bot: S7Bot, window_start: int):
 
     async def cb_ws():
         nonlocal held_trade, held_direction
-        try:
-            async with websockets.connect(CB_WS_URL, ping_interval=20, ping_timeout=15) as ws:
-                await ws.send(json.dumps({
-                    "type": "subscribe", "product_ids": ["BTC-USD"], "channels": ["ticker"]
-                }))
-                log_msg("[CB-WS] Connected")
-                while running:
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
-                    except asyncio.TimeoutError:
-                        if time.time() >= window_end - 5:
-                            return
-                        continue
-                    try:
-                        msg = json.loads(raw)
-                        if msg.get("type") != "ticker" or "price" not in msg:
+        retry = 0
+        while running and time.time() < window_end:
+            try:
+                async with websockets.connect(CB_WS_URL, ping_interval=20, ping_timeout=15) as ws:
+                    await ws.send(json.dumps({
+                        "type": "subscribe", "product_ids": ["BTC-USD"], "channels": ["ticker"]
+                    }))
+                    if retry == 0:
+                        log_msg("[CB-WS] Connected")
+                    else:
+                        log_msg(f"[CB-WS] Reconnected (attempt {retry})")
+                    retry = 0
+                    while running:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                        except asyncio.TimeoutError:
+                            if time.time() >= window_end - 5:
+                                return
                             continue
-                        new_price = float(msg["price"])
-                        now_ms = int(time.time() * 1000)
+                        try:
+                            msg = json.loads(raw)
+                            if msg.get("type") != "ticker" or "price" not in msg:
+                                continue
+                            new_price = float(msg["price"])
+                            now_ms = int(time.time() * 1000)
 
-                        if (bot.prev_cb_price > 0
-                                and (now_ms - bot.prev_cb_ms) <= MAX_GAP_MS
-                                and not bot.fired_this_window):
-                            move = new_price - bot.prev_cb_price
-                            if abs(move) >= S7_THRESHOLD:
-                                # Fade — buy OPPOSITE direction
-                                if move > 0:  # CB UP → fade by buying DOWN
-                                    fade_token = down_token
-                                    fade_ask = bot.down_ask
-                                    fade_label = "DN"
-                                else:
-                                    fade_token = up_token
-                                    fade_ask = bot.up_ask
-                                    fade_label = "UP"
-                                if fade_ask > 0 and fade_ask < 1:
-                                    # Cap entry to keep EV positive at the 54% CI lower bound.
-                                    # Paper-validated: dropping fade>$0.60 doubles worst-case
-                                    # EV ($23 → $40/day) with no loss in observed P&L.
-                                    if fade_ask > MAX_FADE_ASK:
-                                        log_msg(f"[S7-SKIP] CB {'UP' if move > 0 else 'DN'} "
-                                                f"${move:+.2f} | fade {fade_label} ask "
-                                                f"${fade_ask:.2f} > cap ${MAX_FADE_ASK:.2f}")
-                                        bot.fired_this_window = True
-                                        continue
-                                    # Floor — skip the proven death zone (0/5 historical).
-                                    # When CB moves big enough to push fade below $0.10,
-                                    # the move is trend confirmation, NOT exhaustion.
-                                    if fade_ask < MIN_FADE_ASK:
-                                        log_msg(f"[S7-SKIP] CB {'UP' if move > 0 else 'DN'} "
-                                                f"${move:+.2f} | fade {fade_label} ask "
-                                                f"${fade_ask:.2f} < floor ${MIN_FADE_ASK:.2f} "
-                                                f"(death zone)")
-                                        bot.fired_this_window = True
-                                        continue
-                                    # NEW: capture the precise ms when our code decided
-                                    signal_at_ms = int(time.time() * 1000)
-                                    log_msg(f"[S7-SIGNAL] CB {'UP' if move > 0 else 'DN'} "
-                                            f"${move:+.2f} | FADE {fade_label} @ ${fade_ask:.2f} "
-                                            f"@ {signal_at_ms}ms")
-                                    trade = bot.place_market_order(fade_token, fade_ask,
-                                                                   SHARES_PER_TRADE,
-                                                                   token_label=fade_label,
-                                                                   signal_at_ms=signal_at_ms)
-                                    if trade["filled_size"] > 0:
-                                        held_trade = trade
-                                        held_direction = fade_label
+                            if (bot.prev_cb_price > 0
+                                    and (now_ms - bot.prev_cb_ms) <= MAX_GAP_MS
+                                    and not bot.fired_this_window):
+                                move = new_price - bot.prev_cb_price
+                                if abs(move) >= S7_THRESHOLD:
+                                    # Fade — buy OPPOSITE direction
+                                    if move > 0:  # CB UP → fade by buying DOWN
+                                        fade_token = down_token
+                                        fade_ask = bot.down_ask
+                                        fade_label = "DN"
                                     else:
-                                        # NEW: log unfilled/rejected attempts so we capture
-                                        # latency distribution across ALL paths
-                                        bot.record_attempt(trade, fade_label,
-                                                           f"NOFILL ({trade.get('outcome', '')})")
-                                    bot.fired_this_window = True
+                                        fade_token = up_token
+                                        fade_ask = bot.up_ask
+                                        fade_label = "UP"
+                                    if fade_ask > 0 and fade_ask < 1:
+                                        # Cap entry to keep EV positive at the 54% CI lower bound.
+                                        if fade_ask > MAX_FADE_ASK:
+                                            log_msg(f"[S7-SKIP] CB {'UP' if move > 0 else 'DN'} "
+                                                    f"${move:+.2f} | fade {fade_label} ask "
+                                                    f"${fade_ask:.2f} > cap ${MAX_FADE_ASK:.2f}")
+                                            bot.fired_this_window = True
+                                            continue
+                                        # Floor — skip the proven death zone (0/5 historical).
+                                        if fade_ask < MIN_FADE_ASK:
+                                            log_msg(f"[S7-SKIP] CB {'UP' if move > 0 else 'DN'} "
+                                                    f"${move:+.2f} | fade {fade_label} ask "
+                                                    f"${fade_ask:.2f} < floor ${MIN_FADE_ASK:.2f} "
+                                                    f"(death zone)")
+                                            bot.fired_this_window = True
+                                            continue
+                                        signal_at_ms = int(time.time() * 1000)
+                                        log_msg(f"[S7-SIGNAL] CB {'UP' if move > 0 else 'DN'} "
+                                                f"${move:+.2f} | FADE {fade_label} @ ${fade_ask:.2f} "
+                                                f"@ {signal_at_ms}ms")
+                                        trade = bot.place_market_order(fade_token, fade_ask,
+                                                                       SHARES_PER_TRADE,
+                                                                       token_label=fade_label,
+                                                                       signal_at_ms=signal_at_ms)
+                                        if trade["filled_size"] > 0:
+                                            held_trade = trade
+                                            held_direction = fade_label
+                                        else:
+                                            bot.record_attempt(trade, fade_label,
+                                                               f"NOFILL ({trade.get('outcome', '')})")
+                                        bot.fired_this_window = True
 
-                        bot.prev_cb_price = new_price
-                        bot.prev_cb_ms = now_ms
-                        bot.cb_price = new_price
-                    except Exception:
-                        pass
-        except Exception as e:
-            log_msg(f"[CB-WS] Error: {str(e)[:80]}")
+                            bot.prev_cb_price = new_price
+                            bot.prev_cb_ms = now_ms
+                            bot.cb_price = new_price
+                        except Exception:
+                            pass
+            except Exception as e:
+                retry += 1
+                if time.time() >= window_end - 2:
+                    return
+                log_msg(f"[CB-WS] Dropped: {str(e)[:60]} — reconnecting (attempt {retry})...")
+                await asyncio.sleep(min(retry * 0.5, 3))
 
     async def poly_ws():
-        try:
-            async with websockets.connect(POLY_WS_URL, ping_interval=20, ping_timeout=15) as ws:
-                await ws.send(json.dumps({"assets_ids": [up_token, down_token], "type": "market"}))
-                log_msg("[POLY-WS] Connected")
-                while running:
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
-                    except asyncio.TimeoutError:
-                        if time.time() >= window_end - 5:
-                            return
-                        continue
-                    try:
-                        msg = json.loads(raw)
-                    except Exception:
-                        continue
-
-                    def update_from(item):
-                        if not isinstance(item, dict):
-                            return
-                        aid = item.get("asset_id", "")
-                        bids = item.get("bids", [])
-                        asks = item.get("asks", [])
-                        if bids:
-                            try:
-                                bb = max(float(b["price"]) for b in bids if isinstance(b, dict) and "price" in b)
-                                if aid == up_token: bot.up_bid = bb
-                                elif aid == down_token: bot.down_bid = bb
-                            except Exception:
-                                pass
-                        if asks:
-                            try:
-                                ba = min(float(a["price"]) for a in asks if isinstance(a, dict) and "price" in a)
-                                if aid == up_token: bot.up_ask = ba
-                                elif aid == down_token: bot.down_ask = ba
-                            except Exception:
-                                pass
-                        for pc in item.get("price_changes", []):
-                            if not isinstance(pc, dict):
-                                continue
-                            aid2 = pc.get("asset_id", aid)
-                            bb = pc.get("best_bid")
-                            ba = pc.get("best_ask")
-                            if bb is not None:
-                                if aid2 == up_token: bot.up_bid = float(bb)
-                                elif aid2 == down_token: bot.down_bid = float(bb)
-                            if ba is not None:
-                                if aid2 == up_token: bot.up_ask = float(ba)
-                                elif aid2 == down_token: bot.down_ask = float(ba)
-
-                    if isinstance(msg, list):
-                        for item in msg: update_from(item)
+        retry = 0
+        while running and time.time() < window_end:
+            try:
+                async with websockets.connect(POLY_WS_URL, ping_interval=20, ping_timeout=15) as ws:
+                    await ws.send(json.dumps({"assets_ids": [up_token, down_token], "type": "market"}))
+                    if retry == 0:
+                        log_msg("[POLY-WS] Connected")
                     else:
-                        update_from(msg)
-        except Exception as e:
-            log_msg(f"[POLY-WS] Error: {str(e)[:80]}")
+                        log_msg(f"[POLY-WS] Reconnected (attempt {retry})")
+                    retry = 0
+                    while running:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                        except asyncio.TimeoutError:
+                            if time.time() >= window_end - 5:
+                                return
+                            continue
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+
+                        def update_from(item):
+                            if not isinstance(item, dict):
+                                return
+                            aid = item.get("asset_id", "")
+                            bids = item.get("bids", [])
+                            asks = item.get("asks", [])
+                            if bids:
+                                try:
+                                    bb = max(float(b["price"]) for b in bids if isinstance(b, dict) and "price" in b)
+                                    if aid == up_token: bot.up_bid = bb
+                                    elif aid == down_token: bot.down_bid = bb
+                                except Exception:
+                                    pass
+                            if asks:
+                                try:
+                                    ba = min(float(a["price"]) for a in asks if isinstance(a, dict) and "price" in a)
+                                    if aid == up_token: bot.up_ask = ba
+                                    elif aid == down_token: bot.down_ask = ba
+                                except Exception:
+                                    pass
+                            for pc in item.get("price_changes", []):
+                                if not isinstance(pc, dict):
+                                    continue
+                                aid2 = pc.get("asset_id", aid)
+                                bb = pc.get("best_bid")
+                                ba = pc.get("best_ask")
+                                if bb is not None:
+                                    if aid2 == up_token: bot.up_bid = float(bb)
+                                    elif aid2 == down_token: bot.down_bid = float(bb)
+                                if ba is not None:
+                                    if aid2 == up_token: bot.up_ask = float(ba)
+                                    elif aid2 == down_token: bot.down_ask = float(ba)
+
+                        if isinstance(msg, list):
+                            for item in msg: update_from(item)
+                        else:
+                            update_from(msg)
+            except Exception as e:
+                retry += 1
+                if time.time() >= window_end - 2:
+                    return
+                log_msg(f"[POLY-WS] Dropped: {str(e)[:60]} — reconnecting (attempt {retry})...")
+                await asyncio.sleep(min(retry * 0.5, 3))
 
     timer_task = asyncio.create_task(asyncio.sleep(max(1, window_end - time.time())))
     cb_task = asyncio.create_task(cb_ws())
