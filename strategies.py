@@ -122,6 +122,7 @@ class Strategy(ABC):
 
 class S2FadeStrategy(Strategy):
     name = "S2-FADE"
+    description = "Fade $15+ CB spike within 1.5s → taker ask → hold to resolution"
 
     def __init__(self, engine: OrderEngine, threshold: float = 15.0,
                  max_gap_ms: int = 1500, shares: int = 7,
@@ -208,6 +209,7 @@ class S2FadeStrategy(Strategy):
 
 class S6MomentumStrategy(Strategy):
     name = "S6-MOMENTUM"
+    description = "Ride $30+ CB momentum (continuation, not fade) → taker ask → hold to resolution"
 
     def __init__(self, engine: OrderEngine, threshold: float = 30.0,
                  shares: int = 7, entry_mode: str = "taker_ask"):
@@ -287,6 +289,7 @@ class S6MomentumStrategy(Strategy):
 
 class S1AlignedHoldStrategy(Strategy):
     name = "S1-ALIGNED"
+    description = "Aligned CB+book hold: $5-$10 CB move with tight book agreement → taker ask → hold to resolution"
 
     def __init__(self, engine: OrderEngine, min_move: float = 5.0, max_move: float = 9.99,
                  max_gap_ms: int = 1500, shares: int = 7, entry_mode: str = "taker_ask"):
@@ -367,15 +370,173 @@ class S7FadeStrategy(S2FadeStrategy):
         - entry_mode: taker_market (FAK at ask+$0.05 cap; price improvement)
         - shares: 6 (current live size)
         - min_notional_target: $1.20 (Option B dynamic shares to bypass $1 reject)
+
+    Optional regime filter (off by default):
+        - regime_filter_enabled: when True, classify regime at signal-time and
+          skip if current regime is not in allowed_regimes.
+        - regime_lookback_s: window of CB history used for autocorrelation.
+        - allowed_regimes: tuple of regime labels to fire in.
+
+    The regime classifier uses CB autocorrelation; default allows RANGING only
+    per the 434-window backtest where RANGING was the only profitable regime.
     """
     name = "S7-FADE"
+    description = "S2 tuned for live: fade $18+ CB spike → FAK ask+$0.05 cap, $1.20 min notional → hold"
 
     def __init__(self, engine: OrderEngine, shares: int = 6,
                  threshold: float = 18.0, max_gap_ms: int = 1500,
-                 min_notional_target: float = 1.20):
+                 min_notional_target: float = 1.20,
+                 min_fade_ask: float = 0.10,
+                 regime_filter_enabled: bool = False,
+                 regime_lookback_s: int = 60,
+                 allowed_regimes: tuple = ("RANGING",),
+                 min_history_for_regime_s: int = 60,
+                 # v2: TA-driven composable filter chain + 5-substate classifier
+                 filter_chain=None,
+                 regime_classifier_v2=None,
+                 v2_allowed_regimes: tuple = ("DISTRIBUTION",)):
         super().__init__(engine, threshold=threshold, max_gap_ms=max_gap_ms,
                          shares=shares, entry_mode="taker_market",
                          min_notional_target=min_notional_target)
+        # min_fade_ask matches live btc_s7_fade.py MIN_FADE_ASK constant:
+        # "Skip super-cheap fades — proven 0/5 death zone in history (CB moves
+        # big enough to push fade <$0.10 don't revert)". Synced 2026-05-28
+        # per feedback_sync_live_filters_to_backtest.
+        self.min_fade_ask = min_fade_ask
+        self.regime_filter_enabled = regime_filter_enabled
+        self.regime_lookback_s = regime_lookback_s
+        self.allowed_regimes = tuple(allowed_regimes)
+        self.min_history_for_regime_s = min_history_for_regime_s
+        # v2 — filter chain + classifier (both optional, default None = off)
+        self.filter_chain = filter_chain
+        self.regime_classifier_v2 = regime_classifier_v2
+        self.v2_allowed_regimes = tuple(v2_allowed_regimes)
+        # Stats
+        self.death_zone_skips = 0
+        self.regime_skips = 0
+        self.regime_insufficient = 0
+        self.regime_fires_by_label: dict = {}
+        self.v2_regime_skips = 0
+        self.v2_regime_fires_by_label: dict = {}
+        self.v2_filter_skips = 0
+
+    def _reset_window_state(self):
+        super()._reset_window_state()
+        # Rolling CB tick history for regime classification at signal time.
+        # deque gives O(1) popleft instead of O(n) for list.pop(0).
+        self._cb_hist: deque = deque()
+        # Reset v2 filter chain and classifier state (per-window)
+        # (we check getattr since this also runs from S2 __init__ pre-attrs)
+        fc = getattr(self, "filter_chain", None)
+        if fc is not None:
+            fc.reset()
+        cl = getattr(self, "regime_classifier_v2", None)
+        if cl is not None:
+            cl.reset()
+
+    def on_tick(self, state: BookState) -> None:
+        # Track CB history for the (v1) regime classifier
+        if self.regime_filter_enabled and state.cb_price > 0:
+            self._cb_hist.append((state.elapsed_ms, state.cb_price))
+            cutoff = state.elapsed_ms - (self.regime_lookback_s + 5) * 1000
+            while self._cb_hist and self._cb_hist[0][0] < cutoff:
+                self._cb_hist.popleft()
+        # Feed v2 filter chain + classifier on every tick
+        if self.filter_chain is not None and state.cb_price > 0:
+            self.filter_chain.observe(state.elapsed_ms, state.cb_price)
+        if self.regime_classifier_v2 is not None and state.cb_price > 0:
+            self.regime_classifier_v2.observe(state.elapsed_ms, state.cb_price)
+        # Delegate the actual signal logic to S2
+        super().on_tick(state)
+
+    def _place_entry(self, state: BookState, token_id: str, label: str,
+                     bid: float, ask: float):
+        # Death-zone floor — matches live MIN_FADE_ASK skip.
+        if self.min_fade_ask > 0 and ask < self.min_fade_ask:
+            self.death_zone_skips += 1
+            self.fired = True   # one-shot — don't re-check this window
+            return
+        if self.regime_filter_enabled:
+            regime = self._classify_current_regime(state)
+            self.regime_fires_by_label[regime] = self.regime_fires_by_label.get(regime, 0) + 1
+            if regime not in self.allowed_regimes:
+                self.regime_skips += 1
+                # Mark fired so we don't re-check every tick this window
+                self.fired = True
+                return
+        # v2 — composable filter chain (hard-close, climax, polarity, multi-TF)
+        if self.filter_chain is not None:
+            # label = direction of the FADE token; the CB SIGNAL direction is
+            # opposite. Filter expects CB side, so flip.
+            cb_side = "DN" if label == "UP" else "UP"
+            ok, reason = self.filter_chain.approve(state.elapsed_ms, cb_side, state.cb_price)
+            if not ok:
+                self.v2_filter_skips += 1
+                self.fired = True
+                return
+        # v2 — 5-substate regime classifier
+        if self.regime_classifier_v2 is not None:
+            rg, _info = self.regime_classifier_v2.classify(state.elapsed_ms)
+            self.v2_regime_fires_by_label[rg] = self.v2_regime_fires_by_label.get(rg, 0) + 1
+            if rg not in self.v2_allowed_regimes:
+                self.v2_regime_skips += 1
+                self.fired = True
+                return
+        super()._place_entry(state, token_id, label, bid, ask)
+
+    def _classify_current_regime(self, state: BookState) -> str:
+        """Classify regime from in-buffer CB history. Returns 'MOMENTUM',
+        'EXHAUSTION', 'RANGING', or 'INSUFFICIENT'."""
+        # Need at least min_history_for_regime_s of data
+        if not self._cb_hist:
+            self.regime_insufficient += 1
+            return "INSUFFICIENT"
+        span_ms = state.elapsed_ms - self._cb_hist[0][0]
+        if span_ms < self.min_history_for_regime_s * 1000:
+            self.regime_insufficient += 1
+            return "INSUFFICIENT"
+        # Bucket into 5s prices
+        bucket_s = 5
+        bucket_ms = bucket_s * 1000
+        lookback_ms = self.regime_lookback_s * 1000
+        latest_ts = self._cb_hist[-1][0]
+        first_ts = latest_ts - lookback_ms
+        i = 0
+        prices: list = []
+        bucket_boundary = first_ts
+        while bucket_boundary <= latest_ts + 1:
+            last_p = None
+            while i < len(self._cb_hist) and self._cb_hist[i][0] <= bucket_boundary:
+                last_p = self._cb_hist[i][1]
+                i += 1
+            if last_p is None and self._cb_hist:
+                last_p = self._cb_hist[0][1]
+            if last_p is not None:
+                prices.append(last_p)
+            bucket_boundary += bucket_ms
+        if len(prices) < 4:
+            self.regime_insufficient += 1
+            return "INSUFFICIENT"
+        # Log returns
+        import math
+        returns: list = []
+        for k in range(1, len(prices)):
+            if prices[k - 1] > 0 and prices[k] > 0:
+                returns.append(math.log(prices[k] / prices[k - 1]))
+        if len(returns) < 3:
+            self.regime_insufficient += 1
+            return "INSUFFICIENT"
+        # Lag-1 autocorrelation
+        n = len(returns)
+        mean = sum(returns) / n
+        num = sum((returns[k] - mean) * (returns[k - 1] - mean) for k in range(1, n))
+        den = sum((r - mean) ** 2 for r in returns)
+        ac = num / den if den > 0 else 0.0
+        if ac > 0.25:
+            return "MOMENTUM"
+        if ac < -0.25:
+            return "EXHAUSTION"
+        return "RANGING"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -384,6 +545,7 @@ class S7FadeStrategy(S2FadeStrategy):
 
 class CombinedS2S6Strategy(Strategy):
     name = "S2+S6-COMBINED"
+    description = "Fire on EITHER S2-fade OR S6-momentum signal — whichever triggers first"
 
     def __init__(self, engine: OrderEngine, shares: int = 7, entry_mode: str = "taker_ask"):
         super().__init__(engine, shares=shares, entry_mode=entry_mode)
